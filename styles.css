@@ -1,0 +1,202 @@
+/* Tezcat Plugin Styles */
+
+/* Search View Styles */
+.search-results-container {
+    padding: 8px;
+    overflow-y: auto;
+    height: calc(100% - 60px);
+}
+
+.search-count {
+    font-size: 0.9em;
+    color: var(--text-muted);
+    margin-bottom: 12px;
+}
+
+.search-empty-state {
+    text-align: center;
+    color: var(--text-muted);
+    margin-top: 40px;
+}
+
+.search-result-item {
+    padding: 12px;
+    margin-bottom: 8px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.search-result-item:hover {
+    background-color: var(--background-modifier-hover);
+}
+
+.search-result-text {
+    font-size: 0.85em;
+    line-height: 1.4;
+    margin-bottom: 8px;
+}
+
+.search-result-path-container {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.search-result-path {
+    color: var(--text-muted);
+    font-size: 0.8em;
+}
+
+.search-result-meta {
+    display: flex;
+    align-items: center;
+}
+
+.search-result-type {
+    background: var(--background-modifier-border);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 0.8em;
+}
+
+.search-result-score {
+    color: var(--text-muted);
+    font-size: 0.8em;
+    margin-left: 6px;
+}
+
+.search-result-actions {
+    margin-top: 8px;
+    display: flex;
+    gap: 8px;
+}
+
+.search-result-actions button {
+    font-size: 0.8em;
+    padding: 4px 8px;
+}
+
+/* Main Plugin Styles - Settings Tab */
+.tezcat-input {
+    width: 100%;
+    padding: 8px;
+    margin-bottom: 16px;
+}
+
+.tezcat-overall-status {
+    padding: 12px;
+    margin-bottom: 16px;
+    border-radius: 6px;
+}
+
+.tezcat-overall-status.system-ready {
+    background: rgba(0, 255, 0, 0.1);
+    border: 1px solid rgba(0, 255, 0, 0.3);
+}
+
+.tezcat-overall-status.setup-required {
+    background: rgba(255, 255, 0, 0.1);
+    border: 1px solid rgba(255, 255, 0, 0.3);
+}
+
+.tezcat-button-container {
+    margin-top: 20px;
+}
+
+.tezcat-validation-item {
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    border-radius: 4px;
+    border: 1px solid var(--background-modifier-border);
+}
+
+.tezcat-validation-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+}
+
+.tezcat-validation-status.ready {
+    color: var(--text-success);
+}
+
+.tezcat-validation-status.issue {
+    color: var(--text-error);
+}
+
+.tezcat-validation-message {
+    font-size: 0.9em;
+    color: var(--text-muted);
+}
+
+.tezcat-search-results {
+    max-height: 400px;
+    overflow-y: auto;
+    margin-bottom: 16px;
+}
+
+.tezcat-search-result {
+    padding: 12px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    margin-bottom: 8px;
+    cursor: pointer;
+}
+
+.tezcat-search-result:hover {
+    background-color: var(--background-modifier-hover);
+}
+
+.tezcat-search-result-text {
+    font-size: 0.9em;
+    line-height: 1.4;
+    margin-bottom: 8px;
+}
+
+.tezcat-search-result-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+}
+
+.tezcat-search-result-title {
+    font-size: 0.9em;
+}
+
+.tezcat-search-result-path {
+    color: var(--text-muted);
+    font-size: 0.8em;
+}
+
+.tezcat-search-result-path.note-path {
+    font-size: 0.9em;
+    margin-bottom: 8px;
+}
+
+.tezcat-search-result-chunk-text {
+    font-size: 0.9em;
+    line-height: 1.4;
+}
+
+/* Status Bar Styles */
+.tezcat-status-bar {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.tezcat-status-initializing {
+    color: var(--text-muted);
+}
+
+.tezcat-status-ready {
+    color: var(--text-success);
+}
+
+.tezcat-status-error {
+    color: var(--text-error);
+}

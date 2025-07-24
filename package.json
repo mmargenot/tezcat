@@ -1,0 +1,34 @@
+{
+	"name": "tezcat",
+	"version": "1.0.0",
+	"description": "Implements a remembrance agent for Obsidian. Look into the mirror.",
+	"main": "main.js",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"test": "node --max-old-space-size=8192 node_modules/.bin/vitest run",
+		"test:watch": "node --max-old-space-size=8192 node_modules/.bin/vitest",
+		"version": "node version-bump.mjs && git add manifest.json versions.json"
+	},
+	"keywords": [],
+	"author": "",
+	"license": "MIT",
+	"devDependencies": {
+		"@types/node": "^20.19.9",
+		"@types/sql.js": "^1.4.9",
+		"@typescript-eslint/eslint-plugin": "5.29.0",
+		"@typescript-eslint/parser": "5.29.0",
+		"builtin-modules": "3.3.0",
+		"esbuild": "0.17.3",
+		"obsidian": "latest",
+		"tslib": "2.4.0",
+		"typescript": "4.7.4",
+		"vitest": "^3.2.4"
+	},
+	"dependencies": {
+		"@huggingface/transformers": "^3.7.0",
+		"onnxruntime-web": "^1.22.0",
+		"sql.js": "^1.8.0",
+		"tiktoken": "^1.0.16"
+	}
+}
