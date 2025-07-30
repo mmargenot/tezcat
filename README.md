@@ -5,8 +5,15 @@ Tezcat is an Obsidian plugin that indexes your thoughts. It uses an AI embedding
 This tool works best with Ollama in the current state. It frequently makes calls to generate embeddings and search its database, and if you use a proprietary embeddings endpoint this may incur undesired costs.
 
 # Requirements
-For local models, the current system enables:
-- Ollama
+
+## Local
+In order for Tezcat to work properly with local AI models, you must have a local model provider installed and running. There are a couple of good providers for local models, but for now the current system only enables:
+- [Ollama](https://ollama.com/download)
+
+Go to the download page, install the software, and boot it up on your machine.
+
+## Non-Local
+Currently, we only support OpenAI embedding models. Use this option if you don't want to use local-running models.
 
 For proprietary models, the current system enables:
 - OpenAI
