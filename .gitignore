@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+main.js
+main.js.map
+*.js.map
+
+# Database files
+tezcat.db
+
+# Settings
+data.json
+
+# Environment files
+.env
+.env.local
+
+# IDE files
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+
+# Temporary files
+*.tmp
+*.temp
