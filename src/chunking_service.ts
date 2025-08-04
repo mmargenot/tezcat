@@ -2,6 +2,7 @@
 import { Plugin } from 'obsidian';
 import { Logger } from './logger';
 import type { Tiktoken } from 'tiktoken';
+import { get_encoding } from 'tiktoken';
 
 export interface TextChunk {
     text: string;
@@ -29,22 +30,12 @@ export class ChunkingService {
             try {
                 this.logger.info('ChunkingService', 'Loading tiktoken with WASM binary...');
                 
-                // Import tiktoken dynamically
-                const { init, get_encoding } = await import('tiktoken/init');
-                
-                // Read WASM file directly and provide as binary data
-                const wasmPath = `${this.plugin.app.vault.configDir}/plugins/tezcat/tiktoken_bg.wasm`;
-                const wasmBuffer = await this.plugin.app.vault.adapter.readBinary(wasmPath);
-                
-                // Initialize tiktoken with WASM binary
-                await init((imports) => WebAssembly.instantiate(wasmBuffer, imports));
-                
                 // Use cl100k_base encoding (used by GPT-3.5/4)
                 this.encoder = get_encoding('cl100k_base');
                 
-                } catch (error) {
+            } catch (error) {
                 this.logger.error('ChunkingService', 'Failed to load tiktoken encoder:', error);
-                throw new Error('Tiktoken encoder failed to load. Please ensure tiktoken WASM file is available.');
+                throw new Error('Tiktoken encoder failed to load.');
             }
         }
     }

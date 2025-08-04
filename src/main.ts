@@ -36,11 +36,11 @@ const DEFAULT_SETTINGS: TezcatSettings = {
     ollamaBaseUrl: 'http://localhost:11434',
     chunkSize: 128,
     chunkOverlap: 16,
-    contextWindowWords: 170, // ~128 / 0.75, reasonable default for search context
+    contextWindowWords: 64, // Smaller context window for more focused search
     searchCadence: 'always',
     searchMode: 'hybrid',
     logLevel: LogLevel.INFO,
-    highlightBlockOnOpen: false
+    highlightBlockOnOpen: true
 }
 
 export default class Tezcat extends Plugin {
@@ -1303,12 +1303,12 @@ class TezcatSettingTab extends PluginSettingTab {
         // Context Window Setting (applies immediately)
         new Setting(containerEl)
             .setName('Search Context Window (words)')
-            .setDesc('Number of words to extract around your cursor for contextual search (default: 170)')
+            .setDesc('Number of words to extract around your cursor for contextual search (default: 64)')
             .addText(text => text
-                .setPlaceholder('170')
+                .setPlaceholder('64')
                 .setValue(this.plugin.settings.contextWindowWords.toString())
                 .onChange(async (value) => {
-                    const contextWords = parseInt(value) || 170;
+                    const contextWords = parseInt(value) || 64;
                     this.plugin.settings.contextWindowWords = contextWords;
                     await this.plugin.saveSettings();
                     logger.info('Settings', `Context window words updated to: ${contextWords}`);
@@ -1454,17 +1454,8 @@ class TezcatSettingTab extends PluginSettingTab {
             new Notice('Configuration validated. Rebuilding vector database...');
             logger.info('Plugin', 'Beginning vector database rebuild');
             
-            // Clean up orphaned data first
-            await this.plugin.databaseService.performFullCleanup();
-            
-            // Use the blocks-based processing for all files
-            await this.plugin.processAllVaultFilesIntoDatabase(false);
-            
-            new Notice('Rebuilding search index...');
-            logger.info('Plugin', 'Beginning LSH index generation');
-            
-            // Rebuild LSH index
-            await this.plugin.databaseAdapter.generateVectorIndex(this.plugin.settings.vectorSize);
+            // Use the existing rebuildDatabase method which handles everything properly
+            await this.plugin.rebuildDatabase();
             
             new Notice('Reindexing completed successfully!');
             logger.info('Plugin', 'Reindexing completed successfully');
