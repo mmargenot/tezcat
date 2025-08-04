@@ -11,6 +11,7 @@ import { NoteProcessor } from './note_processor';
 
 type EmbeddingProviderType = 'openai' | 'ollama';
 type SearchCadence = 'always' | 'sometimes' | 'occasionally';
+type SearchMode = 'vector' | 'hybrid';
 
 interface TezcatSettings {
     embeddingProvider: EmbeddingProviderType;
@@ -22,6 +23,7 @@ interface TezcatSettings {
     chunkOverlap: number;
     contextWindowWords: number;
     searchCadence: SearchCadence;
+    searchMode: SearchMode;
     logLevel: LogLevel;
     highlightBlockOnOpen: boolean;
 }
@@ -36,6 +38,7 @@ const DEFAULT_SETTINGS: TezcatSettings = {
     chunkOverlap: 16,
     contextWindowWords: 170, // ~128 / 0.75, reasonable default for search context
     searchCadence: 'always',
+    searchMode: 'hybrid',
     logLevel: LogLevel.INFO,
     highlightBlockOnOpen: false
 }
@@ -210,9 +213,6 @@ export default class Tezcat extends Plugin {
                 );
 
                 logger.info('Plugin', `Processed: ${file.path}`);
-            } else {
-                // Content unchanged - skip
-                logger.debug('Plugin', `Skipped (unchanged): ${file.path}`);
             }
 
             return note_result;
@@ -335,6 +335,7 @@ export default class Tezcat extends Plugin {
             await this.databaseAdapter.createChunksTable();
             await this.databaseAdapter.createVectorsTable();
             await this.databaseAdapter.createBlocksTable();
+            await this.databaseAdapter.createFTSTable();
             
             // Process all vault files with the clean database
             new Notice('Processing all vault files...');
@@ -473,6 +474,10 @@ export default class Tezcat extends Plugin {
             // Build vector index after all files are processed
             logger.info('Plugin', 'Building vector index...');
             await this.ensureVectorIndexExists();
+            
+            // Ensure FTS content exists for all notes (for hybrid search)
+            logger.info('Plugin', 'Ensuring FTS content is populated...');
+            await this.databaseService.ensureFTSContentForAllNotes();
             
             // Automatically activate the Tezcat view
             logger.info('Plugin', 'Activating Tezcat view...');
@@ -795,15 +800,25 @@ export default class Tezcat extends Plugin {
             const currentNotePath = this.getCurrentNotePath();
             const excludeNotePaths = currentNotePath ? [currentNotePath] : [];
             
-            // Perform search asynchronously without blocking
-            const searchPromise = this.searchService.vectorSearch(context, {
-                topK: 10,
-                minScore: 0.1,
-                includeNoteVectors: true,
-                includeChunkVectors: false,
-                includeBlockVectors: true,
-                excludeNotePaths
-            });
+            // Perform search based on settings (vector or hybrid)
+            const searchPromise = this.settings.searchMode === 'hybrid' 
+                ? this.searchService.hybridSearch(context, {
+                    topK: 10,
+                    minScore: 0, // RRF scores are much smaller than cosine similarity scores
+                    includeNoteVectors: true,
+                    includeChunkVectors: false,
+                    includeBlockVectors: true,
+                    excludeNotePaths,
+                    hybridWeight: 0.5 // Equal weighting by default
+                })
+                : this.searchService.vectorSearch(context, {
+                    topK: 10,
+                    minScore: 0.1,
+                    includeNoteVectors: true,
+                    includeChunkVectors: false,
+                    includeBlockVectors: true,
+                    excludeNotePaths
+                });
             
             const results = await searchPromise;
             
@@ -1270,6 +1285,19 @@ class TezcatSettingTab extends PluginSettingTab {
                     this.plugin.settings.searchCadence = value;
                     await this.plugin.saveSettings();
                     logger.info('Settings', `Search cadence updated to: ${value}`);
+                }));
+
+        new Setting(containerEl)
+            .setName('Search Mode')
+            .setDesc('Choose between vector-only search or hybrid search combining semantic similarity with keyword matching')
+            .addDropdown(dropdown => dropdown
+                .addOption('vector', 'Vector Only (semantic similarity)')
+                .addOption('hybrid', 'Hybrid (semantic + keyword matching)')
+                .setValue(this.plugin.settings.searchMode)
+                .onChange(async (value: SearchMode) => {
+                    this.plugin.settings.searchMode = value;
+                    await this.plugin.saveSettings();
+                    logger.info('Settings', `Search mode updated to: ${value}`);
                 }));
 
         // Context Window Setting (applies immediately)

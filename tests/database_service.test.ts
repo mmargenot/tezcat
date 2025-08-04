@@ -23,6 +23,10 @@ class MockDatabaseAdapter implements DatabaseAdapter {
     createChunksTable = vi.fn().mockResolvedValue(undefined);
     createVectorsTable = vi.fn().mockResolvedValue(undefined);
     createBlocksTable = vi.fn().mockResolvedValue(undefined);
+    createFTSTable = vi.fn().mockResolvedValue(undefined);
+    searchFTS = vi.fn().mockResolvedValue([]);
+    insertFTSContent = vi.fn().mockResolvedValue(undefined);
+    deleteFTSContentForNote = vi.fn().mockResolvedValue(undefined);
     dropAllTables = vi.fn().mockResolvedValue(undefined);
     generateVectorIndex = vi.fn().mockResolvedValue(undefined);
     getSimilarVectors = vi.fn().mockResolvedValue([]);

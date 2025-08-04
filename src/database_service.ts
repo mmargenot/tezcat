@@ -13,6 +13,7 @@ export interface DatabaseAdapter {
     createChunksTable(): Promise<void>;
     createVectorsTable(): Promise<void>;
     createBlocksTable(): Promise<void>;
+    createFTSTable(): Promise<void>;
     dropAllTables(): Promise<void>;
     
     // Basic database operations
@@ -24,6 +25,11 @@ export interface DatabaseAdapter {
     generateVectorIndex(vectorDimensions: number): Promise<void>;
     getSimilarVectors(queryVector: Int8Array, limit: number): Promise<Vector[]>;
     isVectorIndexAvailable(): Promise<boolean>;
+    
+    // FTS operations
+    searchFTS(query: string, limit: number): Promise<FTSResult[]>;
+    insertFTSContent(id: string, type: string, noteId: string, content: string, notePath: string, noteName: string, blockId?: string): Promise<void>;
+    deleteFTSContentForNote(noteId: string): Promise<void>;
     
     // Persistence operations
     save(): Promise<void>;
@@ -74,6 +80,7 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
             await this.createChunksTable();
             await this.createVectorsTable();
             await this.createBlocksTable();
+            await this.createFTSTable();
             await this.createLSHBucketsTable();
             
             this.logger.info('SqlJsAdapter', 'Database initialized successfully with sql.js');
@@ -175,6 +182,25 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         this.logger.info('SqlJsAdapter', 'Created blocks table with JSON position storage');
     }
 
+    async createFTSTable(): Promise<void> {
+        if (!this.db) throw new Error('Database not initialized');
+        
+        // Create FTS3 virtual table for full-text search
+        await this.execute(`
+            CREATE VIRTUAL TABLE IF NOT EXISTS fts_content USING fts3(
+                id TEXT,
+                type TEXT,
+                note_id TEXT,
+                content TEXT,
+                note_path TEXT,
+                note_name TEXT,
+                block_id TEXT
+            )
+        `);
+        
+        this.logger.info('SqlJsAdapter', 'Created FTS3 virtual table for full-text search');
+    }
+
 
     async dropAllTables(): Promise<void> {
         if (!this.db) throw new Error('Database not initialized');
@@ -188,6 +214,7 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         await this.execute('DROP TABLE IF EXISTS vectors');
         await this.execute('DROP TABLE IF EXISTS blocks');
         await this.execute('DROP TABLE IF EXISTS chunks');
+        await this.execute('DROP TABLE IF EXISTS fts_content');
         await this.execute('DROP TABLE IF EXISTS notes');
         
         this.logger.info('SqlJsAdapter', 'All tables dropped successfully');
@@ -609,6 +636,50 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         }
     }
 
+    async searchFTS(query: string, limit: number): Promise<FTSResult[]> {
+        if (!this.db) throw new Error('Database not initialized');
+        
+        // Escape FTS query and use FTS3 MATCH syntax
+        const escapedQuery = query.replace(/["']/g, '').trim();
+        if (!escapedQuery) return [];
+        
+        const rows = await this.query(`
+            SELECT id, type, note_id, content, note_path, note_name, block_id
+            FROM fts_content 
+            WHERE content MATCH ?
+            LIMIT ?
+        `, [escapedQuery, limit]);
+        
+        return rows.map(row => ({
+            id: row.id,
+            type: row.type,
+            noteId: row.note_id,
+            content: row.content,
+            notePath: row.note_path,
+            noteName: row.note_name,
+            blockId: row.block_id,
+            relevance: 1.0 // Simple relevance score since we removed rank()
+        }));
+    }
+
+    async insertFTSContent(id: string, type: string, noteId: string, content: string, notePath: string, noteName: string, blockId?: string): Promise<void> {
+        if (!this.db) throw new Error('Database not initialized');
+        
+        await this.execute(`
+            INSERT OR REPLACE INTO fts_content (id, type, note_id, content, note_path, note_name, block_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `, [id, type, noteId, content, notePath, noteName, blockId || null]);
+        
+        await this.save();
+    }
+
+    async deleteFTSContentForNote(noteId: string): Promise<void> {
+        if (!this.db) throw new Error('Database not initialized');
+        
+        await this.execute('DELETE FROM fts_content WHERE note_id = ?', [noteId]);
+        await this.save();
+    }
+
     private generateId(): string {
         return Date.now().toString(36) + Math.random().toString(36).substr(2);
     }
@@ -649,6 +720,17 @@ export type Vector = {
     created_at: string;
     updated_at: string;
     vector: Int8Array; // Quantized int8 vectors
+};
+
+export type FTSResult = {
+    id: string;
+    type: string;
+    noteId: string;
+    content: string;
+    notePath: string;
+    noteName: string;
+    blockId?: string;
+    relevance: number;
 };
 
 export class DatabaseService {
@@ -1178,7 +1260,6 @@ export class DatabaseService {
         }
         const trimmedContent = note.text.trim();
         if (!trimmedContent || trimmedContent.length < 16) {
-            this.logger.debug('SqlJsAdapter', `Note ${noteId} (${note.path}) has insufficient content (${trimmedContent.length} chars), skipping vector processing`);
             return
         }
 
@@ -1193,6 +1274,16 @@ export class DatabaseService {
                 type: VectorType.NOTE,
                 vector: noteVector
             });
+            
+            // Also add note content to FTS index
+            await this.adapter.insertFTSContent(
+                `note_${noteId}`,
+                'note',
+                noteId,
+                note.text,
+                note.path,
+                note.name
+            );
         } catch (error) {
             this.logger.error('SqlJsAdapter', `Failed to process note ${noteId}`, error);
             throw error;
@@ -1229,7 +1320,6 @@ export class DatabaseService {
         }
         
         await this.adapter.save();
-        this.logger.debug('SqlJsAdapter', `Inserted ${blocks.length} blocks for note ${noteId}`);
         
         return { blockIds };
     }
@@ -1265,7 +1355,6 @@ export class DatabaseService {
             // Get the blocks for this note, filtering out null content
             const blocks = await this.getBlocksForNote(noteId, true);
             if (blocks.length === 0) {
-                this.logger.debug('SqlJsAdapter', `No blocks found for note ${noteId}, skipping vector processing`);
                 return;
             }
 
@@ -1281,7 +1370,6 @@ export class DatabaseService {
             const filteredBlocks = blocks.filter(block => allowedBlockTypes.includes(block.type));
             
             if (filteredBlocks.length === 0) {
-                this.logger.debug('SqlJsAdapter', `No processable blocks found for note ${noteId}`);
                 return;
             }
 
@@ -1291,7 +1379,7 @@ export class DatabaseService {
             // Generate embeddings for all blocks at once
             const embeddings = await embeddingService.embedTexts(blockTexts);
             
-            // Store the embeddings in the vectors table
+            // Store the embeddings in the vectors table and FTS content
             for (let i = 0; i < embeddings.length; i++) {
                 const block = filteredBlocks[i];
                 const embedding = embeddings[i];
@@ -1303,6 +1391,20 @@ export class DatabaseService {
                     type: VectorType.BLOCK,
                     vector: embedding
                 });
+                
+                // Get note info for FTS indexing
+                const note = await this.getNote(noteId);
+                if (note) {
+                    await this.adapter.insertFTSContent(
+                        `block_${block.id}`,
+                        'block',
+                        noteId,
+                        block.content,
+                        note.path,
+                        note.name,
+                        block.id
+                    );
+                }
             }
             
             this.logger.info('SqlJsAdapter', `Generated and stored ${embeddings.length} block embeddings for note ${noteId}`);
@@ -1334,11 +1436,9 @@ export class DatabaseService {
                         path: filePath
                     });
                     
-                    this.logger.debug('SqlJsAdapter', `Updated existing note: ${filePath}`);
                     return { noteId: existingNote.id, changed: true };
                 } else {
                     // Content unchanged - skip
-                    this.logger.debug('SqlJsAdapter', `No changes detected for note: ${filePath}`);
                     return { noteId: existingNote.id, changed: false };
                 }
             } else {
@@ -1350,7 +1450,6 @@ export class DatabaseService {
                     path: filePath
                 });
                 
-                this.logger.debug('SqlJsAdapter', `Created new note: ${filePath}`);
                 return { noteId: newNoteId, changed: true };
             }
         } catch (error) {
@@ -1359,6 +1458,69 @@ export class DatabaseService {
         }
     }
 
+
+    async searchFTS(query: string, limit: number = 10): Promise<FTSResult[]> {
+        return await this.adapter.searchFTS(query, limit);
+    }
+
+    async getFTSTableStats(): Promise<{ count: number; sampleContent: string | null }> {
+        const countResult = await this.adapter.get('SELECT COUNT(*) as count FROM fts_content');
+        const sampleResult = await this.adapter.get('SELECT content FROM fts_content LIMIT 1');
+        
+        return {
+            count: countResult?.count || 0,
+            sampleContent: sampleResult?.content || null
+        };
+    }
+
+    async ensureFTSContentForAllNotes(): Promise<void> {
+        this.logger.info('DatabaseService', 'Ensuring FTS content exists for all notes...');
+        
+        // Get all notes
+        const allNotes = await this.getAllNotes();
+        
+        // Get existing FTS content note IDs
+        const existingFTSNoteIds = new Set<string>();
+        const ftsRows = await this.adapter.query('SELECT DISTINCT note_id FROM fts_content');
+        ftsRows.forEach(row => existingFTSNoteIds.add(row.note_id));
+        
+        let populated = 0;
+        
+        for (const note of allNotes) {
+            if (!existingFTSNoteIds.has(note.id)) {
+                
+                // Add note content to FTS
+                await this.adapter.insertFTSContent(
+                    `note_${note.id}`,
+                    'note',
+                    note.id,
+                    note.text,
+                    note.path,
+                    note.name
+                );
+                
+                // Add block content to FTS
+                const blocks = await this.getBlocksForNote(note.id);
+                for (const block of blocks) {
+                    await this.adapter.insertFTSContent(
+                        `block_${block.id}`,
+                        'block',
+                        note.id,
+                        block.content,
+                        note.path,
+                        note.name,
+                        block.id
+                    );
+                }
+                
+                populated++;
+            }
+        }
+        
+        if (populated > 0) {
+            this.logger.info('DatabaseService', `Populated FTS content for ${populated} notes`);
+        }
+    }
 
     async getVectorDatabaseStats(): Promise<{
         totalNotes: number;

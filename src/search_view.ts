@@ -80,7 +80,6 @@ class TezcatView extends ItemView {
 
   setLastActiveMarkdownView(view: MarkdownView | null) {
     this.lastActiveMarkdownView = view;
-    logger.debug('SearchView', `Set last active markdown view: ${view?.file?.path || 'none'}`);
   }
 
   private showEmptyState() {
@@ -166,8 +165,6 @@ class TezcatView extends ItemView {
   }
 
   private insertText(result: SearchResult) {
-    logger.debug('SearchView', `Insert text clicked for result: ${result.noteName}`);
-    
     // Suppress search for 2 seconds after button click
     if (this.plugin && this.plugin.suppressSearchFor) {
       this.plugin.suppressSearchFor(2000);
@@ -175,27 +172,21 @@ class TezcatView extends ItemView {
     
     // Try to get current active view first
     let targetView = this.app.workspace.getActiveViewOfType(MarkdownView);
-    logger.debug('SearchView', `Current active view: ${targetView?.file?.path || 'none'}`);
     
     // If no active view, use the last known markdown view
     if (!targetView) {
       targetView = this.lastActiveMarkdownView;
-      logger.debug('SearchView', `Using last active view: ${targetView?.file?.path || 'none'}`);
     }
     
     if (targetView && targetView.editor) {
       const text = result.type === 'block' ? result.text : result.noteName;
-      logger.debug('SearchView', `Inserting text: ${text.substring(0, 50)}...`);
       targetView.editor.replaceSelection(text);
-      logger.debug('SearchView', 'Text inserted successfully');
     } else {
       logger.warn('SearchView', 'No valid markdown view found for text insertion');
     }
   }
 
   private insertLink(result: SearchResult) {
-    logger.debug('SearchView', `Insert link clicked for result: ${result.noteName}`);
-    
     // Suppress search for 2 seconds after button click
     if (this.plugin && this.plugin.suppressSearchFor) {
       this.plugin.suppressSearchFor(2000);
@@ -203,19 +194,15 @@ class TezcatView extends ItemView {
     
     // Try to get current active view first
     let targetView = this.app.workspace.getActiveViewOfType(MarkdownView);
-    logger.debug('SearchView', `Current active view: ${targetView?.file?.path || 'none'}`);
     
     // If no active view, use the last known markdown view
     if (!targetView) {
       targetView = this.lastActiveMarkdownView;
-      logger.debug('SearchView', `Using last active view: ${targetView?.file?.path || 'none'}`);
     }
     
     if (targetView && targetView.editor) {
       const linkText = `[[${result.notePath}|${result.noteName}]]`;
-      logger.debug('SearchView', `Inserting link: ${linkText}`);
       targetView.editor.replaceSelection(linkText);
-      logger.debug('SearchView', 'Link inserted successfully');
     } else {
       logger.warn('SearchView', 'No valid markdown view found for link insertion');
     }
@@ -263,7 +250,6 @@ class TezcatView extends ItemView {
             (this.plugin as any).debouncedSearch(result.text);
           }
           
-          logger.debug('SearchView', `Navigated to block at line ${result.blockStartPosition.line}, col ${result.blockStartPosition.col}`);
         }
       }, 100);
     }
@@ -278,12 +264,10 @@ class TezcatView extends ItemView {
         // For blocks: copy the block text
         textToCopy = result.text;
         noticeMessage = 'Block text copied to clipboard';
-        logger.debug('SearchView', `Copied block text to clipboard: ${textToCopy.substring(0, 50)}...`);
       } else {
         // For notes: copy a markdown link
         textToCopy = `[[${result.notePath}|${result.noteName}]]`;
         noticeMessage = 'Note link copied to clipboard';
-        logger.debug('SearchView', `Copied note link to clipboard: ${textToCopy}`);
       }
 
       // Copy to clipboard using the modern Clipboard API

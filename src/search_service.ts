@@ -1,4 +1,4 @@
-import { DatabaseService, Vector, VectorType } from './database_service';
+import { DatabaseService, Vector, VectorType, FTSResult } from './database_service';
 import { EmbeddingService } from './embedding_service';
 import { Logger } from './logger';
 import { Position } from './note_processor';
@@ -24,6 +24,8 @@ export type SearchOptions = {
     includeBlockVectors?: boolean;
     excludeNotePaths?: string[];
     useVectorIndex?: boolean;
+    useHybridSearch?: boolean;
+    hybridWeight?: number; // Weight for combining vector and FTS scores (0.0 = only FTS, 1.0 = only vector)
 };
 
 
@@ -65,11 +67,7 @@ export class SearchService {
         this.logger.info('SearchService', `Starting vector search for query: "${query.substring(0, 50)}${query.length > 50 ? '...' : ''}"`);
 
         // Embed the query
-        const embeddingStartTime = performance.now();
-        this.logger.debug('SearchService', 'Beginning query embedding...');
         const queryVector = await this.embeddingService.embedText(query);
-        const embeddingEndTime = performance.now();
-        this.logger.debug('SearchService', `Query embedding completed in ${(embeddingEndTime - embeddingStartTime).toFixed(2)}ms`);
 
         // Get vectors from database - use index if requested and available
         let allVectors: Vector[];
@@ -77,7 +75,6 @@ export class SearchService {
             this.logger.info('SearchService', 'Using vector index for candidate selection');
             try {
                 allVectors = await this.databaseService.getSimilarVectors(queryVector, topK);
-                this.logger.debug('SearchService', `Vector index returned ${allVectors.length} candidates`);
             } catch (error) {
                 this.logger.warn('SearchService', 'Vector index failed, falling back to linear search', error);
                 allVectors = await this.databaseService.getAllVectors();
@@ -85,8 +82,6 @@ export class SearchService {
         } else {
             if (useVectorIndex) {
                 this.logger.warn('SearchService', 'Vector index requested but not available, using linear search');
-            } else {
-                this.logger.debug('SearchService', 'Using linear search as requested');
             }
             allVectors = await this.databaseService.getAllVectors();
         }
@@ -119,9 +114,6 @@ export class SearchService {
             return true;
         });
         
-        if (vectors.length !== allVectors.length) {
-            this.logger.debug('SearchService', `Filtered to ${vectors.length} vectors (excluded ${allVectors.length - vectors.length} vectors)`);
-        }
 
         // Calculate similarities
         const results: SearchResult[] = [];
@@ -191,12 +183,132 @@ export class SearchService {
         const totalSearchTime = searchEndTime - searchStartTime;
         
         this.logger.info('SearchService', `Search completed in ${totalSearchTime.toFixed(2)}ms`);
-        this.logger.debug('SearchService', `Found ${results.length} matches above threshold, returning top ${topResults.length}`);
-        this.logger.debug('SearchService', `Results served - Score range: ${topResults.length > 0 ? `${topResults[topResults.length - 1].score.toFixed(3)} - ${topResults[0].score.toFixed(3)}` : 'N/A'}`);
 
         return topResults;
     }
 
+    /**
+     * Perform hybrid search using Reciprocal Rank Fusion (RRF) to combine vector and FTS results
+     */
+    async hybridSearch(query: string, options: SearchOptions = {}): Promise<SearchResult[]> {
+        const {
+            topK = 10,
+            minScore = 0.0,
+            includeNoteVectors = true,
+            includeChunkVectors = false,
+            includeBlockVectors = true,
+            excludeNotePaths = [],
+            hybridWeight = 0.5 // Weight for vector vs FTS in RRF (0.5 = 50% vector, 50% FTS)
+        } = options;
+
+        const searchStartTime = performance.now();
+        this.logger.info('SearchService', `Starting RRF hybrid search for query: "${query.substring(0, 50)}${query.length > 50 ? '...' : ''}"`);
+
+        // Perform both vector and FTS searches in parallel
+        const [vectorResults, ftsResults] = await Promise.all([
+            this.vectorSearch(query, { ...options, useHybridSearch: false }),
+            this.databaseService.searchFTS(query, topK * 2)
+        ]);
+
+        // Create maps for RRF processing
+        const vectorRankMap = new Map<string, number>(); // key -> rank
+        const ftsRankMap = new Map<string, number>(); // key -> rank
+        const allResultsMap = new Map<string, SearchResult>(); // key -> SearchResult
+
+        // Build vector rank map and results map
+        vectorResults.forEach((result, index) => {
+            const key = result.blockId || result.noteId;
+            vectorRankMap.set(key, index + 1);
+            allResultsMap.set(key, result);
+        });
+
+        // Build FTS rank map and add FTS-only results to results map
+        for (let i = 0; i < ftsResults.length; i++) {
+            const ftsResult = ftsResults[i];
+            const key = ftsResult.blockId || ftsResult.noteId;
+            ftsRankMap.set(key, i + 1);
+            
+            // If not already in results map from vector search, add it
+            if (!allResultsMap.has(key)) {
+                const searchResult: SearchResult = {
+                    noteId: ftsResult.noteId,
+                    blockId: ftsResult.blockId,
+                    type: ftsResult.type as VectorType,
+                    score: 0, // Will be set by RRF
+                    text: ftsResult.content,
+                    notePath: ftsResult.notePath,
+                    noteName: ftsResult.noteName
+                };
+                
+                // Add position data for blocks if available
+                if (ftsResult.blockId && ftsResult.type === 'block') {
+                    try {
+                        const blocks = await this.databaseService.getBlocksForNote(ftsResult.noteId);
+                        const block = blocks.find(b => b.id === ftsResult.blockId);
+                        if (block) {
+                            searchResult.blockStartPosition = block.start_position;
+                            searchResult.blockEndPosition = block.end_position;
+                        }
+                    } catch (error) {
+                        this.logger.warn('SearchService', `Failed to get block position for ${ftsResult.blockId}`, error);
+                    }
+                }
+                
+                allResultsMap.set(key, searchResult);
+            }
+        }
+
+        // Apply Reciprocal Rank Fusion (RRF) with hybrid weighting
+        const k = 60; // RRF constant
+        const rrfScores = new Map<string, number>();
+
+        // Calculate RRF scores for all results
+        for (const [key, result] of allResultsMap) {
+            let rrfScore = 0;
+            
+            // Add vector ranking contribution
+            if (vectorRankMap.has(key)) {
+                rrfScore += hybridWeight * (1 / (k + vectorRankMap.get(key)!));
+            }
+            
+            // Add FTS ranking contribution
+            if (ftsRankMap.has(key)) {
+                rrfScore += (1 - hybridWeight) * (1 / (k + ftsRankMap.get(key)!));
+            }
+            
+            if (rrfScore > 0) {
+                rrfScores.set(key, rrfScore);
+            }
+        }
+
+        // Create final results with RRF scores
+        const fusedResults: SearchResult[] = [];
+        for (const [key, rrfScore] of rrfScores) {
+            if (rrfScore >= minScore) {
+                const result = allResultsMap.get(key)!;
+                fusedResults.push({
+                    ...result,
+                    score: rrfScore
+                });
+            }
+        }
+
+        // Sort by RRF score and take top K
+        fusedResults.sort((a, b) => b.score - a.score);
+        let finalResults = fusedResults.slice(0, topK);
+
+        // Apply exclusion filters
+        if (excludeNotePaths.length > 0) {
+            finalResults = finalResults.filter(result => !excludeNotePaths.includes(result.notePath));
+        }
+
+        const searchEndTime = performance.now();
+        const totalSearchTime = searchEndTime - searchStartTime;
+        
+        this.logger.info('SearchService', `RRF hybrid search completed in ${totalSearchTime.toFixed(2)}ms`);
+
+        return finalResults;
+    }
 
     /**
      * Calculate cosine similarity between two quantized int8 vectors
