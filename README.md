@@ -4,6 +4,8 @@ Tezcat is an Obsidian plugin that indexes your thoughts. It uses an AI embedding
 
 This tool works best with Ollama in the current state. It frequently makes calls to generate embeddings and search its database, and if you use a proprietary embeddings endpoint this may incur undesired costs.
 
+![Searching Edgar Allen Poe's corpus](./assets/tezcat_search_3.gif)
+
 # Requirements
 
 ## Local
