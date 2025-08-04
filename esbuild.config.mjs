@@ -33,8 +33,29 @@ const context = await esbuild.context({
 		"@lezer/lr",
 		...builtins],
 	loader: {
-		'.wasm': 'file'
+		// Disable default WASM loader to let our plugin handle it
 	},
+	plugins: [
+		{
+			name: 'wasm-plugin',
+			setup(build) {
+				// Embed WASM files as base64 strings
+				build.onLoad({ filter: /\.wasm$/ }, async (args) => {
+					const fs = await import('fs');
+					const wasmBuffer = await fs.promises.readFile(args.path);
+					const base64 = wasmBuffer.toString('base64');
+					return {
+						contents: `
+							const wasmBase64 = "${base64}";
+							const wasmBuffer = Uint8Array.from(atob(wasmBase64), c => c.charCodeAt(0));
+							export default wasmBuffer;
+						`,
+						loader: 'js'
+					};
+				});
+			}
+		}
+	],
 	format: "cjs",
 	target: "es2020",
 	logLevel: "info",

@@ -9,6 +9,8 @@ export default defineConfig({
   resolve: {
     alias: {
       obsidian: new URL('./tests/obsidian-mock.ts', import.meta.url).pathname,
+      // Mock WASM imports
+      '../node_modules/sql.js/dist/sql-wasm.wasm': new URL('./tests/mocks/sql-wasm-mock.js', import.meta.url).pathname,
     },
   },
 });

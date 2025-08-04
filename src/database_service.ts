@@ -3,6 +3,9 @@ import { TextChunk } from './chunking_service';
 import { EmbeddingService, LSHConfig, LSHHashFunction, VectorUtils } from './embedding_service';
 import { Logger } from './logger';
 import { Block, BlockType } from './note_processor';
+import initSqlJs from 'sql.js';
+import sqlWasmPath from '../node_modules/sql.js/dist/sql-wasm.wasm';
+const sqlWasm = sqlWasmPath;
 
 
 export interface DatabaseAdapter {
@@ -54,17 +57,10 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         try {
             this.logger.info('SqlJsAdapter', 'Starting sql.js database initialization...');
             
-            // Import sql.js
-            const initSqlJs = (await import('sql.js')).default;
-            
             this.logger.info('SqlJsAdapter', 'sql.js loaded successfully');
             
-            // Read WASM file directly and provide as binary data
-            const wasmPath = `${this.plugin.app.vault.configDir}/plugins/tezcat/sql-wasm.wasm`;
-            const wasmBuffer = await this.plugin.app.vault.adapter.readBinary(wasmPath);
-            
             this.SQL = await initSqlJs({
-                wasmBinary: wasmBuffer
+                wasmBinary: sqlWasm
             });
             this.logger.info('SqlJsAdapter', 'sql.js initialized successfully');
             

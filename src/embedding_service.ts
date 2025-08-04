@@ -335,6 +335,9 @@ export class OpenAIEmbeddingProvider extends EmbeddingProvider {
         this.modelName = modelName;
         this.baseUrl = baseUrl;
         this.logger = logger;
+        
+        // Debug: Log API key info (without exposing the full key)
+        this.logger.debug('OpenAIProvider', `API key length: ${apiKey?.length || 0}, starts with: ${apiKey?.substring(0, 7) || 'undefined'}`);
     }
 
     async embed_one(text: string): Promise<Int8Array> {
