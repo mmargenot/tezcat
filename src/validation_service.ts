@@ -247,7 +247,7 @@ export class ValidationService {
         
         // Show user feedback
         if (allSuccessful) {
-            new Notice('System validation successful - Tezcat is ready!', 3000);
+            new Notice('System validation successful - proceeding with setup...', 3000);
         } else {
             const failures = [];
             if (!embeddingProvider.success) failures.push('Provider');

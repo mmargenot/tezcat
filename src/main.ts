@@ -55,7 +55,8 @@ export default class Tezcat extends Plugin {
     private validationService: ValidationService;
     public modelManager: OllamaModelManager | null = null;
     private systemValidationResult: SystemValidationResult | null = null;
-    private isSystemValid: boolean = false;
+    public isSystemValid: boolean = false;
+    public isOperationInProgress: boolean = false;
     private searchDebounceTimer: number | null = null;
     private lastSearchContext: string = '';
     private get CONTEXT_WINDOW_WORDS() { 
@@ -315,14 +316,53 @@ export default class Tezcat extends Plugin {
         await this.saveData(this.settings);
         // Update logger level when settings are saved
         logger.setLevel(this.settings.logLevel);
+        // Reinitialize services to pick up new settings
+        this.reinitializeServicesAfterSettingsChange();
+    }
+
+    private reinitializeServicesAfterSettingsChange(): void {
+        logger.info('Plugin', 'Reinitializing services after settings change');
+        
+        // Reinitialize embedding services with new settings
+        this.initializeEmbeddingServices();
+        
+        // Update chunking service with new settings
+        this.chunkingService = new ChunkingService(
+            this.settings.chunkSize, 
+            this.settings.chunkOverlap, 
+            this, 
+            logger
+        );
+        
+        // Recreate search service with updated embedding service
+        this.searchService = new SearchService(
+            this.databaseService, 
+            this.embeddingService, 
+            logger
+        );
+        
+        // Clear any cached validation results to force fresh validation
+        this.clearValidationCache();
+        
+        logger.info('Plugin', 'Services reinitialized after settings change');
+    }
+
+    /**
+     * Clear validation cache to force fresh validation
+     */
+    clearValidationCache(): void {
+        this.systemValidationResult = null;
+        this.isSystemValid = false;
     }
 
     // Vector database command implementations
     async rebuildDatabase() {
-        if (!this.ensureSystemValid()) {
+        if (this.isOperationInProgress) {
+            new Notice('Database operation already in progress. Please wait for it to complete.');
             return;
         }
-        
+
+        this.isOperationInProgress = true;
         new Notice('Starting database rebuild...');
         
         try {
@@ -349,9 +389,15 @@ export default class Tezcat extends Plugin {
             await this.databaseAdapter.save();
             
             new Notice('Database rebuild completed successfully!');
+            
+            // Update system status to reflect successful rebuild
+            this.isSystemValid = true;
+            this.updateStatusBar('check', 'Tezcat: System ready', 'tezcat-status-ready');
         } catch (error) {
             logger.error('Plugin', 'Database rebuild failed', error);
             new Notice('Database rebuild failed. Check console for details.');
+        } finally {
+            this.isOperationInProgress = false;
         }
     }
 
@@ -391,6 +437,12 @@ export default class Tezcat extends Plugin {
      * Perform system validation before any setup
      */
     async performValidationAndSetup(): Promise<void> {
+        if (this.isOperationInProgress) {
+            new Notice('Database operation already in progress. Please wait for it to complete.');
+            return;
+        }
+
+        this.isOperationInProgress = true;
         try {
             logger.info('Plugin', 'Starting system validation...');
             
@@ -405,8 +457,9 @@ export default class Tezcat extends Plugin {
             
             if (this.isSystemValid) {
                 logger.info('Plugin', 'System validation successful, proceeding with setup...');
-                this.updateStatusBar('check', 'Tezcat: System ready', 'tezcat-status-ready');
                 await this.performAutomaticSetup();
+                // Only show "ready" status after setup completes successfully
+                this.updateStatusBar('check', 'Tezcat: System ready', 'tezcat-status-ready');
                 await this.activateView();
             } else {
                 logger.warn('Plugin', 'System validation failed, skipping automatic setup');
@@ -422,6 +475,8 @@ export default class Tezcat extends Plugin {
             this.updateStatusBar('x', 'Tezcat: Setup failed', 'tezcat-status-error');
             new Notice('Tezcat setup failed. Check console for details.', 10000);
             await this.activateView(); // Show view with error state
+        } finally {
+            this.isOperationInProgress = false;
         }
     }
 
@@ -954,7 +1009,7 @@ export default class Tezcat extends Plugin {
     /**
      * Update the status bar with current system status
      */
-    private updateStatusBar(status: string, tooltip: string, className?: string) {
+    public updateStatusBar(status: string, tooltip: string, className?: string) {
         if (!this.statusBarItem) return;
         
         this.statusBarItem.empty();
@@ -1000,8 +1055,15 @@ export default class Tezcat extends Plugin {
      * Show detailed system status in a modal
      */
     private async showSystemStatusModal() {
-        if (!this.systemValidationResult) {
-            new Notice('System validation not yet completed');
+        // If operation is in progress, show modal immediately without validation
+        if (this.isOperationInProgress) {
+            // Skip validation and proceed directly to showing modal
+        } else if (!this.systemValidationResult) {
+            // Only run validation if not in progress and no validation result exists
+            new Notice('Running system validation...');
+            await this.performValidationAndSetup();
+            // Return early - performValidationAndSetup handles everything including user feedback
+            // Don't show the modal after validation/setup completes
             return;
         }
         
@@ -1017,12 +1079,18 @@ export default class Tezcat extends Plugin {
                     success: true,
                     message: `Database ready (${noteCount} notes, ${vectorCount} vectors)`
                 }
-            };
+            } as SystemValidationResult;
             
             new SystemStatusModal(this.app, updatedResult, this.isSystemValid, this).open();
         } catch (error) {
-            // Fall back to cached result if database query fails
-            new SystemStatusModal(this.app, this.systemValidationResult, this.isSystemValid, this).open();
+            // Fall back to cached result if database query fails, or create minimal result if none exists
+            const fallbackResult = this.systemValidationResult || {
+                embeddingProvider: { success: false, message: 'Not validated yet' },
+                database: { success: false, message: 'Not validated yet' },
+                models: { success: false, message: 'Not validated yet' },
+                overall: { success: false, message: 'System not validated yet' }
+            };
+            new SystemStatusModal(this.app, fallbackResult, this.isSystemValid, this).open();
         }
     }
 
@@ -1260,6 +1328,27 @@ class TezcatSettingTab extends PluginSettingTab {
             cancelButton.onclick = () => this.cancelChanges();
         }
 
+        // Rebuild Database Button
+        new Setting(containerEl)
+            .setName('Rebuild Database & Index')
+            .setDesc('Completely rebuild the database and reindex all vault content. This will take some time but can fix indexing issues.')
+            .addButton(button => button
+                .setButtonText('Rebuild Database')
+                .setClass('mod-warning')
+                .onClick(async () => {
+                    // Show confirmation modal
+                    new ReindexConfirmModal(
+                        this.app,
+                        async () => {
+                            // User confirmed - proceed with rebuild
+                            await this.plugin.rebuildDatabase();
+                        },
+                        () => {
+                            // User cancelled - do nothing
+                        }
+                    ).open();
+                }));
+
         // Horizontal divider
         const divider = containerEl.createEl('hr', {
             attr: { style: 'margin: 2em 0; border: none; border-top: 1px solid var(--background-modifier-border);' }
@@ -1393,6 +1482,9 @@ class TezcatSettingTab extends PluginSettingTab {
             logger
         );
         
+        // Clear any cached validation results to force fresh validation
+        this.plugin.clearValidationCache();
+        
         logger.info('Plugin', 'Services reinitialized successfully');
     }
 
@@ -1434,6 +1526,12 @@ class TezcatSettingTab extends PluginSettingTab {
     }
 
     private async saveAndReindex() {
+        if (this.plugin.isOperationInProgress) {
+            new Notice('Database operation already in progress. Please wait for it to complete.');
+            return;
+        }
+
+        this.plugin.isOperationInProgress = true;
         try {
             // Save settings first
             this.plugin.settings = { ...this.pendingSettings };
@@ -1460,6 +1558,10 @@ class TezcatSettingTab extends PluginSettingTab {
             new Notice('Reindexing completed successfully!');
             logger.info('Plugin', 'Reindexing completed successfully');
             
+            // Update system status to reflect successful reindex
+            this.plugin.isSystemValid = true;
+            this.plugin.updateStatusBar('check', 'Tezcat: System ready', 'tezcat-status-ready');
+            
             // Reset pending settings to match saved settings and refresh UI
             this.pendingSettings = { ...this.plugin.settings };
             this.hasSensitiveChanges = false;
@@ -1485,6 +1587,8 @@ class TezcatSettingTab extends PluginSettingTab {
             this.pendingSettings = { ...this.plugin.settings };
             this.hasSensitiveChanges = false;
             this.display();
+        } finally {
+            this.plugin.isOperationInProgress = false;
         }
     }
 
@@ -1633,6 +1737,16 @@ class SystemStatusModal extends Modal {
 
         contentEl.createEl('h2', { text: 'Tezcat System Status' });
         
+        // Show operation in progress status
+        if (this.plugin.isOperationInProgress) {
+            const progressEl = contentEl.createDiv('tezcat-operation-progress');
+            progressEl.addClass('operation-in-progress');
+            progressEl.createEl('strong', { text: 'Operation in Progress' });
+            progressEl.createEl('br');
+            progressEl.appendText('Database rebuild or validation is currently running. Please wait for it to complete.');
+            progressEl.createEl('br');
+        }
+        
         // Overall status
         const overallEl = contentEl.createDiv('tezcat-overall-status');
         
@@ -1677,14 +1791,20 @@ class SystemStatusModal extends Modal {
         
         if (!this.isSystemValid) {
             const retryButton = buttonContainer.createEl('button', {
-                text: 'Retry Setup',
-                cls: 'mod-cta'
+                text: this.plugin.isOperationInProgress ? 'Operation in Progress...' : 'Retry Setup',
+                cls: this.plugin.isOperationInProgress ? 'mod-muted' : 'mod-cta'
             });
-            retryButton.onclick = async () => {
-                this.close();
-                new Notice('Retrying system setup...');
-                await this.plugin.performValidationAndSetup();
-            };
+            
+            if (this.plugin.isOperationInProgress) {
+                retryButton.disabled = true;
+                retryButton.style.opacity = '0.5';
+            } else {
+                retryButton.onclick = async () => {
+                    this.close();
+                    new Notice('Retrying system setup...');
+                    await this.plugin.performValidationAndSetup();
+                };
+            }
             
             const settingsButton = buttonContainer.createEl('button', {
                 text: 'Open Settings'
