@@ -512,6 +512,11 @@ export class OpenAIEmbeddingProvider extends EmbeddingProvider {
     }
 
     async validate(): Promise<void> {
+        // Check for empty or missing API key first
+        if (!this.apiKey || this.apiKey.trim() === '') {
+            throw new Error('OpenAI API key is required. Please configure your API key in Tezcat settings (Settings → Community Plugins → Tezcat → Options).');
+        }
+        
         try {
             const response = await requestUrl({
                 url: 'https://api.openai.com/v1/me',
@@ -524,7 +529,7 @@ export class OpenAIEmbeddingProvider extends EmbeddingProvider {
             
             if (response.status !== 200) {
                 if (response.status === 401 || response.status === 403) {
-                    throw new Error('Invalid OpenAI API key. Please check your API key in settings.');
+                    throw new Error('Invalid OpenAI API key. Please check your API key in Tezcat settings (Settings → Community Plugins → Tezcat → Options).');
                 }
                 throw new Error(`OpenAI API returned ${response.status}`);
             }
