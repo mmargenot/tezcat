@@ -1146,7 +1146,7 @@ class TezcatSettingTab extends PluginSettingTab {
         containerEl.empty();
 
         // Embedding Settings Section
-        containerEl.createEl('h3', { text: 'Embedding settings' });
+        new Setting(containerEl).setHeading().setName('Embeddings');
         containerEl.createEl('p', {
             text: 'Changing these settings will require reindexing all vault content.',
             cls: 'setting-item-description'
@@ -1355,7 +1355,7 @@ class TezcatSettingTab extends PluginSettingTab {
         });
 
         // Application Settings Section
-        containerEl.createEl('h3', { text: 'Application settings' });
+        new Setting(containerEl).setHeading().setName('Application');
         containerEl.createEl('p', {
             text: 'These settings take effect immediately and don\'t require reindexing.',
             cls: 'setting-item-description'
@@ -1622,8 +1622,8 @@ class ReindexConfirmModal extends Modal {
         const { contentEl } = this;
         contentEl.empty();
 
-        contentEl.createEl('h2', { text: 'Confirm reindex' });
-        
+        new Setting(contentEl).setHeading().setName('Confirm reindex');
+
         contentEl.createEl('p', {
             text: 'The changes you made will require reindexing all vault content. This may take several minutes depending on your vault size.'
         });
@@ -1676,8 +1676,8 @@ class VectorSearchModal extends Modal {
         const { contentEl } = this;
         contentEl.empty();
 
-        contentEl.createEl('h2', { text: 'Vector search' });
-        
+        new Setting(contentEl).setHeading().setName('Vector search');
+
         const inputContainer = contentEl.createDiv('tezcat-modal-input-container');
         const input = inputContainer.createEl('input', {
             type: 'text',
@@ -1735,8 +1735,8 @@ class SystemStatusModal extends Modal {
         const { contentEl } = this;
         contentEl.empty();
 
-        contentEl.createEl('h2', { text: 'Tezcat system status' });
-        
+        new Setting(contentEl).setHeading().setName('Tezcat system status');
+
         // Show operation in progress status
         if (this.plugin.isOperationInProgress) {
             const progressEl = contentEl.createDiv('tezcat-operation-progress');
@@ -1863,7 +1863,7 @@ class VectorSearchResultsModal extends Modal {
         const { contentEl } = this;
         contentEl.empty();
 
-        contentEl.createEl('h2', { text: `Search results for: "${this.query}"` });
+        new Setting(contentEl).setHeading().setName(`Search results for: "${this.query}"`);
         contentEl.createEl('p', { text: `Found ${this.results.length} matches` });
 
         const resultsContainer = contentEl.createDiv('tezcat-search-results');

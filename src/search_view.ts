@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, MarkdownView, Notice } from 'obsidian';
+import { ItemView, WorkspaceLeaf, MarkdownView, Notice, Setting } from 'obsidian';
 import { SearchResult } from './search_service';
 import { logger } from './logger';
 import { Position } from './note_processor';
@@ -34,7 +34,7 @@ class TezcatView extends ItemView {
     container.empty();
     
     const header = container.createEl('div', { cls: 'tezcat-search-view-header' });
-    header.createEl('h4', { text: 'Tezcat search' });
+    new Setting(header).setHeading().setName('Tezcat search');
 
     this.resultsContainer = container.createEl('div', { cls: 'tezcat-search-results-container' });
     this.showEmptyState();
