@@ -1678,7 +1678,7 @@ class VectorSearchModal extends Modal {
 
         contentEl.createEl('h2', { text: 'Vector Search' });
         
-        const inputContainer = contentEl.createDiv('modal-input-container');
+        const inputContainer = contentEl.createDiv('tezcat-modal-input-container');
         const input = inputContainer.createEl('input', {
             type: 'text',
             placeholder: 'Enter your search query...',
@@ -1921,7 +1921,7 @@ class VectorSearchResultsModal extends Modal {
                 pathEl.textContent = result.notePath;
 
                 // Text content (note path and name)
-                const textEl = resultEl.createDiv('search-result-text');
+                const textEl = resultEl.createDiv('tezcat-search-result-text');
                 textEl.textContent = result.text.length > 200 ? result.text.substring(0, 200) + '...' : result.text;
                 textEl.style.fontSize = '0.9em';
                 textEl.style.lineHeight = '1.4';
