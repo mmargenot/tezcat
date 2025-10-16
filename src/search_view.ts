@@ -22,7 +22,7 @@ class TezcatView extends ItemView {
   }
 
   getDisplayText() {
-    return 'Tezcat Search';
+    return 'Tezcat search';
   }
 
   getIcon() {
@@ -34,7 +34,7 @@ class TezcatView extends ItemView {
     container.empty();
     
     const header = container.createEl('div', { cls: 'tezcat-search-view-header' });
-    header.createEl('h4', { text: 'Tezcat Search' });
+    header.createEl('h4', { text: 'Tezcat search' });
 
     this.resultsContainer = container.createEl('div', { cls: 'tezcat-search-results-container' });
     this.showEmptyState();
@@ -117,41 +117,41 @@ class TezcatView extends ItemView {
     const actionsEl = itemEl.createEl('div', { cls: 'tezcat-search-result-actions' });
 
     if (result.type === 'note') {
-      // For note results: only show "Insert Link" and "Open Note"
+      // For note results: only show "Insert link" and "Open note"
 
       // Insert link button
-      const insertLinkBtn = actionsEl.createEl('button', { text: 'Insert Link' });
+      const insertLinkBtn = actionsEl.createEl('button', { text: 'Insert link' });
       insertLinkBtn.onclick = (e) => {
         e.stopPropagation();
         this.insertLink(result);
       };
 
       // Open note button
-      const openNoteBtn = actionsEl.createEl('button', { text: 'Open Note', cls: 'mod-cta' });
+      const openNoteBtn = actionsEl.createEl('button', { text: 'Open note', cls: 'mod-cta' });
       openNoteBtn.onclick = (e) => {
         e.stopPropagation();
         this.openNote(result);
       };
 
     } else if (result.type === 'block') {
-      // For block results: show "Insert Block", "Insert Link", and "Open Note" (goes to block location)
+      // For block results: show "Insert block", "Insert link", and "Open note" (goes to block location)
 
       // Insert text button
-      const insertTextBtn = actionsEl.createEl('button', { text: 'Insert Block' });
+      const insertTextBtn = actionsEl.createEl('button', { text: 'Insert block' });
       insertTextBtn.onclick = (e) => {
         e.stopPropagation();
         this.insertText(result);
       };
 
       // Insert link button
-      const insertLinkBtn = actionsEl.createEl('button', { text: 'Insert Link' });
+      const insertLinkBtn = actionsEl.createEl('button', { text: 'Insert link' });
       insertLinkBtn.onclick = (e) => {
         e.stopPropagation();
         this.insertLink(result);
       };
 
       // Open note button
-      const openNoteBtn = actionsEl.createEl('button', { text: 'Open Note', cls: 'mod-cta' });
+      const openNoteBtn = actionsEl.createEl('button', { text: 'Open note', cls: 'mod-cta' });
       openNoteBtn.onclick = (e) => {
         e.stopPropagation();
         this.openBlockInNote(result);
