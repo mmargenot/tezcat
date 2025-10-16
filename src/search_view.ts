@@ -73,7 +73,7 @@ class TezcatView extends ItemView {
       
       // Yield control back to the browser after each batch
       if (i + BATCH_SIZE < results.length) {
-        await new Promise(resolve => setTimeout(resolve, 0));
+        await new Promise(resolve => window.setTimeout(resolve, 0));
       }
     }
   }
@@ -219,7 +219,7 @@ class TezcatView extends ItemView {
     // If we have block position data, navigate to the block
     if (result.blockStartPosition) {
       // Small delay to ensure the editor is ready
-      setTimeout(() => {
+      window.setTimeout(() => {
         const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (activeView && activeView.editor && result.blockStartPosition) {
           const editor = activeView.editor;

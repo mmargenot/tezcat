@@ -475,7 +475,7 @@ export class OpenAIEmbeddingProvider extends EmbeddingProvider {
         const timeSinceLastRequest = now - this.lastRequestTime;
         if (timeSinceLastRequest < this.minRequestInterval) {
             const waitTime = this.minRequestInterval - timeSinceLastRequest;
-            await new Promise(resolve => setTimeout(resolve, waitTime));
+            await new Promise(resolve => window.setTimeout(resolve, waitTime));
         }
         this.lastRequestTime = Date.now();
 
@@ -498,7 +498,7 @@ export class OpenAIEmbeddingProvider extends EmbeddingProvider {
                     }
                     
                     this.logger.warn('OpenAIProvider', `Rate limited (attempt ${attempt}/${maxRetries}), retrying in ${retryDelay}ms`);
-                    await new Promise(resolve => setTimeout(resolve, retryDelay));
+                    await new Promise(resolve => window.setTimeout(resolve, retryDelay));
                     continue;
                 }
                 

@@ -699,7 +699,7 @@ export default class Tezcat extends Plugin {
         const target = evt.target as Element;
         if (target && (target.closest('.cm-editor') || target.closest('.markdown-source-view'))) {
             // Defer the heavy work to avoid blocking the click event
-            setTimeout(() => {
+            window.setTimeout(() => {
                 try {
                     const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
                     if (activeView && activeView.editor) {
@@ -715,19 +715,19 @@ export default class Tezcat extends Plugin {
 
     private onFileOpen(file: any) {
         // Handle note navigation tracking for file opens
-        setTimeout(() => {
+        window.setTimeout(() => {
             const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
             if (activeView) {
                 this.handleNoteNavigation(this.app.workspace.activeLeaf);
             }
         }, 10);
-        
+
         if (!this.isSearchPanelVisible()) {
             return;
         }
 
         // Small delay to ensure the editor is ready
-        setTimeout(() => {
+        window.setTimeout(() => {
             const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
             if (activeView && activeView.editor) {
                 const context = this.extractCursorContext(activeView.editor);
@@ -891,7 +891,7 @@ export default class Tezcat extends Plugin {
         if (leaves.length > 0) {
             const view = leaves[0].view as TezcatView;
             // Update view asynchronously to avoid blocking the editor
-            setTimeout(async () => {
+            window.setTimeout(async () => {
                 await view.updateSearchResults(results);
             }, 0);
         }
