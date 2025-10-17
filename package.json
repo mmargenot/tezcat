@@ -1,6 +1,6 @@
 {
 	"name": "tezcat",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"description": "Implements a remembrance agent for Obsidian. Look into the mirror.",
 	"main": "main.js",
 	"scripts": {
