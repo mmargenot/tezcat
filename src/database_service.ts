@@ -3,7 +3,7 @@ import { TextChunk } from './chunking_service';
 import { EmbeddingService, LSHConfig, LSHHashFunction, VectorUtils } from './embedding_service';
 import { Logger } from './logger';
 import { Block, BlockType } from './note_processor';
-import initSqlJs, { Database, SqlValue, SqlJsStatic } from 'sql.js';
+import initSqlJs, { Database, SqlValue, SqlJsStatic, BindParams } from 'sql.js';
 import sqlWasmPath from '../node_modules/sql.js/dist/sql-wasm.wasm';
 const sqlWasm = sqlWasmPath;
 
@@ -20,9 +20,9 @@ export interface DatabaseAdapter {
     dropAllTables(): Promise<void>;
     
     // Basic database operations
-    execute(sql: string, params?: unknown[]): Promise<void>;
-    query(sql: string, params?: unknown[]): Promise<Record<string, SqlValue>[]>;
-    get(sql: string, params?: unknown[]): Promise<Record<string, SqlValue> | null>;
+    execute(sql: string, params?: BindParams): Promise<void>;
+    query(sql: string, params?: BindParams): Promise<Record<string, SqlValue>[]>;
+    get(sql: string, params?: BindParams): Promise<Record<string, SqlValue> | null>;
     
     // Vector indexing operations
     generateVectorIndex(vectorDimensions: number): Promise<void>;
@@ -269,12 +269,12 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         this.logger.info('SqlJsAdapter', 'Created LSH tables for hash function storage and bucket indexing');
     }
 
-    async execute(sql: string, params?: unknown[]): Promise<void> {
+    async execute(sql: string, params?: BindParams): Promise<void> {
         if (!this.db) throw new Error('Database not initialized');
         this.db.run(sql, params);
     }
 
-    async query(sql: string, params?: unknown[]): Promise<Record<string, SqlValue>[]> {
+    async query(sql: string, params?: BindParams): Promise<Record<string, SqlValue>[]> {
         if (!this.db) throw new Error('Database not initialized');
         const stmt = this.db.prepare(sql);
         if (params) stmt.bind(params);
@@ -286,7 +286,7 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         return results;
     }
 
-    async get(sql: string, params?: unknown[]): Promise<Record<string, SqlValue> | null> {
+    async get(sql: string, params?: BindParams): Promise<Record<string, SqlValue> | null> {
         const results = await this.query(sql, params);
         return results[0] || null;
     }
