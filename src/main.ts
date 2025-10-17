@@ -718,7 +718,7 @@ export default class Tezcat extends Plugin {
         window.setTimeout(() => {
             const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
             if (activeView) {
-                this.handleNoteNavigation(this.app.workspace.activeLeaf);
+                this.handleNoteNavigation(activeView.leaf);
             }
         }, 10);
 
