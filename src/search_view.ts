@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, MarkdownView, Notice, Setting, sleep } from 'obsidian';
+import { ItemView, WorkspaceLeaf, MarkdownView, Notice, Setting } from 'obsidian';
 import { SearchResult } from './search_service';
 import { logger } from './logger';
 import { Position } from './note_processor';

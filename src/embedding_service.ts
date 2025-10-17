@@ -25,7 +25,7 @@ interface OllamaModelsResponse {
 }
 
 import { Logger } from './logger';
-import { Notice, requestUrl, sleep } from 'obsidian';
+import { Notice, requestUrl } from 'obsidian';
 
 // Vector processing utilities
 export class VectorUtils {
