@@ -333,19 +333,19 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
                 return;
             }
             
-            const vectorCount = vectorStats.count;
-            
+            const vectorCount = vectorStats.count as number;
+
             this.logger.info('SqlJsAdapter', `Building LSH index for ${vectorCount} vectors of ${vectorDimensions} dimensions`);
-            
+
             // Calculate optimal number of hash functions
             const numHashFunctions = Math.ceil(Math.log2(vectorCount));
-            
+
             // Ensure LSH tables exist before clearing them (safe to call multiple times)
             await this.createLSHBucketsTable();
-            
+
             // Clear existing LSH data
             await this.clearLSHTables();
-            
+
             // Generate hash functions using VectorUtils
             const configId = await this.createLSHConfig({
                 vector_count_at_build: vectorCount,
@@ -374,11 +374,11 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
             this.logger.info('SqlJsAdapter', `Populating LSH buckets for ${vectors.length} vectors...`);
             
             for (const vectorRow of vectors) {
-                const vector = new Int8Array(vectorRow.vector);
+                const vector = new Int8Array(vectorRow.vector as Uint8Array);
                 const hashVector = this.vectorUtils.computeHashVector(vector, storedHashFunctions, vectorDimensions);
                 const bucketHash = hashVector.join('');
-                
-                await this.createLSHBucket(configId, bucketHash, vectorRow.id);
+
+                await this.createLSHBucket(configId, bucketHash, vectorRow.id as string);
             }
             
             // Get and log LSH statistics
@@ -398,11 +398,11 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         if (!row) return null;
         
         return {
-            id: row.id,
-            vector_count_at_build: row.vector_count,
-            vector_dimensions: row.vector_dimensions,
-            num_hash_functions: row.num_hash_functions,
-            created_at: row.created_at
+            id: row.id as number,
+            vector_count_at_build: row.vector_count as number,
+            vector_dimensions: row.vector_dimensions as number,
+            num_hash_functions: row.num_hash_functions as number,
+            created_at: row.created_at as string
         };
     }
 
@@ -425,16 +425,16 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         
         return rows.map(row => {
             // Parse as regular array first, then convert to Float32Array
-            const projectionMatrixArray = JSON.parse(row.projection_matrix);
+            const projectionMatrixArray = JSON.parse(row.projection_matrix as string);
             const projectionMatrix = new Float32Array(projectionMatrixArray);
             this.logger.debug('SqlJsAdapter', `Retrieved hash function with ${projectionMatrix.length} dimensions`);
-            
+
             return {
-                id: row.id,
-                configId: row.config_id,
-                hashIndex: row.hash_index,
+                id: row.id as string,
+                configId: row.config_id as string,
+                hashIndex: row.hash_index as number,
                 projectionMatrix: projectionMatrix,
-                createdAt: new Date(row.created_at)
+                createdAt: new Date(row.created_at as string)
             };
         });
     }
@@ -496,7 +496,7 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
             WHERE config_id = ? AND bucket_hash = ?
         `, [configId, bucketHash]);
         
-        return rows.map(row => row.vector_id);
+        return rows.map(row => row.vector_id as string);
     }
 
     async getAllLSHBuckets(configId: string): Promise<{bucketHash: string, vectorIds: string[]}[]> {
@@ -508,10 +508,11 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         // Group by bucket hash
         const bucketMap = new Map<string, string[]>();
         for (const row of rows) {
-            if (!bucketMap.has(row.bucket_hash)) {
-                bucketMap.set(row.bucket_hash, []);
+            const bucketHash = row.bucket_hash as string;
+            if (!bucketMap.has(bucketHash)) {
+                bucketMap.set(bucketHash, []);
             }
-            bucketMap.get(row.bucket_hash)!.push(row.vector_id);
+            bucketMap.get(bucketHash)!.push(row.vector_id as string);
         }
         
         return Array.from(bucketMap.entries()).map(([bucketHash, vectorIds]) => ({
@@ -548,11 +549,11 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         `, [configId]);
         
         return {
-            totalBuckets: stats?.total_buckets || 0,
-            totalVectors: stats?.total_vectors || 0,
-            avgVectorsPerBucket: stats?.avg_vectors_per_bucket || 0,
-            maxVectorsInBucket: stats?.max_vectors_in_bucket || 0,
-            emptyBuckets: stats?.empty_buckets || 0
+            totalBuckets: (stats?.total_buckets as number) || 0,
+            totalVectors: (stats?.total_vectors as number) || 0,
+            avgVectorsPerBucket: (stats?.avg_vectors_per_bucket as number) || 0,
+            maxVectorsInBucket: (stats?.max_vectors_in_bucket as number) || 0,
+            emptyBuckets: (stats?.empty_buckets as number) || 0
         };
     }
 
@@ -617,9 +618,14 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
                 `, vectorIds);
                 
                 vectors.push(...rows.map(row => ({
-                    ...row,
+                    id: row.id as string,
+                    note_id: row.note_id as string,
+                    chunk_id: (row.chunk_id as string | null) || undefined,
+                    block_id: (row.block_id as string | null) || undefined,
                     type: row.type as VectorType,
-                    vector: new Int8Array(row.vector)
+                    created_at: row.created_at as string,
+                    updated_at: row.updated_at as string,
+                    vector: new Int8Array(row.vector as Uint8Array)
                 })));
             }
 
@@ -648,13 +654,13 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         `, [escapedQuery, limit]);
         
         return rows.map(row => ({
-            id: row.id,
-            type: row.type,
-            noteId: row.note_id,
-            content: row.content,
-            notePath: row.note_path,
-            noteName: row.note_name,
-            blockId: row.block_id,
+            id: row.id as string,
+            type: row.type as string,
+            noteId: row.note_id as string,
+            content: row.content as string,
+            notePath: row.note_path as string,
+            noteName: row.note_name as string,
+            blockId: row.block_id as string | undefined,
             relevance: 1.0 // Simple relevance score since we removed rank()
         }));
     }
@@ -771,15 +777,20 @@ export class DatabaseService {
     }
 
     async getNote(id: string): Promise<Note | null> {
-        return await this.adapter.get('SELECT * FROM notes WHERE id = ?', [id]);
+        const row = await this.adapter.get('SELECT * FROM notes WHERE id = ?', [id]);
+        if (!row) return null;
+        return row as Note;
     }
 
     async getNoteByPath(path: string): Promise<Note | null> {
-        return await this.adapter.get('SELECT * FROM notes WHERE path = ?', [path]);
+        const row = await this.adapter.get('SELECT * FROM notes WHERE path = ?', [path]);
+        if (!row) return null;
+        return row as Note;
     }
 
     async getAllNotes(): Promise<Note[]> {
-        return await this.adapter.query('SELECT * FROM notes ORDER BY created_at DESC');
+        const rows = await this.adapter.query('SELECT * FROM notes ORDER BY created_at DESC');
+        return rows as Note[];
     }
 
     // Chunks operations
@@ -814,10 +825,11 @@ export class DatabaseService {
     }
 
     async getChunksForNote(noteId: string): Promise<Chunk[]> {
-        return await this.adapter.query(
+        const rows = await this.adapter.query(
             'SELECT * FROM chunks WHERE note_id = ? ORDER BY chunk_index',
             [noteId]
         );
+        return rows as Chunk[];
     }
 
     async deleteChunksForNote(noteId: string): Promise<void> {
@@ -833,7 +845,7 @@ export class DatabaseService {
         await this.adapter.execute(`
             INSERT INTO vectors (id, note_id, chunk_id, block_id, type, created_at, updated_at, vector)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `, [id, vector.note_id, vector.chunk_id || null, vector.block_id || null, vector.type, now, now, vector.vector]);
+        `, [id, vector.note_id, vector.chunk_id || null, vector.block_id || null, vector.type, now, now, vector.vector as unknown as Uint8Array]);
         
         await this.adapter.save();
         return id;
@@ -841,10 +853,10 @@ export class DatabaseService {
 
     async updateVector(id: string, vector: Int8Array): Promise<void> {
         const now = new Date().toISOString();
-        
+
         await this.adapter.execute(`
             UPDATE vectors SET vector = ?, updated_at = ? WHERE id = ?
-        `, [vector, now, id]);
+        `, [vector as unknown as Uint8Array, now, id]);
         
         await this.adapter.save();
     }
@@ -859,11 +871,16 @@ export class DatabaseService {
             'SELECT * FROM vectors WHERE note_id = ?',
             [noteId]
         );
-        
+
         return rows.map(row => ({
-            ...row,
+            id: row.id as string,
+            note_id: row.note_id as string,
+            chunk_id: (row.chunk_id as string | null) || undefined,
+            block_id: (row.block_id as string | null) || undefined,
             type: row.type as VectorType,
-            vector: new Int8Array(row.vector) // Convert BLOB back to Int8Array
+            created_at: row.created_at as string,
+            updated_at: row.updated_at as string,
+            vector: new Int8Array(row.vector as Uint8Array)
         }));
     }
 
@@ -874,29 +891,39 @@ export class DatabaseService {
 
     // Enhanced vector storage/retrieval methods
     async getVectorByNoteAndChunk(noteId: string, chunkId?: string): Promise<Vector | null> {
-        const query = chunkId 
+        const query = chunkId
             ? 'SELECT * FROM vectors WHERE note_id = ? AND chunk_id = ?'
             : 'SELECT * FROM vectors WHERE note_id = ? AND chunk_id IS NULL';
-        
+
         const params = chunkId ? [noteId, chunkId] : [noteId];
         const row = await this.adapter.get(query, params);
-        
+
         if (!row) return null;
-        
+
         return {
-            ...row,
+            id: row.id as string,
+            note_id: row.note_id as string,
+            chunk_id: (row.chunk_id as string | null) || undefined,
+            block_id: (row.block_id as string | null) || undefined,
             type: row.type as VectorType,
-            vector: new Int8Array(row.vector)
+            created_at: row.created_at as string,
+            updated_at: row.updated_at as string,
+            vector: new Int8Array(row.vector as Uint8Array)
         };
     }
 
     async getAllVectors(): Promise<Vector[]> {
         const rows = await this.adapter.query('SELECT * FROM vectors ORDER BY created_at DESC');
-        
+
         return rows.map(row => ({
-            ...row,
+            id: row.id as string,
+            note_id: row.note_id as string,
+            chunk_id: (row.chunk_id as string | null) || undefined,
+            block_id: (row.block_id as string | null) || undefined,
             type: row.type as VectorType,
-            vector: new Int8Array(row.vector)
+            created_at: row.created_at as string,
+            updated_at: row.updated_at as string,
+            vector: new Int8Array(row.vector as Uint8Array)
         }));
     }
 
@@ -910,7 +937,7 @@ export class DatabaseService {
 
     async getVectorCount(): Promise<number> {
         const result = await this.adapter.get('SELECT COUNT(*) as count FROM vectors');
-        return result?.count || 0;
+        return (result?.count as number) || 0;
     }
 
     async getVectorCountByType(): Promise<{ note: number; block: number }> {
@@ -922,8 +949,8 @@ export class DatabaseService {
         
         const counts = { note: 0, block: 0 };
         results.forEach(row => {
-            if (row.type === 'note') counts.note = row.count;
-            if (row.type === 'block') counts.block = row.count;
+            if (row.type === 'note') counts.note = row.count as number;
+            if (row.type === 'block') counts.block = row.count as number;
         });
         
         return counts;
@@ -955,8 +982,8 @@ export class DatabaseService {
         const results = await this.adapter.query(query);
         
         return results.map(row => ({
-            path: row.path,
-            lastModified: new Date(row.note_updated).getTime()
+            path: row.path as string,
+            lastModified: new Date(row.note_updated as string).getTime()
         }));
     }
 
@@ -973,8 +1000,8 @@ export class DatabaseService {
         const results = await this.adapter.query(query);
         
         return results.map(row => ({
-            path: row.path,
-            noteId: row.note_id
+            path: row.path as string,
+            noteId: row.note_id as string
         }));
     }
 
@@ -1095,9 +1122,9 @@ export class DatabaseService {
         ]);
         
         return {
-            orphanedVectors: orphanedVectors?.count || 0,
-            orphanedChunks: orphanedChunks?.count || 0,
-            orphanedChunkVectors: orphanedChunkVectors?.count || 0
+            orphanedVectors: (orphanedVectors?.count as number) || 0,
+            orphanedChunks: (orphanedChunks?.count as number) || 0,
+            orphanedChunkVectors: (orphanedChunkVectors?.count as number) || 0
         };
     }
 
@@ -1109,7 +1136,7 @@ export class DatabaseService {
             WHERE note_id = ?
         `, [noteId]);
         
-        return result?.last_created ? new Date(result.last_created) : null;
+        return result?.last_created ? new Date(result.last_created as string) : null;
     }
 
     async getVectorCreationStats(): Promise<{
@@ -1128,36 +1155,42 @@ export class DatabaseService {
         `);
         
         return {
-            totalVectors: stats?.total_vectors || 0,
-            oldestVector: stats?.oldest ? new Date(stats.oldest) : null,
-            newestVector: stats?.newest ? new Date(stats.newest) : null,
-            avgVectorsPerNote: stats?.avg_per_note || 0
+            totalVectors: (stats?.total_vectors as number) || 0,
+            oldestVector: stats?.oldest ? new Date(stats.oldest as string) : null,
+            newestVector: stats?.newest ? new Date(stats.newest as string) : null,
+            avgVectorsPerNote: (stats?.avg_per_note as number) || 0
         };
     }
 
     async getNotesOlderThan(date: Date): Promise<Note[]> {
         // Get notes that haven't been updated since the given date
         const isoDate = date.toISOString();
-        return await this.adapter.query(`
-            SELECT * FROM notes 
-            WHERE updated_at < ? 
+        const rows = await this.adapter.query(`
+            SELECT * FROM notes
+            WHERE updated_at < ?
             ORDER BY updated_at ASC
         `, [isoDate]);
+        return rows as Note[];
     }
 
     async getVectorsOlderThan(date: Date): Promise<Vector[]> {
         // Get vectors created before the given date
         const isoDate = date.toISOString();
         const rows = await this.adapter.query(`
-            SELECT * FROM vectors 
-            WHERE created_at < ? 
+            SELECT * FROM vectors
+            WHERE created_at < ?
             ORDER BY created_at ASC
         `, [isoDate]);
-        
+
         return rows.map(row => ({
-            ...row,
+            id: row.id as string,
+            note_id: row.note_id as string,
+            chunk_id: (row.chunk_id as string | null) || undefined,
+            block_id: (row.block_id as string | null) || undefined,
             type: row.type as VectorType,
-            vector: new Int8Array(row.vector)
+            created_at: row.created_at as string,
+            updated_at: row.updated_at as string,
+            vector: new Int8Array(row.vector as Uint8Array)
         }));
     }
 
@@ -1181,18 +1214,18 @@ export class DatabaseService {
         
         if (!result) return false;
 
-        const noteUpdated = new Date(result.note_updated);
+        const noteUpdated = new Date(result.note_updated as string);
 
         // Check note-level vector exists and is up to date
-        if (!result.note_vectors || result.note_vectors === 0) return false;
+        if (!result.note_vectors || (result.note_vectors as number) === 0) return false;
         if (!result.note_vector_created) return false;
-        if (new Date(result.note_vector_created) < noteUpdated) return false;
+        if (new Date(result.note_vector_created as string) < noteUpdated) return false;
 
         // If there are chunks, check that all chunks have vectors and they're up to date
-        if (result.total_chunks > 0) {
-            if (result.chunk_vectors !== result.total_chunks) return false; // Missing chunk vectors
+        if ((result.total_chunks as number) > 0) {
+            if ((result.chunk_vectors as number) !== (result.total_chunks as number)) return false; // Missing chunk vectors
             if (!result.oldest_chunk_vector_created) return false;
-            if (new Date(result.oldest_chunk_vector_created) < noteUpdated) return false;
+            if (new Date(result.oldest_chunk_vector_created as string) < noteUpdated) return false;
         }
         
         return true;
@@ -1227,26 +1260,26 @@ export class DatabaseService {
             throw new Error(`Note not found: ${noteId}`);
         }
 
-        const noteUpdated = new Date(result.note_updated);
-        const hasNoteVector = result.note_vectors > 0;
-        const noteVectorUpToDate = hasNoteVector && 
-            result.note_vector_created && 
-            new Date(result.note_vector_created) >= noteUpdated;
-        
-        const allChunkVectorsUpToDate = result.total_chunks === 0 || (
-            result.chunk_vectors === result.total_chunks &&
+        const noteUpdated = new Date(result.note_updated as string);
+        const hasNoteVector = (result.note_vectors as number) > 0;
+        const noteVectorUpToDate = hasNoteVector &&
+            result.note_vector_created &&
+            new Date(result.note_vector_created as string) >= noteUpdated;
+
+        const allChunkVectorsUpToDate = (result.total_chunks as number) === 0 || (
+            (result.chunk_vectors as number) === (result.total_chunks as number) &&
             result.oldest_chunk_vector_created &&
-            new Date(result.oldest_chunk_vector_created) >= noteUpdated
+            new Date(result.oldest_chunk_vector_created as string) >= noteUpdated
         );
-        
+
         return {
             noteUpdated,
             hasNoteVector,
-            noteVectorUpToDate,
-            totalChunks: result.total_chunks,
-            chunksWithVectors: result.chunk_vectors,
-            allChunkVectorsUpToDate,
-            fullyProcessed: noteVectorUpToDate && allChunkVectorsUpToDate
+            noteVectorUpToDate: noteVectorUpToDate as boolean,
+            totalChunks: result.total_chunks as number,
+            chunksWithVectors: result.chunk_vectors as number,
+            allChunkVectorsUpToDate: allChunkVectorsUpToDate as boolean,
+            fullyProcessed: (noteVectorUpToDate && allChunkVectorsUpToDate) as boolean
         };
     }
 
@@ -1328,12 +1361,12 @@ export class DatabaseService {
         );
         
         const blocks: Block[] = rows.map(row => ({
-            id: row.id,
+            id: row.id as string,
             type: row.type as BlockType,
-            content: row.content,
-            obsidian_id: row.obsidian_id,
-            start_position: JSON.parse(row.start_position),
-            end_position: JSON.parse(row.end_position)
+            content: row.content as string,
+            obsidian_id: (row.obsidian_id as string) || null,
+            start_position: JSON.parse(row.start_position as string),
+            end_position: JSON.parse(row.end_position as string)
         }));
         
         if (filterNull) {
@@ -1463,10 +1496,10 @@ export class DatabaseService {
     async getFTSTableStats(): Promise<{ count: number; sampleContent: string | null }> {
         const countResult = await this.adapter.get('SELECT COUNT(*) as count FROM fts_content');
         const sampleResult = await this.adapter.get('SELECT content FROM fts_content LIMIT 1');
-        
+
         return {
-            count: countResult?.count || 0,
-            sampleContent: sampleResult?.content || null
+            count: (countResult?.count as number) || 0,
+            sampleContent: (sampleResult?.content as string) || null
         };
     }
 
@@ -1479,7 +1512,7 @@ export class DatabaseService {
         // Get existing FTS content note IDs
         const existingFTSNoteIds = new Set<string>();
         const ftsRows = await this.adapter.query('SELECT DISTINCT note_id FROM fts_content');
-        ftsRows.forEach(row => existingFTSNoteIds.add(row.note_id));
+        ftsRows.forEach(row => existingFTSNoteIds.add(row.note_id as string));
         
         let populated = 0;
         
