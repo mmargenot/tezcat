@@ -668,8 +668,8 @@ export default class Tezcat extends Plugin {
         // Track the last active markdown view for the search panel
         if (leaf?.view instanceof MarkdownView) {
             const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-            if (leaves.length > 0) {
-                const searchView = leaves[0].view as TezcatView;
+            if (leaves.length > 0 && leaves[0].view instanceof TezcatView) {
+                const searchView = leaves[0].view;
                 searchView.setLastActiveMarkdownView(leaf.view);
             }
         }
@@ -846,7 +846,7 @@ export default class Tezcat extends Plugin {
 
     private isSearchPanelVisible(): boolean {
         const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-        return leaves.length > 0 && leaves[0].view.containerEl.isShown();
+        return leaves.length > 0 && leaves[0].view instanceof TezcatView && leaves[0].view.containerEl.isShown();
     }
 
     private async performDynamicSearch(context: string) {
@@ -887,8 +887,8 @@ export default class Tezcat extends Plugin {
 
     private async updateSearchPanel(results: SearchResult[]) {
         const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-        if (leaves.length > 0) {
-            const view = leaves[0].view as TezcatView;
+        if (leaves.length > 0 && leaves[0].view instanceof TezcatView) {
+            const view = leaves[0].view;
             // Update view asynchronously to avoid blocking the editor
             window.setTimeout(async () => {
                 await view.updateSearchResults(results);
