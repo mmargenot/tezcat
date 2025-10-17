@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, MarkdownView, Notice } from 'obsidian';
+import { ItemView, WorkspaceLeaf, MarkdownView, Notice, Setting } from 'obsidian';
 import { SearchResult } from './search_service';
 import { logger } from './logger';
 import { Position } from './note_processor';
@@ -22,7 +22,7 @@ class TezcatView extends ItemView {
   }
 
   getDisplayText() {
-    return 'Tezcat Search';
+    return 'Tezcat search';
   }
 
   getIcon() {
@@ -33,10 +33,10 @@ class TezcatView extends ItemView {
     const container = this.containerEl.children[1];
     container.empty();
     
-    const header = container.createEl('div', { cls: 'search-view-header' });
-    header.createEl('h4', { text: 'Tezcat Search' });
-    
-    this.resultsContainer = container.createEl('div', { cls: 'search-results-container' });
+    const header = container.createEl('div', { cls: 'tezcat-search-view-header' });
+    new Setting(header).setHeading().setName('Tezcat search');
+
+    this.resultsContainer = container.createEl('div', { cls: 'tezcat-search-results-container' });
     this.showEmptyState();
   }
 
@@ -53,7 +53,7 @@ class TezcatView extends ItemView {
     }
 
     // Show results count immediately
-    const countEl = this.resultsContainer.createEl('div', { cls: 'search-count' });
+    const countEl = this.resultsContainer.createEl('div', { cls: 'tezcat-search-count' });
     countEl.textContent = `${results.length} results`;
 
     // Render results asynchronously in batches to avoid blocking the editor
@@ -73,7 +73,7 @@ class TezcatView extends ItemView {
       
       // Yield control back to the browser after each batch
       if (i + BATCH_SIZE < results.length) {
-        await new Promise(resolve => setTimeout(resolve, 0));
+        await sleep(0);
       }
     }
   }
@@ -83,75 +83,75 @@ class TezcatView extends ItemView {
   }
 
   private showEmptyState() {
-    const emptyEl = this.resultsContainer.createEl('div', { cls: 'search-empty-state' });
+    const emptyEl = this.resultsContainer.createEl('div', { cls: 'tezcat-search-empty-state' });
     emptyEl.createEl('p', { text: 'Move your cursor around in a markdown file to see related content.' });
   }
 
   private createResultItem(result: SearchResult, index: number) {
-    const itemEl = this.resultsContainer.createEl('div', { cls: 'search-result-item' });
+    const itemEl = this.resultsContainer.createEl('div', { cls: 'tezcat-search-result-item' });
 
     // Result content (text for blocks)
     if (result.type === 'block') {
-      const textEl = itemEl.createEl('div', { cls: 'search-result-text' });
+      const textEl = itemEl.createEl('div', { cls: 'tezcat-search-result-text' });
       textEl.textContent = result.text.length > 150 ? result.text.substring(0, 150) + '...' : result.text;
     }
 
     // Path with type and score
-    const pathContainerEl = itemEl.createEl('div', { cls: 'search-result-path-container' });
+    const pathContainerEl = itemEl.createEl('div', { cls: 'tezcat-search-result-path-container' });
 
-    const pathEl = pathContainerEl.createEl('div', { cls: 'search-result-path' });
+    const pathEl = pathContainerEl.createEl('div', { cls: 'tezcat-search-result-path' });
     pathEl.textContent = result.notePath;
 
-    const metaEl = pathContainerEl.createDiv({ cls: 'search-result-meta' });
-    const typeSpan = metaEl.createEl('span', { 
+    const metaEl = pathContainerEl.createDiv({ cls: 'tezcat-search-result-meta' });
+    const typeSpan = metaEl.createEl('span', {
       text: result.type,
-      cls: 'search-result-type'
+      cls: 'tezcat-search-result-type'
     });
-    
-    const scoreSpan = metaEl.createEl('span', { 
+
+    const scoreSpan = metaEl.createEl('span', {
       text: result.score.toFixed(3),
-      cls: 'search-result-score'
+      cls: 'tezcat-search-result-score'
     });
 
     // Action buttons
-    const actionsEl = itemEl.createEl('div', { cls: 'search-result-actions' });
+    const actionsEl = itemEl.createEl('div', { cls: 'tezcat-search-result-actions' });
 
     if (result.type === 'note') {
-      // For note results: only show "Insert Link" and "Open Note"
-      
+      // For note results: only show "Insert link" and "Open note"
+
       // Insert link button
-      const insertLinkBtn = actionsEl.createEl('button', { text: 'Insert Link' });
+      const insertLinkBtn = actionsEl.createEl('button', { text: 'Insert link' });
       insertLinkBtn.onclick = (e) => {
         e.stopPropagation();
         this.insertLink(result);
       };
 
       // Open note button
-      const openNoteBtn = actionsEl.createEl('button', { text: 'Open Note', cls: 'mod-cta' });
+      const openNoteBtn = actionsEl.createEl('button', { text: 'Open note', cls: 'mod-cta' });
       openNoteBtn.onclick = (e) => {
         e.stopPropagation();
         this.openNote(result);
       };
-      
+
     } else if (result.type === 'block') {
-      // For block results: show "Insert Block", "Insert Link", and "Open Note" (goes to block location)
-      
+      // For block results: show "Insert block", "Insert link", and "Open note" (goes to block location)
+
       // Insert text button
-      const insertTextBtn = actionsEl.createEl('button', { text: 'Insert Block' });
+      const insertTextBtn = actionsEl.createEl('button', { text: 'Insert block' });
       insertTextBtn.onclick = (e) => {
         e.stopPropagation();
         this.insertText(result);
       };
 
       // Insert link button
-      const insertLinkBtn = actionsEl.createEl('button', { text: 'Insert Link' });
+      const insertLinkBtn = actionsEl.createEl('button', { text: 'Insert link' });
       insertLinkBtn.onclick = (e) => {
         e.stopPropagation();
         this.insertLink(result);
       };
 
       // Open note button
-      const openNoteBtn = actionsEl.createEl('button', { text: 'Open Note', cls: 'mod-cta' });
+      const openNoteBtn = actionsEl.createEl('button', { text: 'Open note', cls: 'mod-cta' });
       openNoteBtn.onclick = (e) => {
         e.stopPropagation();
         this.openBlockInNote(result);
@@ -219,7 +219,7 @@ class TezcatView extends ItemView {
     // If we have block position data, navigate to the block
     if (result.blockStartPosition) {
       // Small delay to ensure the editor is ready
-      setTimeout(() => {
+      window.setTimeout(() => {
         const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (activeView && activeView.editor && result.blockStartPosition) {
           const editor = activeView.editor;

@@ -1,25 +1,25 @@
 /* Tezcat Plugin Styles */
 
 /* Search View Styles */
-.search-results-container {
+.tezcat-search-results-container {
     padding: 8px;
     overflow-y: auto;
     height: calc(100% - 60px);
 }
 
-.search-count {
+.tezcat-search-count {
     font-size: 0.9em;
     color: var(--text-muted);
     margin-bottom: 12px;
 }
 
-.search-empty-state {
+.tezcat-search-empty-state {
     text-align: center;
     color: var(--text-muted);
     margin-top: 40px;
 }
 
-.search-result-item {
+.tezcat-search-result-item {
     padding: 12px;
     margin-bottom: 8px;
     border: 1px solid var(--background-modifier-border);
@@ -27,53 +27,47 @@
     cursor: pointer;
 }
 
-.search-result-item:hover {
+.tezcat-search-result-item:hover {
     background-color: var(--background-modifier-hover);
 }
 
-.search-result-text {
-    font-size: 0.85em;
-    line-height: 1.4;
-    margin-bottom: 8px;
-}
-
-.search-result-path-container {
+.tezcat-search-result-path-container {
     display: flex;
     justify-content: space-between;
     align-items: center;
     margin-bottom: 8px;
 }
 
-.search-result-path {
+.tezcat-search-result-path {
     color: var(--text-muted);
     font-size: 0.8em;
 }
 
-.search-result-meta {
+.tezcat-search-result-meta {
     display: flex;
     align-items: center;
 }
 
-.search-result-type {
+.tezcat-search-result-type {
     background: var(--background-modifier-border);
     padding: 2px 6px;
     border-radius: 3px;
     font-size: 0.8em;
 }
 
-.search-result-score {
+.tezcat-search-result-score {
     color: var(--text-muted);
     font-size: 0.8em;
     margin-left: 6px;
 }
 
-.search-result-actions {
+.tezcat-search-result-actions {
     margin-top: 8px;
     display: flex;
     gap: 8px;
 }
 
-.search-result-actions button {
+.tezcat-search-result-actions button {
     font-size: 0.8em;
     padding: 4px 8px;
 }
@@ -103,6 +97,16 @@
 
 .tezcat-button-container {
     margin-top: 20px;
+}
+
+.tezcat-button-disabled {
+    opacity: 0.5;
+}
+
+.tezcat-settings-divider {
+    margin: 2em 0;
+    border: none;
+    border-top: 1px solid var(--background-modifier-border);
 }
 
 .tezcat-validation-item {

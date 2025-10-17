@@ -93,7 +93,6 @@ export default class Tezcat extends Plugin {
 
         // Create status bar item
         this.statusBarItem = this.addStatusBarItem();
-        this.addStatusBarStyles();
         this.updateStatusBar('sync', 'Tezcat: Initializing...', 'tezcat-status-initializing');
         
         // Schedule validation and setup to run when workspace is ready
@@ -110,17 +109,17 @@ export default class Tezcat extends Plugin {
         // Add command to process all vault files
         this.addCommand({
             id: 'process-all-files',
-            name: 'Process All Files',
+            name: 'Process all files',
             callback: async () => {
                 await this.processAllVaultFilesIntoDatabase();
             }
         });
-        
+
         // Add vector database commands
-        this.registerCommand('rebuild-database', 'Rebuild Database', () => this.rebuildDatabase());
-        this.registerCommand('show-vector-database-stats', 'Show Vector Database Stats', () => this.showVectorDatabaseStats());
-        this.registerCommand('rebuild-vector-index', 'Rebuild Vector Index', () => this.rebuildVectorIndex());
-        this.registerCommand('vector-search', 'Vector Search', () => this.performVectorSearch());
+        this.registerCommand('rebuild-database', 'Rebuild database', () => this.rebuildDatabase());
+        this.registerCommand('show-vector-database-stats', 'Show vector database stats', () => this.showVectorDatabaseStats());
+        this.registerCommand('rebuild-vector-index', 'Rebuild vector index', () => this.rebuildVectorIndex());
+        this.registerCommand('vector-search', 'Vector search', () => this.performVectorSearch());
 
 
         // This adds a settings tab so the user can configure various aspects of the plugin
@@ -588,16 +587,16 @@ export default class Tezcat extends Plugin {
     async showVectorDatabaseStats() {
         try {
             const stats = await this.databaseService.getVectorDatabaseStats();
-            
-            const message = `Vector Database Stats:
-• Total Notes: ${stats.totalNotes}
-• Processed Notes: ${stats.processedNotes}
-• Total Vectors: ${stats.totalVectors}
-• Note Vectors: ${stats.vectorsByType.note}
-• Block Vectors: ${stats.vectorsByType.block}
-• Outdated Notes: ${stats.outdatedNotes}
-• Orphaned Vectors: ${stats.orphanedData.orphanedVectors}
-• Orphaned Chunks: ${stats.orphanedData.orphanedChunks}`;
+
+            const message = `Vector database stats:
+• Total notes: ${stats.totalNotes}
+• Processed notes: ${stats.processedNotes}
+• Total vectors: ${stats.totalVectors}
+• Note vectors: ${stats.vectorsByType.note}
+• Block vectors: ${stats.vectorsByType.block}
+• Outdated notes: ${stats.outdatedNotes}
+• Orphaned vectors: ${stats.orphanedData.orphanedVectors}
+• Orphaned chunks: ${stats.orphanedData.orphanedChunks}`;
 
             new Notice(message, 10000); // Show for 10 seconds
             logger.info('Plugin', `Vector Database Stats: totalNotes=${stats.totalNotes}, processedNotes=${stats.processedNotes}, totalVectors=${stats.totalVectors}, noteVectors=${stats.vectorsByType.note}, blockVectors=${stats.vectorsByType.block}`);
@@ -669,8 +668,8 @@ export default class Tezcat extends Plugin {
         // Track the last active markdown view for the search panel
         if (leaf?.view instanceof MarkdownView) {
             const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-            if (leaves.length > 0) {
-                const searchView = leaves[0].view as TezcatView;
+            if (leaves.length > 0 && leaves[0].view instanceof TezcatView) {
+                const searchView = leaves[0].view;
                 searchView.setLastActiveMarkdownView(leaf.view);
             }
         }
@@ -699,7 +698,7 @@ export default class Tezcat extends Plugin {
         const target = evt.target as Element;
         if (target && (target.closest('.cm-editor') || target.closest('.markdown-source-view'))) {
             // Defer the heavy work to avoid blocking the click event
-            setTimeout(() => {
+            window.setTimeout(() => {
                 try {
                     const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
                     if (activeView && activeView.editor) {
@@ -715,19 +714,19 @@ export default class Tezcat extends Plugin {
 
     private onFileOpen(file: any) {
         // Handle note navigation tracking for file opens
-        setTimeout(() => {
+        window.setTimeout(() => {
             const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
             if (activeView) {
-                this.handleNoteNavigation(this.app.workspace.activeLeaf);
+                this.handleNoteNavigation(activeView.leaf);
             }
         }, 10);
-        
+
         if (!this.isSearchPanelVisible()) {
             return;
         }
 
         // Small delay to ensure the editor is ready
-        setTimeout(() => {
+        window.setTimeout(() => {
             const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
             if (activeView && activeView.editor) {
                 const context = this.extractCursorContext(activeView.editor);
@@ -847,7 +846,7 @@ export default class Tezcat extends Plugin {
 
     private isSearchPanelVisible(): boolean {
         const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-        return leaves.length > 0 && leaves[0].view.containerEl.isShown();
+        return leaves.length > 0 && leaves[0].view instanceof TezcatView && leaves[0].view.containerEl.isShown();
     }
 
     private async performDynamicSearch(context: string) {
@@ -888,10 +887,10 @@ export default class Tezcat extends Plugin {
 
     private async updateSearchPanel(results: SearchResult[]) {
         const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-        if (leaves.length > 0) {
-            const view = leaves[0].view as TezcatView;
+        if (leaves.length > 0 && leaves[0].view instanceof TezcatView) {
+            const view = leaves[0].view;
             // Update view asynchronously to avoid blocking the editor
-            setTimeout(async () => {
+            window.setTimeout(async () => {
                 await view.updateSearchResults(results);
             }, 0);
         }
@@ -1094,38 +1093,6 @@ export default class Tezcat extends Plugin {
         }
     }
 
-    /**
-     * Add CSS styles for status bar items
-     */
-    private addStatusBarStyles() {
-        const styleEl = document.createElement('style');
-        styleEl.textContent = `
-            .tezcat-status-ready {
-                color: var(--text-success, #4ade80) !important;
-                cursor: pointer;
-            }
-            .tezcat-status-error {
-                color: var(--text-error, #ef4444) !important;
-                cursor: pointer;
-                animation: tezcat-pulse 2s infinite;
-            }
-            .tezcat-status-initializing {
-                color: var(--text-muted) !important;
-                cursor: pointer;
-            }
-            @keyframes tezcat-pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.6; }
-            }
-            .status-bar-item.tezcat-status-ready:hover,
-            .status-bar-item.tezcat-status-error:hover,
-            .status-bar-item.tezcat-status-initializing:hover {
-                background-color: var(--background-modifier-hover);
-                border-radius: 3px;
-            }
-        `;
-        document.head.appendChild(styleEl);
-    }
 }
 
 
@@ -1146,14 +1113,14 @@ class TezcatSettingTab extends PluginSettingTab {
         containerEl.empty();
 
         // Embedding Settings Section
-        containerEl.createEl('h3', { text: 'Embedding Settings' });
+        new Setting(containerEl).setHeading().setName('Embeddings');
         containerEl.createEl('p', {
             text: 'Changing these settings will require reindexing all vault content.',
             cls: 'setting-item-description'
         });
 
         new Setting(containerEl)
-            .setName('Embedding Provider')
+            .setName('Embedding provider')
             .setDesc('Choose the provider for generating embeddings')
             .addDropdown(dropdown => dropdown
                 .addOption('ollama', 'Ollama')
@@ -1166,7 +1133,7 @@ class TezcatSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName('Embedding Model')
+            .setName('Embedding model')
             .setDesc('The model to use for generating embeddings')
             .addDropdown(dropdown => {
                 if (this.pendingSettings.embeddingProvider === 'openai') {
@@ -1200,7 +1167,7 @@ class TezcatSettingTab extends PluginSettingTab {
             });
 
         new Setting(containerEl)
-            .setName('Vector Size')
+            .setName('Vector size')
             .setDesc('The size of the embedding vectors (default: 768)')
             .addText(text => {
                 const isReadOnly = this.pendingSettings.embeddingModel === 'bge-m3' || 
@@ -1228,7 +1195,7 @@ class TezcatSettingTab extends PluginSettingTab {
             });
 
         new Setting(containerEl)
-            .setName('Chunk Size')
+            .setName('Chunk size')
             .setDesc('The number of tokens per text chunk. Also affects the search context window size around your cursor (default: 128)')
             .addText(text => {
                 const originalValue = this.plugin.settings.chunkSize;
@@ -1248,7 +1215,7 @@ class TezcatSettingTab extends PluginSettingTab {
             });
 
         new Setting(containerEl)
-            .setName('Chunk Overlap')
+            .setName('Chunk overlap')
             .setDesc('The number of tokens to overlap between chunks for better context continuity (default: 16)')
             .addText(text => {
                 const originalValue = this.plugin.settings.chunkOverlap;
@@ -1270,7 +1237,7 @@ class TezcatSettingTab extends PluginSettingTab {
         // Conditional settings based on provider
         if (this.pendingSettings.embeddingProvider === 'openai') {
             new Setting(containerEl)
-                .setName('OpenAI API Key')
+                .setName('OpenAI API key')
                 .setDesc('Your OpenAI API key for embedding generation')
                 .addText(text => {
                     const originalValue = this.plugin.settings.openaiApiKey;
@@ -1291,7 +1258,7 @@ class TezcatSettingTab extends PluginSettingTab {
 
         if (this.pendingSettings.embeddingProvider === 'ollama') {
             new Setting(containerEl)
-                .setName('Ollama Base URL')
+                .setName('Ollama base URL')
                 .setDesc('The base URL for your Ollama server')
                 .addText(text => {
                     const originalValue = this.plugin.settings.ollamaBaseUrl;
@@ -1317,7 +1284,7 @@ class TezcatSettingTab extends PluginSettingTab {
 
         if (this.hasSensitiveChanges) {
             const saveButton = buttonControl.createEl('button', {
-                text: 'Save Changes',
+                text: 'Save changes',
                 cls: 'mod-cta'
             });
             saveButton.onclick = () => this.confirmAndSave();
@@ -1330,10 +1297,10 @@ class TezcatSettingTab extends PluginSettingTab {
 
         // Rebuild Database Button
         new Setting(containerEl)
-            .setName('Rebuild Database & Index')
+            .setName('Rebuild database & index')
             .setDesc('Completely rebuild the database and reindex all vault content. This will take some time but can fix indexing issues.')
             .addButton(button => button
-                .setButtonText('Rebuild Database')
+                .setButtonText('Rebuild database')
                 .setClass('mod-warning')
                 .onClick(async () => {
                     // Show confirmation modal
@@ -1351,11 +1318,11 @@ class TezcatSettingTab extends PluginSettingTab {
 
         // Horizontal divider
         const divider = containerEl.createEl('hr', {
-            attr: { style: 'margin: 2em 0; border: none; border-top: 1px solid var(--background-modifier-border);' }
+            cls: 'tezcat-settings-divider'
         });
 
         // Application Settings Section
-        containerEl.createEl('h3', { text: 'Application Settings' });
+        new Setting(containerEl).setHeading().setName('Application');
         containerEl.createEl('p', {
             text: 'These settings take effect immediately and don\'t require reindexing.',
             cls: 'setting-item-description'
@@ -1363,7 +1330,7 @@ class TezcatSettingTab extends PluginSettingTab {
 
         // Search Cadence Setting (applies immediately)
         new Setting(containerEl)
-            .setName('Search Cadence')
+            .setName('Search cadence')
             .setDesc('How frequently to perform contextual searches as you move your cursor')
             .addDropdown(dropdown => dropdown
                 .addOption('always', 'Always (0.5s delay - most responsive)')
@@ -1377,10 +1344,10 @@ class TezcatSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName('Search Mode')
+            .setName('Search mode')
             .setDesc('Choose between vector-only search or hybrid search combining semantic similarity with keyword matching')
             .addDropdown(dropdown => dropdown
-                .addOption('vector', 'Vector Only (semantic similarity)')
+                .addOption('vector', 'Vector only (semantic similarity)')
                 .addOption('hybrid', 'Hybrid (semantic + keyword matching)')
                 .setValue(this.plugin.settings.searchMode)
                 .onChange(async (value: SearchMode) => {
@@ -1391,7 +1358,7 @@ class TezcatSettingTab extends PluginSettingTab {
 
         // Context Window Setting (applies immediately)
         new Setting(containerEl)
-            .setName('Search Context Window (words)')
+            .setName('Search context window (words)')
             .setDesc('Number of words to extract around your cursor for contextual search (default: 64)')
             .addText(text => text
                 .setPlaceholder('64')
@@ -1405,7 +1372,7 @@ class TezcatSettingTab extends PluginSettingTab {
 
         // Highlight Block Setting (applies immediately)
         new Setting(containerEl)
-            .setName('Highlight Block on Open')
+            .setName('Highlight block on open')
             .setDesc('When opening a note from a block search result, highlight the entire block content')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.highlightBlockOnOpen)
@@ -1417,7 +1384,7 @@ class TezcatSettingTab extends PluginSettingTab {
 
         // Log Level Setting (applies immediately)
         new Setting(containerEl)
-            .setName('Log Level')
+            .setName('Log level')
             .setDesc('Set the logging verbosity level for debugging')
             .addDropdown(dropdown => dropdown
                 .addOption(LogLevel.ERROR.toString(), 'ERROR')
@@ -1622,8 +1589,8 @@ class ReindexConfirmModal extends Modal {
         const { contentEl } = this;
         contentEl.empty();
 
-        contentEl.createEl('h2', { text: 'Confirm Reindex' });
-        
+        new Setting(contentEl).setHeading().setName('Confirm reindex');
+
         contentEl.createEl('p', {
             text: 'The changes you made will require reindexing all vault content. This may take several minutes depending on your vault size.'
         });
@@ -1676,9 +1643,9 @@ class VectorSearchModal extends Modal {
         const { contentEl } = this;
         contentEl.empty();
 
-        contentEl.createEl('h2', { text: 'Vector Search' });
-        
-        const inputContainer = contentEl.createDiv('modal-input-container');
+        new Setting(contentEl).setHeading().setName('Vector search');
+
+        const inputContainer = contentEl.createDiv('tezcat-modal-input-container');
         const input = inputContainer.createEl('input', {
             type: 'text',
             placeholder: 'Enter your search query...',
@@ -1735,8 +1702,8 @@ class SystemStatusModal extends Modal {
         const { contentEl } = this;
         contentEl.empty();
 
-        contentEl.createEl('h2', { text: 'Tezcat System Status' });
-        
+        new Setting(contentEl).setHeading().setName('Tezcat system status');
+
         // Show operation in progress status
         if (this.plugin.isOperationInProgress) {
             const progressEl = contentEl.createDiv('tezcat-operation-progress');
@@ -1752,12 +1719,12 @@ class SystemStatusModal extends Modal {
         
         if (this.isSystemValid) {
             overallEl.addClass('system-ready');
-            const strongEl = overallEl.createEl('strong', { text: 'System Ready' });
+            const strongEl = overallEl.createEl('strong', { text: 'System ready' });
             overallEl.createEl('br');
             overallEl.appendText('All components are working correctly.');
         } else {
             overallEl.addClass('setup-required');
-            const strongEl = overallEl.createEl('strong', { text: 'Setup Required' });
+            const strongEl = overallEl.createEl('strong', { text: 'Setup required' });
             overallEl.createEl('br');
             overallEl.appendText('Some components need attention.');
         }
@@ -1768,7 +1735,7 @@ class SystemStatusModal extends Modal {
         // Provider status
         this.createStatusItem(
             detailsEl,
-            'Embedding Provider',
+            'Embedding provider',
             this.validationResult.embeddingProvider
         );
         
@@ -1791,13 +1758,13 @@ class SystemStatusModal extends Modal {
         
         if (!this.isSystemValid) {
             const retryButton = buttonContainer.createEl('button', {
-                text: this.plugin.isOperationInProgress ? 'Operation in Progress...' : 'Retry Setup',
+                text: this.plugin.isOperationInProgress ? 'Operation in progress...' : 'Retry setup',
                 cls: this.plugin.isOperationInProgress ? 'mod-muted' : 'mod-cta'
             });
             
             if (this.plugin.isOperationInProgress) {
                 retryButton.disabled = true;
-                retryButton.style.opacity = '0.5';
+                retryButton.addClass('tezcat-button-disabled');
             } else {
                 retryButton.onclick = async () => {
                     this.close();
@@ -1807,7 +1774,7 @@ class SystemStatusModal extends Modal {
             }
             
             const settingsButton = buttonContainer.createEl('button', {
-                text: 'Open Settings'
+                text: 'Open settings'
             });
             settingsButton.onclick = () => {
                 this.close();
@@ -1863,7 +1830,7 @@ class VectorSearchResultsModal extends Modal {
         const { contentEl } = this;
         contentEl.empty();
 
-        contentEl.createEl('h2', { text: `Search Results for: "${this.query}"` });
+        new Setting(contentEl).setHeading().setName(`Search results for: "${this.query}"`);
         contentEl.createEl('p', { text: `Found ${this.results.length} matches` });
 
         const resultsContainer = contentEl.createDiv('tezcat-search-results');
@@ -1883,16 +1850,15 @@ class VectorSearchResultsModal extends Modal {
                 titleEl.textContent = result.noteName;
 
                 const metaEl = headerEl.createDiv();
-                const typeSpan = metaEl.createEl('span', { text: result.type });
-                typeSpan.style.background = 'var(--background-modifier-border)';
-                typeSpan.style.padding = '2px 6px';
-                typeSpan.style.borderRadius = '3px';
-                typeSpan.style.fontSize = '0.8em';
-                
-                const scoreSpan = metaEl.createEl('span', { text: `Score: ${result.score.toFixed(3)}` });
-                scoreSpan.style.color = 'var(--text-muted)';
-                scoreSpan.style.fontSize = '0.9em';
-                scoreSpan.style.marginLeft = '6px';
+                const typeSpan = metaEl.createEl('span', {
+                    text: result.type,
+                    cls: 'tezcat-search-result-type'
+                });
+
+                const scoreSpan = metaEl.createEl('span', {
+                    text: `Score: ${result.score.toFixed(3)}`,
+                    cls: 'tezcat-search-result-score'
+                });
 
                 // Path
                 const pathEl = resultEl.createDiv('tezcat-search-result-path');
@@ -1905,26 +1871,23 @@ class VectorSearchResultsModal extends Modal {
                 titleEl.textContent = result.noteName;
 
                 const metaEl = headerEl.createDiv();
-                const typeSpan = metaEl.createEl('span', { text: result.type });
-                typeSpan.style.background = 'var(--background-modifier-border)';
-                typeSpan.style.padding = '2px 6px';
-                typeSpan.style.borderRadius = '3px';
-                typeSpan.style.fontSize = '0.8em';
-                
-                const scoreSpan = metaEl.createEl('span', { text: `Score: ${result.score.toFixed(3)}` });
-                scoreSpan.style.color = 'var(--text-muted)';
-                scoreSpan.style.fontSize = '0.9em';
-                scoreSpan.style.marginLeft = '6px';
+                const typeSpan = metaEl.createEl('span', {
+                    text: result.type,
+                    cls: 'tezcat-search-result-type'
+                });
+
+                const scoreSpan = metaEl.createEl('span', {
+                    text: `Score: ${result.score.toFixed(3)}`,
+                    cls: 'tezcat-search-result-score'
+                });
 
                 // Path
                 const pathEl = resultEl.createDiv('tezcat-search-result-path note-path');
                 pathEl.textContent = result.notePath;
 
                 // Text content (note path and name)
-                const textEl = resultEl.createDiv('search-result-text');
+                const textEl = resultEl.createDiv('tezcat-search-result-text');
                 textEl.textContent = result.text.length > 200 ? result.text.substring(0, 200) + '...' : result.text;
-                textEl.style.fontSize = '0.9em';
-                textEl.style.lineHeight = '1.4';
             }
 
             // Click to open note

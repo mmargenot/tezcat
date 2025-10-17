@@ -26,7 +26,7 @@ class Logger {
         return this.currentLevel;
     }
 
-    private log(level: LogLevel, component: string, message: string, ...args: any[]): void {
+    private log(level: LogLevel, component: string, message: string, ...args: unknown[]): void {
         if (level >= this.currentLevel) {
             const levelStr = LogLevel[level];
             const prefix = `[${levelStr}] [${component}]`;
@@ -48,19 +48,19 @@ class Logger {
         }
     }
 
-    debug(component: string, message: string, ...args: any[]): void {
+    debug(component: string, message: string, ...args: unknown[]): void {
         this.log(LogLevel.DEBUG, component, message, ...args);
     }
 
-    info(component: string, message: string, ...args: any[]): void {
+    info(component: string, message: string, ...args: unknown[]): void {
         this.log(LogLevel.INFO, component, message, ...args);
     }
 
-    warn(component: string, message: string, ...args: any[]): void {
+    warn(component: string, message: string, ...args: unknown[]): void {
         this.log(LogLevel.WARN, component, message, ...args);
     }
 
-    error(component: string, message: string, ...args: any[]): void {
+    error(component: string, message: string, ...args: unknown[]): void {
         this.log(LogLevel.ERROR, component, message, ...args);
     }
 }
