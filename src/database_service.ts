@@ -3,7 +3,7 @@ import { TextChunk } from './chunking_service';
 import { EmbeddingService, LSHConfig, LSHHashFunction, VectorUtils } from './embedding_service';
 import { Logger } from './logger';
 import { Block, BlockType } from './note_processor';
-import { initSqlJs, Database, SqlValue } from 'sql.js';
+import initSqlJs, { Database, SqlValue, SqlJsStatic } from 'sql.js';
 import sqlWasmPath from '../node_modules/sql.js/dist/sql-wasm.wasm';
 const sqlWasm = sqlWasmPath;
 
@@ -42,7 +42,7 @@ export interface DatabaseAdapter {
 
 export class SqlJsDatabaseAdapter implements DatabaseAdapter {
     private db: Database | null = null;
-    private SQL: typeof initSqlJs | null = null;
+    private SQL: SqlJsStatic | null = null;
     private plugin: Plugin;
     private vectorUtils: VectorUtils;
     private logger: Logger;
