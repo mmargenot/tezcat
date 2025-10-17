@@ -99,6 +99,16 @@
     margin-top: 20px;
 }
 
+.tezcat-button-disabled {
+    opacity: 0.5;
+}
+
+.tezcat-settings-divider {
+    margin: 2em 0;
+    border: none;
+    border-top: 1px solid var(--background-modifier-border);
+}
+
 .tezcat-validation-item {
     padding: 8px 12px;
     margin-bottom: 8px;

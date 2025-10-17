@@ -93,7 +93,6 @@ export default class Tezcat extends Plugin {
 
         // Create status bar item
         this.statusBarItem = this.addStatusBarItem();
-        this.addStatusBarStyles();
         this.updateStatusBar('sync', 'Tezcat: Initializing...', 'tezcat-status-initializing');
         
         // Schedule validation and setup to run when workspace is ready
@@ -1094,38 +1093,6 @@ export default class Tezcat extends Plugin {
         }
     }
 
-    /**
-     * Add CSS styles for status bar items
-     */
-    private addStatusBarStyles() {
-        const styleEl = document.createElement('style');
-        styleEl.textContent = `
-            .tezcat-status-ready {
-                color: var(--text-success, #4ade80) !important;
-                cursor: pointer;
-            }
-            .tezcat-status-error {
-                color: var(--text-error, #ef4444) !important;
-                cursor: pointer;
-                animation: tezcat-pulse 2s infinite;
-            }
-            .tezcat-status-initializing {
-                color: var(--text-muted) !important;
-                cursor: pointer;
-            }
-            @keyframes tezcat-pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.6; }
-            }
-            .status-bar-item.tezcat-status-ready:hover,
-            .status-bar-item.tezcat-status-error:hover,
-            .status-bar-item.tezcat-status-initializing:hover {
-                background-color: var(--background-modifier-hover);
-                border-radius: 3px;
-            }
-        `;
-        document.head.appendChild(styleEl);
-    }
 }
 
 
@@ -1351,7 +1318,7 @@ class TezcatSettingTab extends PluginSettingTab {
 
         // Horizontal divider
         const divider = containerEl.createEl('hr', {
-            attr: { style: 'margin: 2em 0; border: none; border-top: 1px solid var(--background-modifier-border);' }
+            cls: 'tezcat-settings-divider'
         });
 
         // Application Settings Section
@@ -1797,7 +1764,7 @@ class SystemStatusModal extends Modal {
             
             if (this.plugin.isOperationInProgress) {
                 retryButton.disabled = true;
-                retryButton.style.opacity = '0.5';
+                retryButton.addClass('tezcat-button-disabled');
             } else {
                 retryButton.onclick = async () => {
                     this.close();
@@ -1883,16 +1850,15 @@ class VectorSearchResultsModal extends Modal {
                 titleEl.textContent = result.noteName;
 
                 const metaEl = headerEl.createDiv();
-                const typeSpan = metaEl.createEl('span', { text: result.type });
-                typeSpan.style.background = 'var(--background-modifier-border)';
-                typeSpan.style.padding = '2px 6px';
-                typeSpan.style.borderRadius = '3px';
-                typeSpan.style.fontSize = '0.8em';
-                
-                const scoreSpan = metaEl.createEl('span', { text: `Score: ${result.score.toFixed(3)}` });
-                scoreSpan.style.color = 'var(--text-muted)';
-                scoreSpan.style.fontSize = '0.9em';
-                scoreSpan.style.marginLeft = '6px';
+                const typeSpan = metaEl.createEl('span', {
+                    text: result.type,
+                    cls: 'tezcat-search-result-type'
+                });
+
+                const scoreSpan = metaEl.createEl('span', {
+                    text: `Score: ${result.score.toFixed(3)}`,
+                    cls: 'tezcat-search-result-score'
+                });
 
                 // Path
                 const pathEl = resultEl.createDiv('tezcat-search-result-path');
@@ -1905,16 +1871,15 @@ class VectorSearchResultsModal extends Modal {
                 titleEl.textContent = result.noteName;
 
                 const metaEl = headerEl.createDiv();
-                const typeSpan = metaEl.createEl('span', { text: result.type });
-                typeSpan.style.background = 'var(--background-modifier-border)';
-                typeSpan.style.padding = '2px 6px';
-                typeSpan.style.borderRadius = '3px';
-                typeSpan.style.fontSize = '0.8em';
-                
-                const scoreSpan = metaEl.createEl('span', { text: `Score: ${result.score.toFixed(3)}` });
-                scoreSpan.style.color = 'var(--text-muted)';
-                scoreSpan.style.fontSize = '0.9em';
-                scoreSpan.style.marginLeft = '6px';
+                const typeSpan = metaEl.createEl('span', {
+                    text: result.type,
+                    cls: 'tezcat-search-result-type'
+                });
+
+                const scoreSpan = metaEl.createEl('span', {
+                    text: `Score: ${result.score.toFixed(3)}`,
+                    cls: 'tezcat-search-result-score'
+                });
 
                 // Path
                 const pathEl = resultEl.createDiv('tezcat-search-result-path note-path');
@@ -1923,8 +1888,6 @@ class VectorSearchResultsModal extends Modal {
                 // Text content (note path and name)
                 const textEl = resultEl.createDiv('tezcat-search-result-text');
                 textEl.textContent = result.text.length > 200 ? result.text.substring(0, 200) + '...' : result.text;
-                textEl.style.fontSize = '0.9em';
-                textEl.style.lineHeight = '1.4';
             }
 
             // Click to open note
