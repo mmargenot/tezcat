@@ -25,7 +25,7 @@ interface OllamaModelsResponse {
 }
 
 import { Logger } from './logger';
-import { Notice, requestUrl } from 'obsidian';
+import { Notice, requestUrl, sleep } from 'obsidian';
 
 // Vector processing utilities
 export class VectorUtils {
@@ -475,7 +475,7 @@ export class OpenAIEmbeddingProvider extends EmbeddingProvider {
         const timeSinceLastRequest = now - this.lastRequestTime;
         if (timeSinceLastRequest < this.minRequestInterval) {
             const waitTime = this.minRequestInterval - timeSinceLastRequest;
-            await new Promise(resolve => window.setTimeout(resolve, waitTime));
+            await sleep(waitTime);
         }
         this.lastRequestTime = Date.now();
 
@@ -498,7 +498,7 @@ export class OpenAIEmbeddingProvider extends EmbeddingProvider {
                     }
                     
                     this.logger.warn('OpenAIProvider', `Rate limited (attempt ${attempt}/${maxRetries}), retrying in ${retryDelay}ms`);
-                    await new Promise(resolve => window.setTimeout(resolve, retryDelay));
+                    await sleep(retryDelay);
                     continue;
                 }
                 

@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, MarkdownView, Notice, Setting } from 'obsidian';
+import { ItemView, WorkspaceLeaf, MarkdownView, Notice, Setting, sleep } from 'obsidian';
 import { SearchResult } from './search_service';
 import { logger } from './logger';
 import { Position } from './note_processor';
@@ -73,7 +73,7 @@ class TezcatView extends ItemView {
       
       // Yield control back to the browser after each batch
       if (i + BATCH_SIZE < results.length) {
-        await new Promise(resolve => window.setTimeout(resolve, 0));
+        await sleep(0);
       }
     }
   }
