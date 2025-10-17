@@ -306,10 +306,11 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         try {
             const adapter = this.plugin.app.vault.adapter;
             const dbPath = `${this.plugin.app.vault.configDir}/plugins/tezcat/tezcat.db`;
-            
+
             if (await adapter.exists(dbPath)) {
                 const buffer = await adapter.readBinary(dbPath);
                 const data = new Uint8Array(buffer);
+                if (!this.SQL) throw new Error('SQL not initialized');
                 this.db = new this.SQL.Database(data);
                 this.logger.info('SqlJsAdapter', 'Database loaded from disk');
             }
@@ -1179,14 +1180,14 @@ export class DatabaseService {
         `, [noteId]);
         
         if (!result) return false;
-        
+
         const noteUpdated = new Date(result.note_updated);
-        
+
         // Check note-level vector exists and is up to date
         if (!result.note_vectors || result.note_vectors === 0) return false;
         if (!result.note_vector_created) return false;
         if (new Date(result.note_vector_created) < noteUpdated) return false;
-        
+
         // If there are chunks, check that all chunks have vectors and they're up to date
         if (result.total_chunks > 0) {
             if (result.chunk_vectors !== result.total_chunks) return false; // Missing chunk vectors
@@ -1225,7 +1226,7 @@ export class DatabaseService {
         if (!result) {
             throw new Error(`Note not found: ${noteId}`);
         }
-        
+
         const noteUpdated = new Date(result.note_updated);
         const hasNoteVector = result.note_vectors > 0;
         const noteVectorUpToDate = hasNoteVector && 
