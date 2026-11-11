@@ -28,9 +28,6 @@ class MockDatabaseAdapter implements DatabaseAdapter {
     insertFTSContent = vi.fn().mockResolvedValue(undefined);
     deleteFTSContentForNote = vi.fn().mockResolvedValue(undefined);
     dropAllTables = vi.fn().mockResolvedValue(undefined);
-    generateVectorIndex = vi.fn().mockResolvedValue(undefined);
-    getSimilarVectors = vi.fn().mockResolvedValue([]);
-    isVectorIndexAvailable = vi.fn().mockResolvedValue(false);
     save = vi.fn().mockResolvedValue(undefined);
     load = vi.fn().mockResolvedValue(undefined);
 

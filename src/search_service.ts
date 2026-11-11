@@ -23,7 +23,6 @@ export type SearchOptions = {
     includeChunkVectors?: boolean;
     includeBlockVectors?: boolean;
     excludeNotePaths?: string[];
-    useVectorIndex?: boolean;
     useHybridSearch?: boolean;
     hybridWeight?: number; // Weight for combining vector and FTS scores (0.0 = only FTS, 1.0 = only vector)
 };
@@ -40,15 +39,6 @@ export class SearchService {
         this.logger = logger;
     }
 
-    private async isVectorIndexAvailable(): Promise<boolean> {
-        try {
-            return await this.databaseService.isVectorIndexAvailable();
-        } catch (error) {
-            this.logger.warn('SearchService', 'Vector index availability check failed', error);
-            return false;
-        }
-    }
-
     /**
      * Perform vector similarity search against all stored vectors
      */
@@ -59,8 +49,7 @@ export class SearchService {
             includeNoteVectors = true,
             includeChunkVectors = false,
             includeBlockVectors = true,
-            excludeNotePaths = [],
-            useVectorIndex = true
+            excludeNotePaths = []
         } = options;
 
         const searchStartTime = performance.now();
@@ -69,22 +58,8 @@ export class SearchService {
         // Embed the query
         const queryVector = await this.embeddingService.embedText(query);
 
-        // Get vectors from database - use index if requested and available
-        let allVectors: Vector[];
-        if (useVectorIndex && await this.isVectorIndexAvailable()) {
-            this.logger.info('SearchService', 'Using vector index for candidate selection');
-            try {
-                allVectors = await this.databaseService.getSimilarVectors(queryVector, topK);
-            } catch (error) {
-                this.logger.warn('SearchService', 'Vector index failed, falling back to linear search', error);
-                allVectors = await this.databaseService.getAllVectors();
-            }
-        } else {
-            if (useVectorIndex) {
-                this.logger.warn('SearchService', 'Vector index requested but not available, using linear search');
-            }
-            allVectors = await this.databaseService.getAllVectors();
-        }
+        // Score every stored vector. Exact, and fast at vault scale.
+        const allVectors: Vector[] = await this.databaseService.getAllVectors();
 
         // Get excluded note IDs if we have excluded paths
         let excludedNoteIds: string[] = [];

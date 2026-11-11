@@ -1,11 +1,14 @@
 import { Plugin } from 'obsidian';
 import { TextChunk } from './chunking_service';
-import { EmbeddingService, LSHConfig, LSHHashFunction, VectorUtils } from './embedding_service';
+import { EmbeddingService } from './embedding_service';
 import { Logger } from './logger';
 import { Block, BlockType } from './note_processor';
 import initSqlJs, { Database, SqlValue, SqlJsStatic, BindParams } from 'sql.js';
 import sqlWasmPath from '../node_modules/sql.js/dist/sql-wasm.wasm';
 const sqlWasm = sqlWasmPath;
+
+/** Tables from earlier versions that nothing uses any more (the LSH vector index). */
+const OBSOLETE_TABLES = ['lsh_buckets', 'lsh_vector_buckets', 'lsh_hash_functions', 'lsh_configs'];
 
 
 export interface DatabaseAdapter {
@@ -24,11 +27,6 @@ export interface DatabaseAdapter {
     query(sql: string, params?: BindParams): Promise<Record<string, SqlValue>[]>;
     get(sql: string, params?: BindParams): Promise<Record<string, SqlValue> | null>;
     
-    // Vector indexing operations
-    generateVectorIndex(vectorDimensions: number): Promise<void>;
-    getSimilarVectors(queryVector: Int8Array, limit: number): Promise<Vector[]>;
-    isVectorIndexAvailable(): Promise<boolean>;
-    
     // FTS operations
     searchFTS(query: string, limit: number): Promise<FTSResult[]>;
     insertFTSContent(id: string, type: string, noteId: string, content: string, notePath: string, noteName: string, blockId?: string): Promise<void>;
@@ -44,12 +42,10 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
     private db: Database | null = null;
     private SQL: SqlJsStatic | null = null;
     private plugin: Plugin;
-    private vectorUtils: VectorUtils;
     private logger: Logger;
 
-    constructor(plugin: Plugin, vectorUtils: VectorUtils, logger: Logger) {
+    constructor(plugin: Plugin, logger: Logger) {
         this.plugin = plugin;
-        this.vectorUtils = vectorUtils;
         this.logger = logger;
     }
 
@@ -70,6 +66,11 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
             
             // Load existing database if it exists
             await this.load();
+
+            // Remove tables left behind by earlier versions
+            for (const table of OBSOLETE_TABLES) {
+                await this.execute(`DROP TABLE IF EXISTS ${table}`);
+            }
             
             // Create all tables (will be no-op if they already exist due to IF NOT EXISTS)
             await this.createNotesTable();
@@ -77,7 +78,6 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
             await this.createVectorsTable();
             await this.createBlocksTable();
             await this.createFTSTable();
-            await this.createLSHBucketsTable();
             
             this.logger.info('SqlJsAdapter', 'Database initialized successfully with sql.js');
         } catch (error) {
@@ -204,9 +204,9 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         this.logger.info('SqlJsAdapter', 'Dropping all tables for database rebuild...');
         
         // Drop tables in reverse dependency order to avoid foreign key constraint issues
-        await this.execute('DROP TABLE IF EXISTS lsh_vector_buckets');
-        await this.execute('DROP TABLE IF EXISTS lsh_hash_functions');
-        await this.execute('DROP TABLE IF EXISTS lsh_configs');
+        for (const table of OBSOLETE_TABLES) {
+            await this.execute(`DROP TABLE IF EXISTS ${table}`);
+        }
         await this.execute('DROP TABLE IF EXISTS vectors');
         await this.execute('DROP TABLE IF EXISTS blocks');
         await this.execute('DROP TABLE IF EXISTS chunks');
@@ -214,59 +214,6 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         await this.execute('DROP TABLE IF EXISTS notes');
         
         this.logger.info('SqlJsAdapter', 'All tables dropped successfully');
-    }
-
-    async createLSHBucketsTable(): Promise<void> {
-        if (!this.db) throw new Error('Database not initialized');
-        
-        // Create LSH configuration table
-        await this.execute(`
-            CREATE TABLE IF NOT EXISTS lsh_configs (
-                id TEXT PRIMARY KEY,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                vector_count INTEGER NOT NULL,
-                vector_dimensions INTEGER NOT NULL,
-                num_hash_functions INTEGER NOT NULL
-            )
-        `);
-        
-        // Create LSH hash functions table
-        await this.execute(`
-            CREATE TABLE IF NOT EXISTS lsh_hash_functions (
-                id TEXT PRIMARY KEY,
-                config_id TEXT NOT NULL,
-                hash_index INTEGER NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                projection_matrix TEXT NOT NULL,
-                FOREIGN KEY (config_id) REFERENCES lsh_configs(id) ON DELETE CASCADE
-            )
-        `);
-        
-        // Create LSH buckets table
-        await this.execute(`
-            CREATE TABLE IF NOT EXISTS lsh_buckets (
-                id TEXT PRIMARY KEY,
-                config_id TEXT NOT NULL,
-                bucket_hash TEXT NOT NULL,
-                vector_id TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (config_id) REFERENCES lsh_configs(id) ON DELETE CASCADE,
-                FOREIGN KEY (vector_id) REFERENCES vectors(id) ON DELETE CASCADE
-            )
-        `);
-        
-        // Create indexes for efficient lookups
-        await this.execute(`
-            CREATE INDEX IF NOT EXISTS idx_lsh_hash_functions_config_id 
-            ON lsh_hash_functions(config_id)
-        `);
-        
-        await this.execute(`
-            CREATE INDEX IF NOT EXISTS idx_lsh_buckets_config_hash 
-            ON lsh_buckets(config_id, bucket_hash)
-        `);
-        
-        this.logger.info('SqlJsAdapter', 'Created LSH tables for hash function storage and bucket indexing');
     }
 
     async execute(sql: string, params?: BindParams): Promise<void> {
@@ -316,326 +263,6 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
             }
         } catch (error) {
             this.logger.info('SqlJsAdapter', 'No existing database found, starting fresh');
-        }
-    }
-
-    async generateVectorIndex(vectorDimensions: number): Promise<void> {
-        if (!this.db) throw new Error('Database not initialized');
-        
-        this.logger.info('SqlJsAdapter', 'Starting LSH vector index generation...');
-        
-        try {
-            // Get vector count from existing vectors
-            const vectorStats = await this.get('SELECT COUNT(*) as count FROM vectors');
-            
-            if (!vectorStats || vectorStats.count === 0) {
-                this.logger.info('SqlJsAdapter', 'No vectors found, skipping LSH index generation');
-                return;
-            }
-            
-            const vectorCount = vectorStats.count as number;
-
-            this.logger.info('SqlJsAdapter', `Building LSH index for ${vectorCount} vectors of ${vectorDimensions} dimensions`);
-
-            // Calculate optimal number of hash functions
-            const numHashFunctions = Math.ceil(Math.log2(vectorCount));
-
-            // Ensure LSH tables exist before clearing them (safe to call multiple times)
-            await this.createLSHBucketsTable();
-
-            // Clear existing LSH data
-            await this.clearLSHTables();
-
-            // Generate hash functions using VectorUtils
-            const configId = await this.createLSHConfig({
-                vector_count_at_build: vectorCount,
-                vector_dimensions: vectorDimensions,
-                num_hash_functions: numHashFunctions
-            });
-
-            // Generate hash functions
-            const { hashFunctions } = this.vectorUtils.createHashFunctions(vectorCount, vectorDimensions);
-            
-            // Store hash functions in database
-            for (const hashFunction of hashFunctions) {
-                await this.createLSHHashFunction({
-                    configId: configId,
-                    hashIndex: hashFunction.hashIndex,
-                    projectionMatrix: hashFunction.projectionMatrix
-                });
-            }
-            
-            // Get the stored hash functions for proper typing
-            const storedHashFunctions = await this.getLSHHashFunctions(configId);
-            
-            // Get all vectors and populate LSH buckets
-            const vectors = await this.query('SELECT id, vector FROM vectors');
-            
-            this.logger.info('SqlJsAdapter', `Populating LSH buckets for ${vectors.length} vectors...`);
-            
-            for (const vectorRow of vectors) {
-                const vector = new Int8Array(vectorRow.vector as Uint8Array);
-                const hashVector = this.vectorUtils.computeHashVector(vector, storedHashFunctions, vectorDimensions);
-                const bucketHash = hashVector.join('');
-
-                await this.createLSHBucket(configId, bucketHash, vectorRow.id as string);
-            }
-            
-            // Get and log LSH statistics
-            const stats = await this.getLSHStats(configId);
-            this.logger.info('SqlJsAdapter', `LSH index generation completed: totalBuckets=${stats.totalBuckets}, totalVectors=${stats.totalVectors}, avgVectorsPerBucket=${stats.avgVectorsPerBucket.toFixed(2)}, maxVectorsInBucket=${stats.maxVectorsInBucket}`);
-            
-        } catch (error) {
-            this.logger.error('SqlJsAdapter', 'Failed to generate LSH vector index', error);
-            throw error;
-        }
-    }
-
-    // LSH-specific operations for SQL.js adapter
-    async getLSHConfig(): Promise<LSHConfig | null> {
-        const row = await this.get('SELECT * FROM lsh_configs LIMIT 1');
-        
-        if (!row) return null;
-        
-        return {
-            id: row.id as number,
-            vector_count_at_build: row.vector_count as number,
-            vector_dimensions: row.vector_dimensions as number,
-            num_hash_functions: row.num_hash_functions as number,
-            created_at: row.created_at as string
-        };
-    }
-
-    async isVectorIndexAvailable(): Promise<boolean> {
-        try {
-            const config = await this.getLSHConfig();
-            return config !== null;
-        } catch (error) {
-            this.logger.warn('SqlJsAdapter', 'Failed to check vector index availability', error);
-            return false;
-        }
-    }
-
-    async getLSHHashFunctions(configId: string): Promise<LSHHashFunction[]> {
-        const rows = await this.query(`
-            SELECT * FROM lsh_hash_functions 
-            WHERE config_id = ? 
-            ORDER BY hash_index
-        `, [configId]);
-        
-        return rows.map(row => {
-            // Parse as regular array first, then convert to Float32Array
-            const projectionMatrixArray = JSON.parse(row.projection_matrix as string);
-            const projectionMatrix = new Float32Array(projectionMatrixArray);
-            this.logger.debug('SqlJsAdapter', `Retrieved hash function with ${projectionMatrix.length} dimensions`);
-
-            return {
-                id: row.id as string,
-                configId: row.config_id as string,
-                hashIndex: row.hash_index as number,
-                projectionMatrix: projectionMatrix,
-                createdAt: new Date(row.created_at as string)
-            };
-        });
-    }
-
-    async clearLSHTables(): Promise<void> {
-        await this.execute('DELETE FROM lsh_buckets');
-        await this.execute('DELETE FROM lsh_hash_functions');
-        await this.execute('DELETE FROM lsh_configs');
-        await this.save();
-        this.logger.info('SqlJsAdapter', 'Cleared all LSH tables');
-    }
-
-    async createLSHConfig(config: Omit<LSHConfig, 'id' | 'created_at'>): Promise<string> {
-        const id = this.generateId();
-        const now = new Date().toISOString();
-        
-        await this.execute(`
-            INSERT INTO lsh_configs (id, created_at, vector_count, vector_dimensions, num_hash_functions)
-            VALUES (?, ?, ?, ?, ?)
-        `, [id, now, config.vector_count_at_build, config.vector_dimensions, config.num_hash_functions]);
-        
-        await this.save();
-        return id;
-    }
-
-    async createLSHHashFunction(hashFunction: Omit<LSHHashFunction, 'id' | 'createdAt'>): Promise<string> {
-        const id = this.generateId();
-        const now = new Date().toISOString();
-        
-        // Convert Float32Array to regular array for proper JSON serialization
-        const projectionMatrixArray = Array.from(hashFunction.projectionMatrix);
-        this.logger.debug('SqlJsAdapter', `Storing hash function with ${projectionMatrixArray.length} dimensions`);
-        
-        await this.execute(`
-            INSERT INTO lsh_hash_functions (id, config_id, hash_index, created_at, projection_matrix)
-            VALUES (?, ?, ?, ?, ?)
-        `, [id, hashFunction.configId, hashFunction.hashIndex, now, JSON.stringify(projectionMatrixArray)]);
-        
-        await this.save();
-        return id;
-    }
-
-    async createLSHBucket(configId: string, bucketHash: string, vectorId: string): Promise<string> {
-        const id = this.generateId();
-        const now = new Date().toISOString();
-        
-        await this.execute(`
-            INSERT INTO lsh_buckets (id, config_id, bucket_hash, vector_id, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        `, [id, configId, bucketHash, vectorId, now]);
-        
-        await this.save();
-        return id;
-    }
-
-    async getLSHBucket(configId: string, bucketHash: string): Promise<string[]> {
-        const rows = await this.query(`
-            SELECT vector_id FROM lsh_buckets 
-            WHERE config_id = ? AND bucket_hash = ?
-        `, [configId, bucketHash]);
-        
-        return rows.map(row => row.vector_id as string);
-    }
-
-    async getAllLSHBuckets(configId: string): Promise<{bucketHash: string, vectorIds: string[]}[]> {
-        const rows = await this.query(`
-            SELECT bucket_hash, vector_id FROM lsh_buckets 
-            WHERE config_id = ?
-        `, [configId]);
-        
-        // Group by bucket hash
-        const bucketMap = new Map<string, string[]>();
-        for (const row of rows) {
-            const bucketHash = row.bucket_hash as string;
-            if (!bucketMap.has(bucketHash)) {
-                bucketMap.set(bucketHash, []);
-            }
-            bucketMap.get(bucketHash)!.push(row.vector_id as string);
-        }
-        
-        return Array.from(bucketMap.entries()).map(([bucketHash, vectorIds]) => ({
-            bucketHash,
-            vectorIds
-        }));
-    }
-
-    async clearLSHBuckets(configId: string): Promise<void> {
-        await this.execute('DELETE FROM lsh_buckets WHERE config_id = ?', [configId]);
-        await this.save();
-    }
-
-    async getLSHStats(configId: string): Promise<{
-        totalBuckets: number;
-        totalVectors: number;
-        avgVectorsPerBucket: number;
-        maxVectorsInBucket: number;
-        emptyBuckets: number;
-    }> {
-        const stats = await this.get(`
-            SELECT 
-                COUNT(DISTINCT bucket_hash) as total_buckets,
-                COUNT(*) as total_vectors,
-                AVG(bucket_size) as avg_vectors_per_bucket,
-                MAX(bucket_size) as max_vectors_in_bucket,
-                COUNT(CASE WHEN bucket_size = 0 THEN 1 END) as empty_buckets
-            FROM (
-                SELECT bucket_hash, COUNT(*) as bucket_size 
-                FROM lsh_buckets 
-                WHERE config_id = ? 
-                GROUP BY bucket_hash
-            )
-        `, [configId]);
-        
-        return {
-            totalBuckets: (stats?.total_buckets as number) || 0,
-            totalVectors: (stats?.total_vectors as number) || 0,
-            avgVectorsPerBucket: (stats?.avg_vectors_per_bucket as number) || 0,
-            maxVectorsInBucket: (stats?.max_vectors_in_bucket as number) || 0,
-            emptyBuckets: (stats?.empty_buckets as number) || 0
-        };
-    }
-
-    async getSimilarVectors(queryVector: Int8Array, limit: number): Promise<Vector[]> {
-        if (!this.db) throw new Error('Database not initialized');
-        
-        if (!this.vectorUtils) {
-            this.logger.error('SqlJsAdapter', 'VectorUtils not provided - vector index search unavailable');
-            throw new Error('Vector index not available - VectorUtils not initialized');
-        }
-        
-        // Check if LSH is available
-        const lshConfig = await this.getLSHConfig();
-        if (!lshConfig) {
-            this.logger.error('SqlJsAdapter', 'No LSH configuration found - vector index not built');
-            throw new Error('Vector index not available - LSH configuration missing');
-        }
-
-        try {
-            // Get hash functions for this configuration
-            const hashFunctions = await this.getLSHHashFunctions(lshConfig.id.toString());
-            
-            // Compute hash for query vector
-            const queryHash = this.vectorUtils.computeHashVector(queryVector, hashFunctions, lshConfig.vector_dimensions);
-
-            // Get all buckets and compute hamming distances
-            const allBuckets = await this.getAllLSHBuckets(lshConfig.id.toString());
-            // Compute hamming distance to each bucket and sort by distance
-            const bucketDistances = allBuckets.map(bucket => {
-                const bucketHashArray = bucket.bucketHash.split('').map(Number);
-                const hammingDistance = VectorUtils.hammingDistance(queryHash, bucketHashArray);
-                return {
-                    ...bucket,
-                    hammingDistance
-                };
-            });
-
-            // Sort by hamming distance (closest first)
-            bucketDistances.sort((a, b) => a.hammingDistance - b.hammingDistance);
-
-            // Collect vector IDs from closest buckets until we have enough candidates
-            const candidateVectorIds = new Set<string>();
-            const targetCandidates = limit * 10; // Get 10x more candidates for better ranking
-            let bucketsUsed = 0;
-            
-            for (const bucket of bucketDistances) {
-                bucket.vectorIds.forEach(id => candidateVectorIds.add(id));
-                bucketsUsed++;
-                
-                // Break once we have enough candidates
-                if (candidateVectorIds.size >= targetCandidates) break;
-            }
-
-            // Retrieve actual vectors from the database
-            const vectorIds = Array.from(candidateVectorIds);
-            const vectors: Vector[] = [];
-            
-            if (vectorIds.length > 0) {
-                const placeholders = vectorIds.map(() => '?').join(',');
-                const rows = await this.query(`
-                    SELECT * FROM vectors WHERE id IN (${placeholders})
-                `, vectorIds);
-                
-                vectors.push(...rows.map(row => ({
-                    id: row.id as string,
-                    note_id: row.note_id as string,
-                    chunk_id: (row.chunk_id as string | null) || undefined,
-                    block_id: (row.block_id as string | null) || undefined,
-                    type: row.type as VectorType,
-                    created_at: row.created_at as string,
-                    updated_at: row.updated_at as string,
-                    vector: new Int8Array(row.vector as Uint8Array)
-                })));
-            }
-
-            this.logger.debug('SqlJsAdapter', `LSH search found ${vectors.length} vector candidates from ${bucketsUsed} buckets (min hamming distance: ${bucketDistances[0].hammingDistance})`);
-            
-            return vectors;
-
-        } catch (error) {
-            this.logger.error('SqlJsAdapter', 'LSH search failed', error);
-            throw error;
         }
     }
 
@@ -925,14 +552,6 @@ export class DatabaseService {
             updated_at: row.updated_at as string,
             vector: new Int8Array(row.vector as Uint8Array)
         }));
-    }
-
-    async getSimilarVectors(queryVector: Int8Array, limit: number): Promise<Vector[]> {
-        return await this.adapter.getSimilarVectors(queryVector, limit);
-    }
-
-    async isVectorIndexAvailable(): Promise<boolean> {
-        return await this.adapter.isVectorIndexAvailable();
     }
 
     async getVectorCount(): Promise<number> {

@@ -17,12 +17,7 @@ const mockLogger = {
 };
 
 // Mock database service with minimal interface
-const mockDatabaseService = {
-    adapter: {
-        getLSHConfig: vi.fn().mockResolvedValue(null)
-    },
-    isVectorIndexAvailable: vi.fn().mockResolvedValue(false)
-};
+const mockDatabaseService = {};
 
 // Mock embedding service
 const mockEmbeddingService = {
@@ -134,15 +129,6 @@ describe('SearchService', () => {
         it('creates SearchService instance with mocked dependencies', () => {
             expect(searchService).toBeDefined();
             expect(searchService).toBeInstanceOf(SearchService);
-        });
-
-        it('has access to vector index availability check', async () => {
-            // Test that the private method exists and can be called
-            const isAvailable = await (searchService as any).isVectorIndexAvailable();
-            
-            // Should return false with our mocked database
-            expect(isAvailable).toBe(false);
-            expect(mockDatabaseService.isVectorIndexAvailable).toHaveBeenCalled();
         });
     });
 });

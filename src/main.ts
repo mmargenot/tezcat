@@ -1,7 +1,7 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, WorkspaceLeaf} from 'obsidian';
 import { TezcatView, VIEW_TYPE } from './search_view';
 import { DatabaseService, SqlJsDatabaseAdapter } from './database_service';
-import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, EmbeddingProvider, VectorUtils, OllamaModelManager } from './embedding_service';
+import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, EmbeddingProvider, OllamaModelManager } from './embedding_service';
 import { ChunkingService } from './chunking_service';
 import { SearchService, SearchResult } from './search_service';
 import { logger, LogLevel } from './logger';
@@ -16,7 +16,6 @@ type SearchMode = 'vector' | 'hybrid';
 interface TezcatSettings {
     embeddingProvider: EmbeddingProviderType;
     embeddingModel: string;
-    vectorSize: number;
     openaiApiKey: string;
     ollamaBaseUrl: string;
     chunkSize: number;
@@ -31,7 +30,6 @@ interface TezcatSettings {
 const DEFAULT_SETTINGS: TezcatSettings = {
     embeddingProvider: 'ollama',
     embeddingModel: 'nomic-embed-text:v1.5',
-    vectorSize: 768,
     openaiApiKey: '',
     ollamaBaseUrl: 'http://localhost:11434',
     chunkSize: 128,
@@ -51,7 +49,6 @@ export default class Tezcat extends Plugin {
     public chunkingService: ChunkingService;
     public searchService: SearchService;
     private noteProcessor: NoteProcessor;
-    private vectorUtils: VectorUtils;
     private validationService: ValidationService;
     public modelManager: OllamaModelManager | null = null;
     private systemValidationResult: SystemValidationResult | null = null;
@@ -74,12 +71,11 @@ export default class Tezcat extends Plugin {
         logger.info('Plugin', 'Loading Tezcat plugin');
         
         
-        // Initialize vector utils and validation service
-        this.vectorUtils = new VectorUtils(logger);
+        // Initialize validation service
         this.validationService = new ValidationService(logger);
         
         // Initialize database (only this needs async initialization due to file I/O)
-        this.databaseAdapter = new SqlJsDatabaseAdapter(this, this.vectorUtils, logger);
+        this.databaseAdapter = new SqlJsDatabaseAdapter(this, logger);
         await this.databaseAdapter.initialize();
         
         // Initialize services but don't validate yet
@@ -118,7 +114,6 @@ export default class Tezcat extends Plugin {
         // Add vector database commands
         this.registerCommand('rebuild-database', 'Rebuild database', () => this.rebuildDatabase());
         this.registerCommand('show-vector-database-stats', 'Show vector database stats', () => this.showVectorDatabaseStats());
-        this.registerCommand('rebuild-vector-index', 'Rebuild vector index', () => this.rebuildVectorIndex());
         this.registerCommand('vector-search', 'Vector search', () => this.performVectorSearch());
 
 
@@ -380,10 +375,6 @@ export default class Tezcat extends Plugin {
             new Notice('Processing all vault files...');
             await this.processAllVaultFilesIntoDatabase(false);
             
-            // Build vector index (this will create LSH tables internally if needed)
-            new Notice('Building vector index...');
-            await this.databaseAdapter.generateVectorIndex(this.settings.vectorSize);
-            
             // Save the rebuilt database
             await this.databaseAdapter.save();
             
@@ -525,10 +516,6 @@ export default class Tezcat extends Plugin {
             logger.info('Plugin', 'Workspace ready, processing vault files...');
             await this.processAllVaultFilesIntoDatabase(false);
             
-            // Build vector index after all files are processed
-            logger.info('Plugin', 'Building vector index...');
-            await this.ensureVectorIndexExists();
-            
             // Ensure FTS content exists for all notes (for hybrid search)
             logger.info('Plugin', 'Ensuring FTS content is populated...');
             await this.databaseService.ensureFTSContentForAllNotes();
@@ -540,47 +527,6 @@ export default class Tezcat extends Plugin {
             logger.info('Plugin', 'Automatic setup completed successfully');
         } catch (error) {
             logger.error('Plugin', 'Failed during automatic setup', error);
-        }
-    }
-
-    async ensureVectorIndexExists() {
-        if (!this.ensureSystemValid()) {
-            return;
-        }
-        
-        try {
-            // Check if vector index already exists
-            const lshConfig = await this.databaseAdapter.getLSHConfig();
-            
-            if (lshConfig) {
-                logger.info('Plugin', 'Vector index already exists, skipping build');
-                return;
-            }
-            
-            // Index doesn't exist, build it
-            logger.info('Plugin', 'Vector index not found, building index...');
-            await this.databaseAdapter.generateVectorIndex(this.settings.vectorSize);
-            logger.info('Plugin', 'Vector index built successfully');
-            
-        } catch (error) {
-            logger.error('Plugin', 'Failed to ensure vector index exists', error);
-            // Don't throw error during startup - just log it
-        }
-    }
-
-    async rebuildVectorIndex() {
-        if (!this.ensureSystemValid()) {
-            return;
-        }
-        
-        new Notice('Starting vector index rebuild...');
-        
-        try {
-            await this.databaseAdapter.generateVectorIndex(this.settings.vectorSize);
-            new Notice('Vector index rebuilt successfully!');
-        } catch (error) {
-            logger.error('Plugin', 'Vector index rebuild failed', error);
-            new Notice('Vector index rebuild failed. Check console for details.');
         }
     }
 
@@ -1151,47 +1097,8 @@ class TezcatSettingTab extends PluginSettingTab {
                     .onChange((value) => {
                         this.pendingSettings.embeddingModel = value;
                         this.hasSensitiveChanges = true;
-                        
-                        // Auto-update vector size based on model
-                        if (value === 'bge-m3') {
-                            this.pendingSettings.vectorSize = 1024;
-                        } else if (value === 'text-embedding-3-small') {
-                            this.pendingSettings.vectorSize = 1536;
-                        } else if (value === 'text-embedding-3-large') {
-                            this.pendingSettings.vectorSize = 3072;
-                        } else {
-                            this.pendingSettings.vectorSize = 768;
-                        }
-                        this.display(); // Refresh to update vector size field
+                        this.display();
                     });
-            });
-
-        new Setting(containerEl)
-            .setName('Vector size')
-            .setDesc('The size of the embedding vectors (default: 768)')
-            .addText(text => {
-                const isReadOnly = this.pendingSettings.embeddingModel === 'bge-m3' || 
-                                 this.pendingSettings.embeddingModel === 'text-embedding-3-small' ||
-                                 this.pendingSettings.embeddingModel === 'text-embedding-3-large';
-                
-                text
-                    .setPlaceholder('768')
-                    .setValue(this.pendingSettings.vectorSize.toString())
-                    .setDisabled(isReadOnly);
-                
-                if (!isReadOnly) {
-                    const originalValue = this.plugin.settings.vectorSize;
-                    text.onChange((value) => {
-                        const vectorSize = parseInt(value) || 768;
-                        this.pendingSettings.vectorSize = vectorSize;
-                    });
-                    text.inputEl.addEventListener('blur', () => {
-                        if (this.pendingSettings.vectorSize !== originalValue) {
-                            this.hasSensitiveChanges = true;
-                            this.display();
-                        }
-                    });
-                }
             });
 
         new Setting(containerEl)
@@ -1486,7 +1393,6 @@ class TezcatSettingTab extends PluginSettingTab {
         return (
             this.plugin.settings.embeddingProvider !== this.pendingSettings.embeddingProvider ||
             this.plugin.settings.embeddingModel !== this.pendingSettings.embeddingModel ||
-            this.plugin.settings.vectorSize !== this.pendingSettings.vectorSize ||
             this.plugin.settings.chunkSize !== this.pendingSettings.chunkSize ||
             this.plugin.settings.chunkOverlap !== this.pendingSettings.chunkOverlap
         );
