@@ -26,7 +26,6 @@
 		"vitest": "^3.2.4"
 	},
 	"dependencies": {
-		"sql.js": "^1.8.0",
-		"tiktoken": "^1.0.16"
+		"sql.js": "^1.8.0"
 	}
 }

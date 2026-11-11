@@ -12,7 +12,6 @@ class MockDatabaseAdapter implements DatabaseAdapter {
     // In-memory storage for tests only
     private mockData = {
         notes: new Map<string, any>(),
-        chunks: new Map<string, any>(),
         vectors: new Map<string, any>()
     };
 
@@ -20,7 +19,6 @@ class MockDatabaseAdapter implements DatabaseAdapter {
     initialize = vi.fn().mockResolvedValue(undefined);
     close = vi.fn().mockResolvedValue(undefined);
     createNotesTable = vi.fn().mockResolvedValue(undefined);
-    createChunksTable = vi.fn().mockResolvedValue(undefined);
     createVectorsTable = vi.fn().mockResolvedValue(undefined);
     createBlocksTable = vi.fn().mockResolvedValue(undefined);
     createFTSTable = vi.fn().mockResolvedValue(undefined);
@@ -51,7 +49,7 @@ class MockDatabaseAdapter implements DatabaseAdapter {
         if (sql.includes('GROUP BY type')) {
             return [
                 { type: 'note', count: 5 },
-                { type: 'chunk', count: 10 }
+                { type: 'block', count: 10 }
             ];
         }
         return [];
@@ -84,7 +82,6 @@ class MockDatabaseAdapter implements DatabaseAdapter {
 
     reset() {
         this.mockData.notes.clear();
-        this.mockData.chunks.clear();
         this.mockData.vectors.clear();
         vi.clearAllMocks();
     }
@@ -178,7 +175,7 @@ describe('DatabaseService', () => {
                 expect.arrayContaining([
                     vectorId,
                     vectorData.note_id,
-                    null, // chunk_id
+                    null, // block_id
                     vectorData.type,
                     expect.any(String), // created_at
                     expect.any(String), // updated_at
@@ -203,7 +200,7 @@ describe('DatabaseService', () => {
             expect(insertCall).toBeDefined();
             expect(insertCall![1]).toBeDefined();
             
-            const storedVector = (insertCall![1] as any[])[7] as Int8Array; // vector parameter (now at index 7)
+            const storedVector = (insertCall![1] as any[])[6] as Int8Array; // vector parameter (index 6)
             expect(storedVector).toBeInstanceOf(Int8Array);
             expect(Array.from(storedVector)).toEqual(Array.from(originalVector));
         });
@@ -238,23 +235,6 @@ describe('DatabaseService', () => {
     });
 
     describe('Change detection', () => {
-        it('identifies files needing vector processing', async () => {
-            const mockOutdatedFiles = [
-                { path: '/outdated1.md', note_updated: '2024-01-02T00:00:00.000Z' },
-                { path: '/outdated2.md', note_updated: '2024-01-03T00:00:00.000Z' }
-            ];
-
-            mockAdapter.setMockQueryResult('SELECT DISTINCT', mockOutdatedFiles);
-
-            const result = await databaseService.getFilesModifiedSinceLastVectorCreation();
-
-            expect(result).toHaveLength(2);
-            expect(result[0]).toEqual({
-                path: '/outdated1.md',
-                lastModified: new Date('2024-01-02T00:00:00.000Z').getTime()
-            });
-        });
-
         it('identifies files without vectors', async () => {
             const mockFiles = [
                 { note_id: 'note1', path: '/new1.md' },
@@ -280,64 +260,6 @@ describe('DatabaseService', () => {
                 expect.stringContaining('DELETE FROM vectors')
             );
             expect(mockAdapter.save).toHaveBeenCalled();
-        });
-
-        it('gets orphaned data counts', async () => {
-            const mockCounts = [5, 3, 2];
-            let callIndex = 0;
-            
-            (mockAdapter.get as MockedFunction<any>).mockImplementation(async () => {
-                return { count: mockCounts[callIndex++] || 0 };
-            });
-
-            const result = await databaseService.getOrphanedDataCounts();
-
-            expect(result).toEqual({
-                orphanedVectors: 5,
-                orphanedChunks: 3,
-                orphanedChunkVectors: 2
-            });
-        });
-
-        it('performs full cleanup', async () => {
-            await databaseService.performFullCleanup();
-
-            expect(mockAdapter.execute).toHaveBeenCalledTimes(3); // 3 cleanup operations
-            expect(mockAdapter.save).toHaveBeenCalledTimes(3);
-        });
-    });
-
-    describe('Chunk operations', () => {
-        it('creates a chunk', async () => {
-            const chunkData = {
-                note_id: 'test-note-id',
-                chunk_index: 0,
-                text: 'This is chunk text'
-            };
-
-            const chunkId = await databaseService.createChunk(chunkData);
-
-            expect(chunkId).toBeDefined();
-            expect(mockAdapter.execute).toHaveBeenCalledWith(
-                expect.stringContaining('INSERT INTO chunks'),
-                expect.arrayContaining([
-                    chunkId,
-                    chunkData.note_id,
-                    expect.any(String), // created_at
-                    expect.any(String), // updated_at
-                    chunkData.chunk_index,
-                    chunkData.text
-                ])
-            );
-        });
-
-        it('deletes chunks for a note', async () => {
-            await databaseService.deleteChunksForNote('test-note-id');
-
-            expect(mockAdapter.execute).toHaveBeenCalledWith(
-                'DELETE FROM chunks WHERE note_id = ?',
-                ['test-note-id']
-            );
         });
     });
 });

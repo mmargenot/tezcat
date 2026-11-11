@@ -2,7 +2,6 @@ import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Set
 import { TezcatView, VIEW_TYPE } from './search_view';
 import { DatabaseService, SqlJsDatabaseAdapter } from './database_service';
 import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, EmbeddingProvider, OllamaModelManager } from './embedding_service';
-import { ChunkingService } from './chunking_service';
 import { SearchService, SearchResult } from './search_service';
 import { logger, LogLevel } from './logger';
 import { ValidationService, SystemValidationResult, ValidationResult } from './validation_service';
@@ -18,8 +17,6 @@ interface TezcatSettings {
     embeddingModel: string;
     openaiApiKey: string;
     ollamaBaseUrl: string;
-    chunkSize: number;
-    chunkOverlap: number;
     contextWindowWords: number;
     searchCadence: SearchCadence;
     searchMode: SearchMode;
@@ -32,8 +29,6 @@ const DEFAULT_SETTINGS: TezcatSettings = {
     embeddingModel: 'nomic-embed-text:v1.5',
     openaiApiKey: '',
     ollamaBaseUrl: 'http://localhost:11434',
-    chunkSize: 128,
-    chunkOverlap: 16,
     contextWindowWords: 64, // Smaller context window for more focused search
     searchCadence: 'always',
     searchMode: 'hybrid',
@@ -46,7 +41,6 @@ export default class Tezcat extends Plugin {
     public databaseService: DatabaseService;
     public databaseAdapter: SqlJsDatabaseAdapter;
     public embeddingService: EmbeddingService;
-    public chunkingService: ChunkingService;
     public searchService: SearchService;
     private noteProcessor: NoteProcessor;
     private validationService: ValidationService;
@@ -81,7 +75,6 @@ export default class Tezcat extends Plugin {
         // Initialize services but don't validate yet
         this.databaseService = new DatabaseService(this.databaseAdapter, logger);
         this.initializeEmbeddingServices();
-        this.chunkingService = new ChunkingService(this.settings.chunkSize, this.settings.chunkOverlap, this, logger);
         this.searchService = new SearchService(this.databaseService, this.embeddingService, logger);
 
         // Initialize note processor
@@ -320,14 +313,6 @@ export default class Tezcat extends Plugin {
         // Reinitialize embedding services with new settings
         this.initializeEmbeddingServices();
         
-        // Update chunking service with new settings
-        this.chunkingService = new ChunkingService(
-            this.settings.chunkSize, 
-            this.settings.chunkOverlap, 
-            this, 
-            logger
-        );
-        
         // Recreate search service with updated embedding service
         this.searchService = new SearchService(
             this.databaseService, 
@@ -366,7 +351,6 @@ export default class Tezcat extends Plugin {
             // Recreate core tables
             new Notice('Recreating database tables...');
             await this.databaseAdapter.createNotesTable();
-            await this.databaseAdapter.createChunksTable();
             await this.databaseAdapter.createVectorsTable();
             await this.databaseAdapter.createBlocksTable();
             await this.databaseAdapter.createFTSTable();
@@ -536,16 +520,12 @@ export default class Tezcat extends Plugin {
 
             const message = `Vector database stats:
 • Total notes: ${stats.totalNotes}
-• Processed notes: ${stats.processedNotes}
 • Total vectors: ${stats.totalVectors}
 • Note vectors: ${stats.vectorsByType.note}
-• Block vectors: ${stats.vectorsByType.block}
-• Outdated notes: ${stats.outdatedNotes}
-• Orphaned vectors: ${stats.orphanedData.orphanedVectors}
-• Orphaned chunks: ${stats.orphanedData.orphanedChunks}`;
+• Block vectors: ${stats.vectorsByType.block}`;
 
             new Notice(message, 10000); // Show for 10 seconds
-            logger.info('Plugin', `Vector Database Stats: totalNotes=${stats.totalNotes}, processedNotes=${stats.processedNotes}, totalVectors=${stats.totalVectors}, noteVectors=${stats.vectorsByType.note}, blockVectors=${stats.vectorsByType.block}`);
+            logger.info('Plugin', `Vector Database Stats: totalNotes=${stats.totalNotes}, totalVectors=${stats.totalVectors}, noteVectors=${stats.vectorsByType.note}, blockVectors=${stats.vectorsByType.block}`);
         } catch (error) {
             logger.error('Plugin', 'Failed to get vector database stats', error);
             new Notice('Failed to get vector database stats. Check console for details.');
@@ -571,7 +551,6 @@ export default class Tezcat extends Plugin {
                         topK: 10,
                         minScore: 0.1,
                         includeNoteVectors: true,
-                        includeChunkVectors: false,
                         includeBlockVectors: true,
                         excludeNotePaths
                     });
@@ -806,7 +785,6 @@ export default class Tezcat extends Plugin {
                     topK: 10,
                     minScore: 0, // RRF scores are much smaller than cosine similarity scores
                     includeNoteVectors: true,
-                    includeChunkVectors: false,
                     includeBlockVectors: true,
                     excludeNotePaths,
                     hybridWeight: 0.5 // Equal weighting by default
@@ -815,7 +793,6 @@ export default class Tezcat extends Plugin {
                     topK: 10,
                     minScore: 0.1,
                     includeNoteVectors: true,
-                    includeChunkVectors: false,
                     includeBlockVectors: true,
                     excludeNotePaths
                 });
@@ -890,9 +867,8 @@ export default class Tezcat extends Plugin {
             const existingNote = await this.databaseService.getNoteByPath(file.path);
             if (existingNote) {
                 logger.info('Plugin', `Removing deleted note from database: ${file.path}`);
-                // Delete in order: vectors, chunks, then note
+                // Delete vectors, then the note
                 await this.databaseService.deleteVectorsForNote(existingNote.id);
-                await this.databaseService.deleteChunksForNote(existingNote.id);
                 await this.databaseService.deleteNote(existingNote.id);
                 logger.info('Plugin', `Successfully removed note ${existingNote.id} (${file.path}) from database`);
             } else {
@@ -1101,46 +1077,6 @@ class TezcatSettingTab extends PluginSettingTab {
                     });
             });
 
-        new Setting(containerEl)
-            .setName('Chunk size')
-            .setDesc('The number of tokens per text chunk. Also affects the search context window size around your cursor (default: 128)')
-            .addText(text => {
-                const originalValue = this.plugin.settings.chunkSize;
-                text
-                    .setPlaceholder('128')
-                    .setValue(this.pendingSettings.chunkSize.toString())
-                    .onChange((value) => {
-                        const chunkSize = parseInt(value) || 128;
-                        this.pendingSettings.chunkSize = chunkSize;
-                    });
-                text.inputEl.addEventListener('blur', () => {
-                    if (this.pendingSettings.chunkSize !== originalValue) {
-                        this.hasSensitiveChanges = true;
-                        this.display();
-                    }
-                });
-            });
-
-        new Setting(containerEl)
-            .setName('Chunk overlap')
-            .setDesc('The number of tokens to overlap between chunks for better context continuity (default: 16)')
-            .addText(text => {
-                const originalValue = this.plugin.settings.chunkOverlap;
-                text
-                    .setPlaceholder('16')
-                    .setValue(this.pendingSettings.chunkOverlap.toString())
-                    .onChange((value) => {
-                        const chunkOverlap = parseInt(value) || 16;
-                        this.pendingSettings.chunkOverlap = chunkOverlap;
-                    });
-                text.inputEl.addEventListener('blur', () => {
-                    if (this.pendingSettings.chunkOverlap !== originalValue) {
-                        this.hasSensitiveChanges = true;
-                        this.display();
-                    }
-                });
-            });
-
         // Conditional settings based on provider
         if (this.pendingSettings.embeddingProvider === 'openai') {
             new Setting(containerEl)
@@ -1342,13 +1278,6 @@ class TezcatSettingTab extends PluginSettingTab {
         const provider = this.createEmbeddingProvider();
         this.plugin.embeddingService = new EmbeddingService(provider, logger);
         
-        this.plugin.chunkingService = new ChunkingService(
-            this.plugin.settings.chunkSize, 
-            this.plugin.settings.chunkOverlap, 
-            this.plugin, 
-            logger
-        );
-        
         // Recreate search service to use the new embedding service
         this.plugin.searchService = new SearchService(
             this.plugin.databaseService, 
@@ -1392,9 +1321,7 @@ class TezcatSettingTab extends PluginSettingTab {
     private requiresReindex(): boolean {
         return (
             this.plugin.settings.embeddingProvider !== this.pendingSettings.embeddingProvider ||
-            this.plugin.settings.embeddingModel !== this.pendingSettings.embeddingModel ||
-            this.plugin.settings.chunkSize !== this.pendingSettings.chunkSize ||
-            this.plugin.settings.chunkOverlap !== this.pendingSettings.chunkOverlap
+            this.plugin.settings.embeddingModel !== this.pendingSettings.embeddingModel
         );
     }
 
@@ -1744,57 +1671,30 @@ class VectorSearchResultsModal extends Modal {
         this.results.forEach((result, index) => {
             const resultEl = resultsContainer.createDiv('tezcat-search-result');
 
-            if (result.type === 'chunk') {
-                // For chunks: show chunk text first, then note info below
-                const textEl = resultEl.createDiv('tezcat-search-result-text');
-                textEl.textContent = result.text.length > 200 ? result.text.substring(0, 200) + '...' : result.text;
+            // Note name, result type and score, then path and text
+            const headerEl = resultEl.createDiv('tezcat-search-result-header');
 
-                // Note info with score and type
-                const headerEl = resultEl.createDiv('tezcat-search-result-header');
+            const titleEl = headerEl.createEl('strong');
+            titleEl.textContent = result.noteName;
 
-                const titleEl = headerEl.createEl('strong', { cls: 'tezcat-search-result-title' });
-                titleEl.textContent = result.noteName;
+            const metaEl = headerEl.createDiv();
+            const typeSpan = metaEl.createEl('span', {
+                text: result.type,
+                cls: 'tezcat-search-result-type'
+            });
 
-                const metaEl = headerEl.createDiv();
-                const typeSpan = metaEl.createEl('span', {
-                    text: result.type,
-                    cls: 'tezcat-search-result-type'
-                });
+            const scoreSpan = metaEl.createEl('span', {
+                text: `Score: ${result.score.toFixed(3)}`,
+                cls: 'tezcat-search-result-score'
+            });
 
-                const scoreSpan = metaEl.createEl('span', {
-                    text: `Score: ${result.score.toFixed(3)}`,
-                    cls: 'tezcat-search-result-score'
-                });
+            // Path
+            const pathEl = resultEl.createDiv('tezcat-search-result-path note-path');
+            pathEl.textContent = result.notePath;
 
-                // Path
-                const pathEl = resultEl.createDiv('tezcat-search-result-path');
-                pathEl.textContent = result.notePath;
-            } else {
-                // For notes: show note info first, then path
-                const headerEl = resultEl.createDiv('tezcat-search-result-header');
-
-                const titleEl = headerEl.createEl('strong');
-                titleEl.textContent = result.noteName;
-
-                const metaEl = headerEl.createDiv();
-                const typeSpan = metaEl.createEl('span', {
-                    text: result.type,
-                    cls: 'tezcat-search-result-type'
-                });
-
-                const scoreSpan = metaEl.createEl('span', {
-                    text: `Score: ${result.score.toFixed(3)}`,
-                    cls: 'tezcat-search-result-score'
-                });
-
-                // Path
-                const pathEl = resultEl.createDiv('tezcat-search-result-path note-path');
-                pathEl.textContent = result.notePath;
-
-                // Text content (note path and name)
-                const textEl = resultEl.createDiv('tezcat-search-result-text');
-                textEl.textContent = result.text.length > 200 ? result.text.substring(0, 200) + '...' : result.text;
-            }
+            // Text content (block text, or note path and name)
+            const textEl = resultEl.createDiv('tezcat-search-result-text');
+            textEl.textContent = result.text.length > 200 ? result.text.substring(0, 200) + '...' : result.text;
 
             // Click to open note
             resultEl.onclick = () => {

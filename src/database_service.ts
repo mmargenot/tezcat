@@ -1,5 +1,4 @@
 import { Plugin } from 'obsidian';
-import { TextChunk } from './chunking_service';
 import { EmbeddingService } from './embedding_service';
 import { Logger } from './logger';
 import { Block, BlockType } from './note_processor';
@@ -7,8 +6,8 @@ import initSqlJs, { Database, SqlValue, SqlJsStatic, BindParams } from 'sql.js';
 import sqlWasmPath from '../node_modules/sql.js/dist/sql-wasm.wasm';
 const sqlWasm = sqlWasmPath;
 
-/** Tables from earlier versions that nothing uses any more (the LSH vector index). */
-const OBSOLETE_TABLES = ['lsh_buckets', 'lsh_vector_buckets', 'lsh_hash_functions', 'lsh_configs'];
+/** Tables from earlier versions that nothing uses any more (token chunks and the LSH index). */
+const OBSOLETE_TABLES = ['lsh_buckets', 'lsh_vector_buckets', 'lsh_hash_functions', 'lsh_configs', 'chunks'];
 
 
 export interface DatabaseAdapter {
@@ -16,7 +15,6 @@ export interface DatabaseAdapter {
     
     // Schema creation methods - each adapter implements its own table creation
     createNotesTable(): Promise<void>;
-    createChunksTable(): Promise<void>;
     createVectorsTable(): Promise<void>;
     createBlocksTable(): Promise<void>;
     createFTSTable(): Promise<void>;
@@ -74,7 +72,6 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
             
             // Create all tables (will be no-op if they already exist due to IF NOT EXISTS)
             await this.createNotesTable();
-            await this.createChunksTable();
             await this.createVectorsTable();
             await this.createBlocksTable();
             await this.createFTSTable();
@@ -109,31 +106,10 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         `);
     }
 
-    async createChunksTable(): Promise<void> {
-        if (!this.db) throw new Error('Database not initialized');
-        
-        await this.execute(`
-            CREATE TABLE IF NOT EXISTS chunks (
-                id TEXT PRIMARY KEY,
-                note_id TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                chunk_index INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE
-            )
-        `);
-        
-        await this.execute(`
-            CREATE INDEX IF NOT EXISTS idx_chunks_note_id_index 
-            ON chunks(note_id, chunk_index)
-        `);
-    }
-
     async createVectorsTable(): Promise<void> {
         if (!this.db) throw new Error('Database not initialized');
         
-        // Create vectors table with BLOB storage for 768-dimensional vectors
+        // chunk_id is unused but kept so existing databases don't need a migration.
         await this.execute(`
             CREATE TABLE IF NOT EXISTS vectors (
                 id TEXT PRIMARY KEY,
@@ -145,7 +121,6 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 vector BLOB,
                 FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
-                FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE,
                 FOREIGN KEY (block_id) REFERENCES blocks(id) ON DELETE CASCADE
             )
         `);
@@ -209,7 +184,6 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         }
         await this.execute('DROP TABLE IF EXISTS vectors');
         await this.execute('DROP TABLE IF EXISTS blocks');
-        await this.execute('DROP TABLE IF EXISTS chunks');
         await this.execute('DROP TABLE IF EXISTS fts_content');
         await this.execute('DROP TABLE IF EXISTS notes');
         
@@ -318,7 +292,6 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
 // Enums and types
 export enum VectorType {
     NOTE = 'note',
-    CHUNK = 'chunk',
     BLOCK = 'block'
 }
 
@@ -332,19 +305,9 @@ export type Note = {
     text: string;
 };
 
-export type Chunk = {
-    id: string;
-    note_id: string;
-    created_at: string;
-    updated_at: string;
-    chunk_index: number;
-    text: string;
-};
-
 export type Vector = {
     id: string;
     note_id: string;
-    chunk_id?: string;
     block_id?: string;
     type: VectorType;
     created_at: string;
@@ -420,59 +383,15 @@ export class DatabaseService {
         return rows as Note[];
     }
 
-    // Chunks operations
-    async createChunk(chunk: Omit<Chunk, 'id' | 'created_at' | 'updated_at'>): Promise<string> {
-        const id = this.generateId();
-        const now = new Date().toISOString();
-        
-        await this.adapter.execute(`
-            INSERT INTO chunks (id, note_id, created_at, updated_at, chunk_index, text)
-            VALUES (?, ?, ?, ?, ?, ?)
-        `, [id, chunk.note_id, now, now, chunk.chunk_index, chunk.text]);
-        
-        await this.adapter.save();
-        return id;
-    }
-
-    async updateChunk(id: string, updates: Partial<Pick<Chunk, 'chunk_index' | 'text'>>): Promise<void> {
-        const now = new Date().toISOString();
-        const setClause = Object.keys(updates).map(key => `${key} = ?`).join(', ');
-        const values = [...Object.values(updates), now, id];
-        
-        await this.adapter.execute(`
-            UPDATE chunks SET ${setClause}, updated_at = ? WHERE id = ?
-        `, values);
-        
-        await this.adapter.save();
-    }
-
-    async deleteChunk(id: string): Promise<void> {
-        await this.adapter.execute('DELETE FROM chunks WHERE id = ?', [id]);
-        await this.adapter.save();
-    }
-
-    async getChunksForNote(noteId: string): Promise<Chunk[]> {
-        const rows = await this.adapter.query(
-            'SELECT * FROM chunks WHERE note_id = ? ORDER BY chunk_index',
-            [noteId]
-        );
-        return rows as Chunk[];
-    }
-
-    async deleteChunksForNote(noteId: string): Promise<void> {
-        await this.adapter.execute('DELETE FROM chunks WHERE note_id = ?', [noteId]);
-        await this.adapter.save();
-    }
-
     // Vectors operations
     async createVector(vector: Omit<Vector, 'id' | 'created_at' | 'updated_at'>): Promise<string> {
         const id = this.generateId();
         const now = new Date().toISOString();
         
         await this.adapter.execute(`
-            INSERT INTO vectors (id, note_id, chunk_id, block_id, type, created_at, updated_at, vector)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `, [id, vector.note_id, vector.chunk_id || null, vector.block_id || null, vector.type, now, now, vector.vector as unknown as Uint8Array]);
+            INSERT INTO vectors (id, note_id, block_id, type, created_at, updated_at, vector)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `, [id, vector.note_id, vector.block_id || null, vector.type, now, now, vector.vector as unknown as Uint8Array]);
         
         await this.adapter.save();
         return id;
@@ -502,7 +421,6 @@ export class DatabaseService {
         return rows.map(row => ({
             id: row.id as string,
             note_id: row.note_id as string,
-            chunk_id: (row.chunk_id as string | null) || undefined,
             block_id: (row.block_id as string | null) || undefined,
             type: row.type as VectorType,
             created_at: row.created_at as string,
@@ -516,36 +434,12 @@ export class DatabaseService {
         await this.adapter.save();
     }
 
-    // Enhanced vector storage/retrieval methods
-    async getVectorByNoteAndChunk(noteId: string, chunkId?: string): Promise<Vector | null> {
-        const query = chunkId
-            ? 'SELECT * FROM vectors WHERE note_id = ? AND chunk_id = ?'
-            : 'SELECT * FROM vectors WHERE note_id = ? AND chunk_id IS NULL';
-
-        const params = chunkId ? [noteId, chunkId] : [noteId];
-        const row = await this.adapter.get(query, params);
-
-        if (!row) return null;
-
-        return {
-            id: row.id as string,
-            note_id: row.note_id as string,
-            chunk_id: (row.chunk_id as string | null) || undefined,
-            block_id: (row.block_id as string | null) || undefined,
-            type: row.type as VectorType,
-            created_at: row.created_at as string,
-            updated_at: row.updated_at as string,
-            vector: new Int8Array(row.vector as Uint8Array)
-        };
-    }
-
     async getAllVectors(): Promise<Vector[]> {
         const rows = await this.adapter.query('SELECT * FROM vectors ORDER BY created_at DESC');
 
         return rows.map(row => ({
             id: row.id as string,
             note_id: row.note_id as string,
-            chunk_id: (row.chunk_id as string | null) || undefined,
             block_id: (row.block_id as string | null) || undefined,
             type: row.type as VectorType,
             created_at: row.created_at as string,
@@ -575,37 +469,6 @@ export class DatabaseService {
         return counts;
     }
 
-    // Change detection methods
-    async getFilesModifiedSinceLastVectorCreation(): Promise<{ path: string; lastModified: number }[]> {
-        // Get all files that are not fully processed (either note vector or chunk vectors are outdated)
-        const query = `
-            SELECT DISTINCT
-                n.path,
-                n.updated_at as note_updated
-            FROM notes n
-            LEFT JOIN chunks c ON n.id = c.note_id
-            LEFT JOIN vectors v_note ON n.id = v_note.note_id AND v_note.type = 'note'
-            LEFT JOIN vectors v_chunk ON c.id = v_chunk.chunk_id AND v_chunk.type = 'chunk'
-            WHERE 
-                -- Missing note vector
-                v_note.id IS NULL
-                -- Note vector is outdated
-                OR (v_note.created_at IS NOT NULL AND v_note.created_at < n.updated_at)
-                -- Has chunks but missing chunk vectors
-                OR (c.id IS NOT NULL AND v_chunk.id IS NULL)
-                -- Has chunks with outdated vectors
-                OR (c.id IS NOT NULL AND v_chunk.created_at IS NOT NULL AND v_chunk.created_at < n.updated_at)
-            ORDER BY n.updated_at DESC
-        `;
-        
-        const results = await this.adapter.query(query);
-        
-        return results.map(row => ({
-            path: row.path as string,
-            lastModified: new Date(row.note_updated as string).getTime()
-        }));
-    }
-
     async getFilesWithoutVectors(): Promise<{ path: string; noteId: string }[]> {
         // Get all notes that have no note-level vectors at all
         const query = `
@@ -624,48 +487,6 @@ export class DatabaseService {
         }));
     }
 
-    async getOutdatedFiles(): Promise<{ path: string; noteId: string; lastModified: number }[]> {
-        // Combine both modified files and files without vectors
-        const [modifiedFiles, filesWithoutVectors] = await Promise.all([
-            this.getFilesModifiedSinceLastVectorCreation(),
-            this.getFilesWithoutVectors()
-        ]);
-
-        // For files without vectors, we need to get their note IDs
-        const filesWithoutVectorsWithIds = await Promise.all(
-            filesWithoutVectors.map(async (file) => {
-                const note = await this.getNoteByPath(file.path);
-                return {
-                    path: file.path,
-                    noteId: file.noteId,
-                    lastModified: note ? new Date(note.updated_at).getTime() : Date.now()
-                };
-            })
-        );
-
-        // Combine and deduplicate by path
-        const allFiles = new Map<string, { path: string; noteId: string; lastModified: number }>();
-        
-        // Add modified files (need to get note IDs)
-        for (const file of modifiedFiles) {
-            const note = await this.getNoteByPath(file.path);
-            if (note) {
-                allFiles.set(file.path, {
-                    path: file.path,
-                    noteId: note.id,
-                    lastModified: file.lastModified
-                });
-            }
-        }
-        
-        // Add files without vectors
-        for (const file of filesWithoutVectorsWithIds) {
-            allFiles.set(file.path, file);
-        }
-
-        return Array.from(allFiles.values());
-    }
-
     // Cleanup methods for orphaned data
     async cleanupOrphanedVectors(): Promise<number> {
         // Remove vectors that reference non-existent notes
@@ -680,71 +501,6 @@ export class DatabaseService {
         // Return count of cleaned up vectors (sql.js doesn't provide affected row counts)
         // For performance reasons, we don't query to count deleted rows
         return 0;
-    }
-
-    async cleanupOrphanedChunks(): Promise<number> {
-        // Remove chunks that reference non-existent notes
-        const query = `
-            DELETE FROM chunks 
-            WHERE note_id NOT IN (SELECT id FROM notes)
-        `;
-        
-        await this.adapter.execute(query);
-        await this.adapter.save();
-        
-        // Return count of cleaned up chunks (sql.js doesn't provide affected row counts)
-        // For performance reasons, we don't query to count deleted rows
-        return 0;
-    }
-
-    async cleanupVectorsForDeletedChunks(): Promise<number> {
-        // Remove vectors that reference non-existent chunks
-        const query = `
-            DELETE FROM vectors 
-            WHERE chunk_id IS NOT NULL 
-            AND chunk_id NOT IN (SELECT id FROM chunks)
-        `;
-        
-        await this.adapter.execute(query);
-        await this.adapter.save();
-        
-        // Return count of cleaned up vectors (sql.js doesn't provide affected row counts)
-        // For performance reasons, we don't query to count deleted rows
-        return 0;
-    }
-
-    async performFullCleanup(): Promise<{ vectors: number; chunks: number; vectorsForChunks: number }> {
-        const [vectors, chunks, vectorsForChunks] = await Promise.all([
-            this.cleanupOrphanedVectors(),
-            this.cleanupOrphanedChunks(),
-            this.cleanupVectorsForDeletedChunks()
-        ]);
-        
-        return { vectors, chunks, vectorsForChunks };
-    }
-
-    async getOrphanedDataCounts(): Promise<{ orphanedVectors: number; orphanedChunks: number; orphanedChunkVectors: number }> {
-        const [orphanedVectors, orphanedChunks, orphanedChunkVectors] = await Promise.all([
-            this.adapter.get(`
-                SELECT COUNT(*) as count FROM vectors 
-                WHERE note_id NOT IN (SELECT id FROM notes)
-            `),
-            this.adapter.get(`
-                SELECT COUNT(*) as count FROM chunks 
-                WHERE note_id NOT IN (SELECT id FROM notes)
-            `),
-            this.adapter.get(`
-                SELECT COUNT(*) as count FROM vectors 
-                WHERE chunk_id IS NOT NULL 
-                AND chunk_id NOT IN (SELECT id FROM chunks)
-            `)
-        ]);
-        
-        return {
-            orphanedVectors: (orphanedVectors?.count as number) || 0,
-            orphanedChunks: (orphanedChunks?.count as number) || 0,
-            orphanedChunkVectors: (orphanedChunkVectors?.count as number) || 0
-        };
     }
 
     // Vector timestamp tracking methods
@@ -804,102 +560,12 @@ export class DatabaseService {
         return rows.map(row => ({
             id: row.id as string,
             note_id: row.note_id as string,
-            chunk_id: (row.chunk_id as string | null) || undefined,
             block_id: (row.block_id as string | null) || undefined,
             type: row.type as VectorType,
             created_at: row.created_at as string,
             updated_at: row.updated_at as string,
             vector: new Int8Array(row.vector as Uint8Array)
         }));
-    }
-
-    async isNoteVectorUpToDate(noteId: string): Promise<boolean> {
-        // Check if BOTH note-level vector AND all chunk vectors are up to date
-        const result = await this.adapter.get(`
-            SELECT 
-                n.updated_at as note_updated,
-                COUNT(c.id) as total_chunks,
-                COUNT(CASE WHEN v_note.type = 'note' THEN 1 END) as note_vectors,
-                COUNT(CASE WHEN v_chunk.type = 'chunk' THEN 1 END) as chunk_vectors,
-                MIN(CASE WHEN v_note.type = 'note' THEN v_note.created_at END) as note_vector_created,
-                MIN(CASE WHEN v_chunk.type = 'chunk' THEN v_chunk.created_at END) as oldest_chunk_vector_created
-            FROM notes n
-            LEFT JOIN chunks c ON n.id = c.note_id
-            LEFT JOIN vectors v_note ON n.id = v_note.note_id AND v_note.type = 'note'
-            LEFT JOIN vectors v_chunk ON c.id = v_chunk.chunk_id AND v_chunk.type = 'chunk'
-            WHERE n.id = ?
-            GROUP BY n.id, n.updated_at
-        `, [noteId]);
-        
-        if (!result) return false;
-
-        const noteUpdated = new Date(result.note_updated as string);
-
-        // Check note-level vector exists and is up to date
-        if (!result.note_vectors || (result.note_vectors as number) === 0) return false;
-        if (!result.note_vector_created) return false;
-        if (new Date(result.note_vector_created as string) < noteUpdated) return false;
-
-        // If there are chunks, check that all chunks have vectors and they're up to date
-        if ((result.total_chunks as number) > 0) {
-            if ((result.chunk_vectors as number) !== (result.total_chunks as number)) return false; // Missing chunk vectors
-            if (!result.oldest_chunk_vector_created) return false;
-            if (new Date(result.oldest_chunk_vector_created as string) < noteUpdated) return false;
-        }
-        
-        return true;
-    }
-
-    async getNoteProcessingStatus(noteId: string): Promise<{
-        noteUpdated: Date;
-        hasNoteVector: boolean;
-        noteVectorUpToDate: boolean;
-        totalChunks: number;
-        chunksWithVectors: number;
-        allChunkVectorsUpToDate: boolean;
-        fullyProcessed: boolean;
-    }> {
-        const result = await this.adapter.get(`
-            SELECT 
-                n.updated_at as note_updated,
-                COUNT(c.id) as total_chunks,
-                COUNT(CASE WHEN v_note.type = 'note' THEN 1 END) as note_vectors,
-                COUNT(CASE WHEN v_chunk.type = 'chunk' THEN 1 END) as chunk_vectors,
-                MIN(CASE WHEN v_note.type = 'note' THEN v_note.created_at END) as note_vector_created,
-                MIN(CASE WHEN v_chunk.type = 'chunk' THEN v_chunk.created_at END) as oldest_chunk_vector_created
-            FROM notes n
-            LEFT JOIN chunks c ON n.id = c.note_id
-            LEFT JOIN vectors v_note ON n.id = v_note.note_id AND v_note.type = 'note'
-            LEFT JOIN vectors v_chunk ON c.id = v_chunk.chunk_id AND v_chunk.type = 'chunk'
-            WHERE n.id = ?
-            GROUP BY n.id, n.updated_at
-        `, [noteId]);
-        
-        if (!result) {
-            throw new Error(`Note not found: ${noteId}`);
-        }
-
-        const noteUpdated = new Date(result.note_updated as string);
-        const hasNoteVector = (result.note_vectors as number) > 0;
-        const noteVectorUpToDate = hasNoteVector &&
-            result.note_vector_created &&
-            new Date(result.note_vector_created as string) >= noteUpdated;
-
-        const allChunkVectorsUpToDate = (result.total_chunks as number) === 0 || (
-            (result.chunk_vectors as number) === (result.total_chunks as number) &&
-            result.oldest_chunk_vector_created &&
-            new Date(result.oldest_chunk_vector_created as string) >= noteUpdated
-        );
-
-        return {
-            noteUpdated,
-            hasNoteVector,
-            noteVectorUpToDate: noteVectorUpToDate as boolean,
-            totalChunks: result.total_chunks as number,
-            chunksWithVectors: result.chunk_vectors as number,
-            allChunkVectorsUpToDate: allChunkVectorsUpToDate as boolean,
-            fullyProcessed: (noteVectorUpToDate && allChunkVectorsUpToDate) as boolean
-        };
     }
 
     async processNoteVector(noteId: string, embeddingService: EmbeddingService): Promise<void> {
@@ -910,10 +576,6 @@ export class DatabaseService {
         const trimmedContent = note.text.trim();
         if (!trimmedContent || trimmedContent.length < 16) {
             return
-        }
-
-        if (await this.isNoteVectorUpToDate(noteId)) {
-            return;  // up to date already
         }
 
         try {
@@ -1035,7 +697,6 @@ export class DatabaseService {
                 
                 await this.createVector({
                     note_id: noteId,
-                    chunk_id: undefined, // No chunk for block vectors
                     block_id: block.id,
                     type: VectorType.BLOCK,
                     vector: embedding
@@ -1173,41 +834,19 @@ export class DatabaseService {
 
     async getVectorDatabaseStats(): Promise<{
         totalNotes: number;
-        processedNotes: number;
         totalVectors: number;
         vectorsByType: { note: number; block: number };
-        outdatedNotes: number;
-        orphanedData: { orphanedVectors: number; orphanedChunks: number; orphanedChunkVectors: number };
     }> {
-        const [
-            allNotes,
-            vectorCount,
-            vectorsByType,
-            outdatedFiles,
-            orphanedData
-        ] = await Promise.all([
+        const [allNotes, vectorCount, vectorsByType] = await Promise.all([
             this.getAllNotes(),
             this.getVectorCount(),
-            this.getVectorCountByType(),
-            this.getOutdatedFiles(),
-            this.getOrphanedDataCounts()
+            this.getVectorCountByType()
         ]);
-
-        // Count how many notes are fully processed
-        let processedNotes = 0;
-        for (const note of allNotes) {
-            if (await this.isNoteVectorUpToDate(note.id)) {
-                processedNotes++;
-            }
-        }
 
         return {
             totalNotes: allNotes.length,
-            processedNotes,
             totalVectors: vectorCount,
-            vectorsByType,
-            outdatedNotes: outdatedFiles.length,
-            orphanedData
+            vectorsByType
         };
     }
 
