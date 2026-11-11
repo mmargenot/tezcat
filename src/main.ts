@@ -49,12 +49,10 @@ export default class Tezcat extends Plugin {
     public isSystemValid: boolean = false;
     public isOperationInProgress: boolean = false;
     private searchDebounceTimer: number | null = null;
-    private lastSearchContext: string = '';
     private get CONTEXT_WINDOW_WORDS() { 
         return this.settings.contextWindowWords; // Words to extract around cursor for search context
     }
     private searchSuppressedUntil: number = 0; // Timestamp to suppress search until
-    private currentNoteId: string | null = null; // Track current note for navigation events
     private statusBarItem: HTMLElement | null = null; // Status bar item for system status
 
     async onload() {
@@ -113,12 +111,6 @@ export default class Tezcat extends Plugin {
         // This adds a settings tab so the user can configure various aspects of the plugin
         this.addSettingTab(new TezcatSettingTab(this.app, this));
 
-        // If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-        // Using this function will automatically remove the event listener when this plugin is disabled.
-
-        // When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-        this.registerInterval(window.setInterval(() => logger.debug('Plugin', 'Heartbeat interval'), 5 * 60 * 1000));
-        
         // Listen for file modifications
         this.registerEvent(this.app.vault.on('modify', (file) => {
             logger.debug('Plugin', `File modified: ${file.path}`);
@@ -156,8 +148,8 @@ export default class Tezcat extends Plugin {
         }));
 
         // Listen for file open events (covers both opening new files and switching between files)
-        this.registerEvent(this.app.workspace.on('file-open', (file) => {
-            this.onFileOpen(file);
+        this.registerEvent(this.app.workspace.on('file-open', () => {
+            this.onFileOpen();
         }));
 
         // Listen for clicks on the editor to detect cursor movements
@@ -221,7 +213,6 @@ export default class Tezcat extends Plugin {
             
             let processed = 0;
             let created = 0;
-            let updated = 0;
             let skipped = 0;
             
             for (const file of files) {
@@ -587,9 +578,6 @@ export default class Tezcat extends Plugin {
     }
 
     private onActiveLeafChange(leaf: WorkspaceLeaf | null) {
-        // Handle note navigation tracking
-        this.handleNoteNavigation(leaf);
-        
         // Track the last active markdown view for the search panel
         if (leaf?.view instanceof MarkdownView) {
             const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
@@ -637,15 +625,7 @@ export default class Tezcat extends Plugin {
         }
     }
 
-    private onFileOpen(file: any) {
-        // Handle note navigation tracking for file opens
-        window.setTimeout(() => {
-            const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (activeView) {
-                this.handleNoteNavigation(activeView.leaf);
-            }
-        }, 10);
-
+    private onFileOpen() {
         if (!this.isSearchPanelVisible()) {
             return;
         }
@@ -763,7 +743,6 @@ export default class Tezcat extends Plugin {
             }
             
             if (context.trim()) {
-                this.lastSearchContext = context;
                 await this.performDynamicSearch(context);
             }
         }, debounceDelay);
@@ -900,30 +879,6 @@ export default class Tezcat extends Plugin {
             }
         } catch (error) {
             logger.error('Plugin', `Failed to handle file rename from ${oldPath} to ${file.path}`, error);
-        }
-    }
-
-
-    private async handleNoteNavigation(leaf: WorkspaceLeaf | null) {
-        // Only handle markdown files
-        if (!leaf?.view || !(leaf.view instanceof MarkdownView) || !leaf.view.file) {
-            return;
-        }
-        
-        const file = leaf.view.file;
-        if (file.extension !== 'md') return;
-        
-        try {
-            // Get the note ID for the current file
-            const note = await this.databaseService.getNoteByPath(file.path);
-            const newNoteId = note?.id || null;
-            
-            
-            // Update current note tracking
-            this.currentNoteId = newNoteId;
-            
-        } catch (error) {
-            logger.warn('Plugin', `Failed to handle note navigation for ${file.path}`, error);
         }
     }
 
@@ -1122,7 +1077,7 @@ class TezcatSettingTab extends PluginSettingTab {
 
         // Save and Cancel buttons for sensitive settings
         const buttonContainer = containerEl.createDiv('setting-item');
-        const buttonInfo = buttonContainer.createDiv('setting-item-info');
+        buttonContainer.createDiv('setting-item-info');
         const buttonControl = buttonContainer.createDiv('setting-item-control');
 
         if (this.hasSensitiveChanges) {
@@ -1160,7 +1115,7 @@ class TezcatSettingTab extends PluginSettingTab {
                 }));
 
         // Horizontal divider
-        const divider = containerEl.createEl('hr', {
+        containerEl.createEl('hr', {
             cls: 'tezcat-settings-divider'
         });
 
@@ -1552,12 +1507,12 @@ class SystemStatusModal extends Modal {
         
         if (this.isSystemValid) {
             overallEl.addClass('system-ready');
-            const strongEl = overallEl.createEl('strong', { text: 'System ready' });
+            overallEl.createEl('strong', { text: 'System ready' });
             overallEl.createEl('br');
             overallEl.appendText('All components are working correctly.');
         } else {
             overallEl.addClass('setup-required');
-            const strongEl = overallEl.createEl('strong', { text: 'Setup required' });
+            overallEl.createEl('strong', { text: 'Setup required' });
             overallEl.createEl('br');
             overallEl.appendText('Some components need attention.');
         }
@@ -1668,7 +1623,7 @@ class VectorSearchResultsModal extends Modal {
 
         const resultsContainer = contentEl.createDiv('tezcat-search-results');
 
-        this.results.forEach((result, index) => {
+        this.results.forEach((result) => {
             const resultEl = resultsContainer.createDiv('tezcat-search-result');
 
             // Note name, result type and score, then path and text
@@ -1678,12 +1633,12 @@ class VectorSearchResultsModal extends Modal {
             titleEl.textContent = result.noteName;
 
             const metaEl = headerEl.createDiv();
-            const typeSpan = metaEl.createEl('span', {
+            metaEl.createEl('span', {
                 text: result.type,
                 cls: 'tezcat-search-result-type'
             });
 
-            const scoreSpan = metaEl.createEl('span', {
+            metaEl.createEl('span', {
                 text: `Score: ${result.score.toFixed(3)}`,
                 cls: 'tezcat-search-result-score'
             });

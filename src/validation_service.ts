@@ -1,7 +1,7 @@
 import { Notice } from 'obsidian';
 import { Logger } from './logger';
-import { EmbeddingProvider, OllamaModelManager, OllamaEmbeddingProvider, OpenAIEmbeddingProvider } from './embedding_service';
-import { SqlJsDatabaseAdapter, DatabaseService } from './database_service';
+import { EmbeddingProvider, OllamaModelManager, OllamaEmbeddingProvider } from './embedding_service';
+import { DatabaseService } from './database_service';
 
 export interface ValidationResult {
     success: boolean;

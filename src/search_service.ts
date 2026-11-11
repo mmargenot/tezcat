@@ -1,4 +1,4 @@
-import { DatabaseService, Vector, VectorType, FTSResult } from './database_service';
+import { DatabaseService, Vector, VectorType } from './database_service';
 import { EmbeddingService } from './embedding_service';
 import { Logger } from './logger';
 import { Position } from './note_processor';
@@ -157,8 +157,6 @@ export class SearchService {
         const {
             topK = 10,
             minScore = 0.0,
-            includeNoteVectors = true,
-            includeBlockVectors = true,
             excludeNotePaths = [],
             hybridWeight = 0.5 // Weight for vector vs FTS in RRF (0.5 = 50% vector, 50% FTS)
         } = options;
@@ -225,7 +223,7 @@ export class SearchService {
         const rrfScores = new Map<string, number>();
 
         // Calculate RRF scores for all results
-        for (const [key, result] of allResultsMap) {
+        for (const key of allResultsMap.keys()) {
             let rrfScore = 0;
             
             // Add vector ranking contribution
