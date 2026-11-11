@@ -233,33 +233,4 @@ describe('DatabaseService', () => {
             });
         });
     });
-
-    describe('Change detection', () => {
-        it('identifies files without vectors', async () => {
-            const mockFiles = [
-                { note_id: 'note1', path: '/new1.md' },
-                { note_id: 'note2', path: '/new2.md' }
-            ];
-
-            mockAdapter.setMockQueryResult('WHERE v.id IS NULL', mockFiles);
-
-            const result = await databaseService.getFilesWithoutVectors();
-
-            expect(result).toEqual([
-                { path: '/new1.md', noteId: 'note1' },
-                { path: '/new2.md', noteId: 'note2' }
-            ]);
-        });
-    });
-
-    describe('Cleanup operations', () => {
-        it('cleans up orphaned vectors', async () => {
-            await databaseService.cleanupOrphanedVectors();
-
-            expect(mockAdapter.execute).toHaveBeenCalledWith(
-                expect.stringContaining('DELETE FROM vectors')
-            );
-            expect(mockAdapter.save).toHaveBeenCalled();
-        });
-    });
 });

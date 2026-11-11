@@ -283,10 +283,6 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         await this.execute('DELETE FROM fts_content WHERE note_id = ?', [noteId]);
         await this.save();
     }
-
-    private generateId(): string {
-        return Date.now().toString(36) + Math.random().toString(36).substr(2);
-    }
 }
 
 // Enums and types
@@ -397,38 +393,6 @@ export class DatabaseService {
         return id;
     }
 
-    async updateVector(id: string, vector: Int8Array): Promise<void> {
-        const now = new Date().toISOString();
-
-        await this.adapter.execute(`
-            UPDATE vectors SET vector = ?, updated_at = ? WHERE id = ?
-        `, [vector as unknown as Uint8Array, now, id]);
-        
-        await this.adapter.save();
-    }
-
-    async deleteVector(id: string): Promise<void> {
-        await this.adapter.execute('DELETE FROM vectors WHERE id = ?', [id]);
-        await this.adapter.save();
-    }
-
-    async getVectorsForNote(noteId: string): Promise<Vector[]> {
-        const rows = await this.adapter.query(
-            'SELECT * FROM vectors WHERE note_id = ?',
-            [noteId]
-        );
-
-        return rows.map(row => ({
-            id: row.id as string,
-            note_id: row.note_id as string,
-            block_id: (row.block_id as string | null) || undefined,
-            type: row.type as VectorType,
-            created_at: row.created_at as string,
-            updated_at: row.updated_at as string,
-            vector: new Int8Array(row.vector as Uint8Array)
-        }));
-    }
-
     async deleteVectorsForNote(noteId: string): Promise<void> {
         await this.adapter.execute('DELETE FROM vectors WHERE note_id = ?', [noteId]);
         await this.adapter.save();
@@ -467,105 +431,6 @@ export class DatabaseService {
         });
         
         return counts;
-    }
-
-    async getFilesWithoutVectors(): Promise<{ path: string; noteId: string }[]> {
-        // Get all notes that have no note-level vectors at all
-        const query = `
-            SELECT n.id as note_id, n.path
-            FROM notes n
-            LEFT JOIN vectors v ON n.id = v.note_id AND v.type = 'note'
-            WHERE v.id IS NULL
-            ORDER BY n.created_at DESC
-        `;
-        
-        const results = await this.adapter.query(query);
-        
-        return results.map(row => ({
-            path: row.path as string,
-            noteId: row.note_id as string
-        }));
-    }
-
-    // Cleanup methods for orphaned data
-    async cleanupOrphanedVectors(): Promise<number> {
-        // Remove vectors that reference non-existent notes
-        const query = `
-            DELETE FROM vectors 
-            WHERE note_id NOT IN (SELECT id FROM notes)
-        `;
-        
-        const result = await this.adapter.execute(query);
-        await this.adapter.save();
-        
-        // Return count of cleaned up vectors (sql.js doesn't provide affected row counts)
-        // For performance reasons, we don't query to count deleted rows
-        return 0;
-    }
-
-    // Vector timestamp tracking methods
-    async getLastVectorCreationTime(noteId: string): Promise<Date | null> {
-        const result = await this.adapter.get(`
-            SELECT MAX(created_at) as last_created
-            FROM vectors
-            WHERE note_id = ?
-        `, [noteId]);
-        
-        return result?.last_created ? new Date(result.last_created as string) : null;
-    }
-
-    async getVectorCreationStats(): Promise<{
-        totalVectors: number;
-        oldestVector: Date | null;
-        newestVector: Date | null;
-        avgVectorsPerNote: number;
-    }> {
-        const stats = await this.adapter.get(`
-            SELECT 
-                COUNT(*) as total_vectors,
-                MIN(created_at) as oldest,
-                MAX(created_at) as newest,
-                COUNT(*) * 1.0 / COUNT(DISTINCT note_id) as avg_per_note
-            FROM vectors
-        `);
-        
-        return {
-            totalVectors: (stats?.total_vectors as number) || 0,
-            oldestVector: stats?.oldest ? new Date(stats.oldest as string) : null,
-            newestVector: stats?.newest ? new Date(stats.newest as string) : null,
-            avgVectorsPerNote: (stats?.avg_per_note as number) || 0
-        };
-    }
-
-    async getNotesOlderThan(date: Date): Promise<Note[]> {
-        // Get notes that haven't been updated since the given date
-        const isoDate = date.toISOString();
-        const rows = await this.adapter.query(`
-            SELECT * FROM notes
-            WHERE updated_at < ?
-            ORDER BY updated_at ASC
-        `, [isoDate]);
-        return rows as Note[];
-    }
-
-    async getVectorsOlderThan(date: Date): Promise<Vector[]> {
-        // Get vectors created before the given date
-        const isoDate = date.toISOString();
-        const rows = await this.adapter.query(`
-            SELECT * FROM vectors
-            WHERE created_at < ?
-            ORDER BY created_at ASC
-        `, [isoDate]);
-
-        return rows.map(row => ({
-            id: row.id as string,
-            note_id: row.note_id as string,
-            block_id: (row.block_id as string | null) || undefined,
-            type: row.type as VectorType,
-            created_at: row.created_at as string,
-            updated_at: row.updated_at as string,
-            vector: new Int8Array(row.vector as Uint8Array)
-        }));
     }
 
     async processNoteVector(noteId: string, embeddingService: EmbeddingService): Promise<void> {
@@ -771,16 +636,6 @@ export class DatabaseService {
 
     async searchFTS(query: string, limit: number = 10): Promise<FTSResult[]> {
         return await this.adapter.searchFTS(query, limit);
-    }
-
-    async getFTSTableStats(): Promise<{ count: number; sampleContent: string | null }> {
-        const countResult = await this.adapter.get('SELECT COUNT(*) as count FROM fts_content');
-        const sampleResult = await this.adapter.get('SELECT content FROM fts_content LIMIT 1');
-
-        return {
-            count: (countResult?.count as number) || 0,
-            sampleContent: (sampleResult?.content as string) || null
-        };
     }
 
     async ensureFTSContentForAllNotes(): Promise<void> {
