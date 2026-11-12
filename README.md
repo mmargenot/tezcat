@@ -43,6 +43,7 @@ Tezcat works with any server that offers an OpenAI-compatible embeddings API. In
 - **Instruction prefixes** that some models expect (for example nomic-embed-text's `search_query:` / `search_document:`) are filled in automatically for known models. They're under **Advanced** if you need to change them.
 - **Switching models** embeds your vault again with the new model. Vectors for the previous model are kept, so switching back is instant. If the configured model isn't available on the server, Tezcat uses the last model that worked and shows a warning under **Model**.
 - **Test connection** embeds a short text and reports the result.
+- **On mobile**, `localhost` is the phone itself, so a server running on your computer isn't reachable at `http://localhost:...`. Use your computer's network address (e.g. `http://192.168.1.5:11434/v1`, with the server set to accept network connections) or a hosted service. Keyword search works on mobile with no setup.
 
 ## Privacy and network use
 
@@ -62,7 +63,7 @@ Tezcat works with any server that offers an OpenAI-compatible embeddings API. In
 
 ## Upgrading from 1.x
 
-- Tezcat 2.0 requires Obsidian 1.11.4 or later.
+- Tezcat 2.0 requires Obsidian 1.11.4 or later, and now also runs on mobile.
 - Your settings carry over. An Ollama setup becomes the endpoint `http://localhost:11434/v1` with the same model; an OpenAI key moves into Obsidian's secret storage.
 - Search starts in keyword-only mode. Move the **Semantic search** slider above 0 to use your embedding model again; blocks are embedded once more.
 - The old database file (`tezcat.db` in the plugin folder) is deleted, and the index is rebuilt on first launch.
@@ -70,7 +71,7 @@ Tezcat works with any server that offers an OpenAI-compatible embeddings API. In
 
 ## Troubleshooting
 
-- The status bar icon shows what Tezcat is doing (`○` working, `✓` ready, `!` a problem); hover or click it for details.
+- The status bar icon shows what Tezcat is doing (`○` working, `✓` ready, `!` a problem); hover or click it for details. On mobile, where there's no status bar, use **Tezcat: Show index status**.
 - If semantic search is unavailable, check that the server is running and use **Test connection**. Messages name the cause, such as an unreachable server, a missing model or a rejected key.
 - If results look wrong, run **Tezcat: Rebuild index**.
 - For more detail, set **Log level** to DEBUG under **Maintenance** and open the developer console (Cmd+Opt+I / Ctrl+Shift+I).
