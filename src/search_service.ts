@@ -1,11 +1,10 @@
-import { DatabaseService, Vector, VectorType, FTSResult } from './database_service';
+import { DatabaseService, Vector, VectorType } from './database_service';
 import { EmbeddingService } from './embedding_service';
 import { Logger } from './logger';
 import { Position } from './note_processor';
 
 export type SearchResult = {
     noteId: string;
-    chunkId?: string;
     blockId?: string;
     type: VectorType;
     score: number;
@@ -20,10 +19,8 @@ export type SearchOptions = {
     topK?: number;
     minScore?: number;
     includeNoteVectors?: boolean;
-    includeChunkVectors?: boolean;
     includeBlockVectors?: boolean;
     excludeNotePaths?: string[];
-    useVectorIndex?: boolean;
     useHybridSearch?: boolean;
     hybridWeight?: number; // Weight for combining vector and FTS scores (0.0 = only FTS, 1.0 = only vector)
 };
@@ -40,15 +37,6 @@ export class SearchService {
         this.logger = logger;
     }
 
-    private async isVectorIndexAvailable(): Promise<boolean> {
-        try {
-            return await this.databaseService.isVectorIndexAvailable();
-        } catch (error) {
-            this.logger.warn('SearchService', 'Vector index availability check failed', error);
-            return false;
-        }
-    }
-
     /**
      * Perform vector similarity search against all stored vectors
      */
@@ -57,10 +45,8 @@ export class SearchService {
             topK = 10,
             minScore = 0.0,
             includeNoteVectors = true,
-            includeChunkVectors = false,
             includeBlockVectors = true,
-            excludeNotePaths = [],
-            useVectorIndex = true
+            excludeNotePaths = []
         } = options;
 
         const searchStartTime = performance.now();
@@ -69,22 +55,8 @@ export class SearchService {
         // Embed the query
         const queryVector = await this.embeddingService.embedText(query);
 
-        // Get vectors from database - use index if requested and available
-        let allVectors: Vector[];
-        if (useVectorIndex && await this.isVectorIndexAvailable()) {
-            this.logger.info('SearchService', 'Using vector index for candidate selection');
-            try {
-                allVectors = await this.databaseService.getSimilarVectors(queryVector, topK);
-            } catch (error) {
-                this.logger.warn('SearchService', 'Vector index failed, falling back to linear search', error);
-                allVectors = await this.databaseService.getAllVectors();
-            }
-        } else {
-            if (useVectorIndex) {
-                this.logger.warn('SearchService', 'Vector index requested but not available, using linear search');
-            }
-            allVectors = await this.databaseService.getAllVectors();
-        }
+        // Score every stored vector. Exact, and fast at vault scale.
+        const allVectors: Vector[] = await this.databaseService.getAllVectors();
 
         // Get excluded note IDs if we have excluded paths
         let excludedNoteIds: string[] = [];
@@ -105,10 +77,9 @@ export class SearchService {
         let vectors = allVectors.filter(vector => {
             // Filter by type if specified
             if (!includeNoteVectors && vector.type === VectorType.NOTE) return false;
-            if (!includeChunkVectors && vector.type === VectorType.CHUNK) return false;
             if (!includeBlockVectors && vector.type === VectorType.BLOCK) return false;
             
-            // Filter out excluded notes (both note vectors and chunk vectors from those notes)
+            // Filter out excluded notes (both note vectors and block vectors from those notes)
             if (excludedNoteIds.length > 0 && excludedNoteIds.includes(vector.note_id)) return false;
             
             return true;
@@ -130,12 +101,6 @@ export class SearchService {
                 if (vector.type === VectorType.NOTE) {
                     // For note vectors, return note path and name (not full text)
                     text = `${note.path} - ${note.name}`;
-                } else if (vector.type === VectorType.CHUNK && vector.chunk_id) {
-                    // For chunk vectors, get the chunk text
-                    const chunks = await this.databaseService.getChunksForNote(vector.note_id);
-                    const chunk = chunks.find(c => c.id === vector.chunk_id);
-                    if (!chunk) continue; // Skip if chunk not found
-                    text = chunk.text;
                 } else if (vector.type === VectorType.BLOCK && vector.block_id) {
                     // For block vectors, get the block text and position
                     const blocks = await this.databaseService.getBlocksForNote(vector.note_id);
@@ -146,7 +111,6 @@ export class SearchService {
                     // Add block result with position data
                     results.push({
                         noteId: vector.note_id,
-                        chunkId: vector.chunk_id,
                         blockId: vector.block_id,
                         type: vector.type,
                         score: similarity,
@@ -164,7 +128,6 @@ export class SearchService {
                 // For non-block results, add without position data
                 results.push({
                     noteId: vector.note_id,
-                    chunkId: vector.chunk_id,
                     blockId: vector.block_id,
                     type: vector.type,
                     score: similarity,
@@ -194,9 +157,6 @@ export class SearchService {
         const {
             topK = 10,
             minScore = 0.0,
-            includeNoteVectors = true,
-            includeChunkVectors = false,
-            includeBlockVectors = true,
             excludeNotePaths = [],
             hybridWeight = 0.5 // Weight for vector vs FTS in RRF (0.5 = 50% vector, 50% FTS)
         } = options;
@@ -263,7 +223,7 @@ export class SearchService {
         const rrfScores = new Map<string, number>();
 
         // Calculate RRF scores for all results
-        for (const [key, result] of allResultsMap) {
+        for (const key of allResultsMap.keys()) {
             let rrfScore = 0;
             
             // Add vector ranking contribution

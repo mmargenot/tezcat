@@ -54,6 +54,4 @@ Select your model, allow the plugin to build the vector database, and you should
   - Insert the text at the cursor
   - Open the page (at the location of the content)
 
-If you find that the search is becoming slower, try running "Tezcat: Rebuild Vector Index" from the command palette.
-
 Generally, if there is any trouble with the plugin (which you can see either via Notices in Obsidian or the console logs in the application (Option + Command + I)), you should be able to fix them by running "Tezcat: Rebuild Database" from the command palete (Command + P)

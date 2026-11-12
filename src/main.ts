@@ -1,8 +1,7 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, WorkspaceLeaf} from 'obsidian';
 import { TezcatView, VIEW_TYPE } from './search_view';
 import { DatabaseService, SqlJsDatabaseAdapter } from './database_service';
-import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, EmbeddingProvider, VectorUtils, OllamaModelManager } from './embedding_service';
-import { ChunkingService } from './chunking_service';
+import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, EmbeddingProvider, OllamaModelManager } from './embedding_service';
 import { SearchService, SearchResult } from './search_service';
 import { logger, LogLevel } from './logger';
 import { ValidationService, SystemValidationResult, ValidationResult } from './validation_service';
@@ -16,11 +15,8 @@ type SearchMode = 'vector' | 'hybrid';
 interface TezcatSettings {
     embeddingProvider: EmbeddingProviderType;
     embeddingModel: string;
-    vectorSize: number;
     openaiApiKey: string;
     ollamaBaseUrl: string;
-    chunkSize: number;
-    chunkOverlap: number;
     contextWindowWords: number;
     searchCadence: SearchCadence;
     searchMode: SearchMode;
@@ -31,11 +27,8 @@ interface TezcatSettings {
 const DEFAULT_SETTINGS: TezcatSettings = {
     embeddingProvider: 'ollama',
     embeddingModel: 'nomic-embed-text:v1.5',
-    vectorSize: 768,
     openaiApiKey: '',
     ollamaBaseUrl: 'http://localhost:11434',
-    chunkSize: 128,
-    chunkOverlap: 16,
     contextWindowWords: 64, // Smaller context window for more focused search
     searchCadence: 'always',
     searchMode: 'hybrid',
@@ -48,22 +41,18 @@ export default class Tezcat extends Plugin {
     public databaseService: DatabaseService;
     public databaseAdapter: SqlJsDatabaseAdapter;
     public embeddingService: EmbeddingService;
-    public chunkingService: ChunkingService;
     public searchService: SearchService;
     private noteProcessor: NoteProcessor;
-    private vectorUtils: VectorUtils;
     private validationService: ValidationService;
     public modelManager: OllamaModelManager | null = null;
     private systemValidationResult: SystemValidationResult | null = null;
     public isSystemValid: boolean = false;
     public isOperationInProgress: boolean = false;
     private searchDebounceTimer: number | null = null;
-    private lastSearchContext: string = '';
     private get CONTEXT_WINDOW_WORDS() { 
         return this.settings.contextWindowWords; // Words to extract around cursor for search context
     }
     private searchSuppressedUntil: number = 0; // Timestamp to suppress search until
-    private currentNoteId: string | null = null; // Track current note for navigation events
     private statusBarItem: HTMLElement | null = null; // Status bar item for system status
 
     async onload() {
@@ -74,18 +63,16 @@ export default class Tezcat extends Plugin {
         logger.info('Plugin', 'Loading Tezcat plugin');
         
         
-        // Initialize vector utils and validation service
-        this.vectorUtils = new VectorUtils(logger);
+        // Initialize validation service
         this.validationService = new ValidationService(logger);
         
         // Initialize database (only this needs async initialization due to file I/O)
-        this.databaseAdapter = new SqlJsDatabaseAdapter(this, this.vectorUtils, logger);
+        this.databaseAdapter = new SqlJsDatabaseAdapter(this, logger);
         await this.databaseAdapter.initialize();
         
         // Initialize services but don't validate yet
         this.databaseService = new DatabaseService(this.databaseAdapter, logger);
         this.initializeEmbeddingServices();
-        this.chunkingService = new ChunkingService(this.settings.chunkSize, this.settings.chunkOverlap, this, logger);
         this.searchService = new SearchService(this.databaseService, this.embeddingService, logger);
 
         // Initialize note processor
@@ -118,19 +105,12 @@ export default class Tezcat extends Plugin {
         // Add vector database commands
         this.registerCommand('rebuild-database', 'Rebuild database', () => this.rebuildDatabase());
         this.registerCommand('show-vector-database-stats', 'Show vector database stats', () => this.showVectorDatabaseStats());
-        this.registerCommand('rebuild-vector-index', 'Rebuild vector index', () => this.rebuildVectorIndex());
         this.registerCommand('vector-search', 'Vector search', () => this.performVectorSearch());
 
 
         // This adds a settings tab so the user can configure various aspects of the plugin
         this.addSettingTab(new TezcatSettingTab(this.app, this));
 
-        // If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-        // Using this function will automatically remove the event listener when this plugin is disabled.
-
-        // When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-        this.registerInterval(window.setInterval(() => logger.debug('Plugin', 'Heartbeat interval'), 5 * 60 * 1000));
-        
         // Listen for file modifications
         this.registerEvent(this.app.vault.on('modify', (file) => {
             logger.debug('Plugin', `File modified: ${file.path}`);
@@ -168,8 +148,8 @@ export default class Tezcat extends Plugin {
         }));
 
         // Listen for file open events (covers both opening new files and switching between files)
-        this.registerEvent(this.app.workspace.on('file-open', (file) => {
-            this.onFileOpen(file);
+        this.registerEvent(this.app.workspace.on('file-open', () => {
+            this.onFileOpen();
         }));
 
         // Listen for clicks on the editor to detect cursor movements
@@ -233,7 +213,6 @@ export default class Tezcat extends Plugin {
             
             let processed = 0;
             let created = 0;
-            let updated = 0;
             let skipped = 0;
             
             for (const file of files) {
@@ -325,14 +304,6 @@ export default class Tezcat extends Plugin {
         // Reinitialize embedding services with new settings
         this.initializeEmbeddingServices();
         
-        // Update chunking service with new settings
-        this.chunkingService = new ChunkingService(
-            this.settings.chunkSize, 
-            this.settings.chunkOverlap, 
-            this, 
-            logger
-        );
-        
         // Recreate search service with updated embedding service
         this.searchService = new SearchService(
             this.databaseService, 
@@ -371,7 +342,6 @@ export default class Tezcat extends Plugin {
             // Recreate core tables
             new Notice('Recreating database tables...');
             await this.databaseAdapter.createNotesTable();
-            await this.databaseAdapter.createChunksTable();
             await this.databaseAdapter.createVectorsTable();
             await this.databaseAdapter.createBlocksTable();
             await this.databaseAdapter.createFTSTable();
@@ -379,10 +349,6 @@ export default class Tezcat extends Plugin {
             // Process all vault files with the clean database
             new Notice('Processing all vault files...');
             await this.processAllVaultFilesIntoDatabase(false);
-            
-            // Build vector index (this will create LSH tables internally if needed)
-            new Notice('Building vector index...');
-            await this.databaseAdapter.generateVectorIndex(this.settings.vectorSize);
             
             // Save the rebuilt database
             await this.databaseAdapter.save();
@@ -525,10 +491,6 @@ export default class Tezcat extends Plugin {
             logger.info('Plugin', 'Workspace ready, processing vault files...');
             await this.processAllVaultFilesIntoDatabase(false);
             
-            // Build vector index after all files are processed
-            logger.info('Plugin', 'Building vector index...');
-            await this.ensureVectorIndexExists();
-            
             // Ensure FTS content exists for all notes (for hybrid search)
             logger.info('Plugin', 'Ensuring FTS content is populated...');
             await this.databaseService.ensureFTSContentForAllNotes();
@@ -543,63 +505,18 @@ export default class Tezcat extends Plugin {
         }
     }
 
-    async ensureVectorIndexExists() {
-        if (!this.ensureSystemValid()) {
-            return;
-        }
-        
-        try {
-            // Check if vector index already exists
-            const lshConfig = await this.databaseAdapter.getLSHConfig();
-            
-            if (lshConfig) {
-                logger.info('Plugin', 'Vector index already exists, skipping build');
-                return;
-            }
-            
-            // Index doesn't exist, build it
-            logger.info('Plugin', 'Vector index not found, building index...');
-            await this.databaseAdapter.generateVectorIndex(this.settings.vectorSize);
-            logger.info('Plugin', 'Vector index built successfully');
-            
-        } catch (error) {
-            logger.error('Plugin', 'Failed to ensure vector index exists', error);
-            // Don't throw error during startup - just log it
-        }
-    }
-
-    async rebuildVectorIndex() {
-        if (!this.ensureSystemValid()) {
-            return;
-        }
-        
-        new Notice('Starting vector index rebuild...');
-        
-        try {
-            await this.databaseAdapter.generateVectorIndex(this.settings.vectorSize);
-            new Notice('Vector index rebuilt successfully!');
-        } catch (error) {
-            logger.error('Plugin', 'Vector index rebuild failed', error);
-            new Notice('Vector index rebuild failed. Check console for details.');
-        }
-    }
-
     async showVectorDatabaseStats() {
         try {
             const stats = await this.databaseService.getVectorDatabaseStats();
 
             const message = `Vector database stats:
 • Total notes: ${stats.totalNotes}
-• Processed notes: ${stats.processedNotes}
 • Total vectors: ${stats.totalVectors}
 • Note vectors: ${stats.vectorsByType.note}
-• Block vectors: ${stats.vectorsByType.block}
-• Outdated notes: ${stats.outdatedNotes}
-• Orphaned vectors: ${stats.orphanedData.orphanedVectors}
-• Orphaned chunks: ${stats.orphanedData.orphanedChunks}`;
+• Block vectors: ${stats.vectorsByType.block}`;
 
             new Notice(message, 10000); // Show for 10 seconds
-            logger.info('Plugin', `Vector Database Stats: totalNotes=${stats.totalNotes}, processedNotes=${stats.processedNotes}, totalVectors=${stats.totalVectors}, noteVectors=${stats.vectorsByType.note}, blockVectors=${stats.vectorsByType.block}`);
+            logger.info('Plugin', `Vector Database Stats: totalNotes=${stats.totalNotes}, totalVectors=${stats.totalVectors}, noteVectors=${stats.vectorsByType.note}, blockVectors=${stats.vectorsByType.block}`);
         } catch (error) {
             logger.error('Plugin', 'Failed to get vector database stats', error);
             new Notice('Failed to get vector database stats. Check console for details.');
@@ -625,7 +542,6 @@ export default class Tezcat extends Plugin {
                         topK: 10,
                         minScore: 0.1,
                         includeNoteVectors: true,
-                        includeChunkVectors: false,
                         includeBlockVectors: true,
                         excludeNotePaths
                     });
@@ -662,9 +578,6 @@ export default class Tezcat extends Plugin {
     }
 
     private onActiveLeafChange(leaf: WorkspaceLeaf | null) {
-        // Handle note navigation tracking
-        this.handleNoteNavigation(leaf);
-        
         // Track the last active markdown view for the search panel
         if (leaf?.view instanceof MarkdownView) {
             const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
@@ -712,15 +625,7 @@ export default class Tezcat extends Plugin {
         }
     }
 
-    private onFileOpen(file: any) {
-        // Handle note navigation tracking for file opens
-        window.setTimeout(() => {
-            const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (activeView) {
-                this.handleNoteNavigation(activeView.leaf);
-            }
-        }, 10);
-
+    private onFileOpen() {
         if (!this.isSearchPanelVisible()) {
             return;
         }
@@ -838,7 +743,6 @@ export default class Tezcat extends Plugin {
             }
             
             if (context.trim()) {
-                this.lastSearchContext = context;
                 await this.performDynamicSearch(context);
             }
         }, debounceDelay);
@@ -860,7 +764,6 @@ export default class Tezcat extends Plugin {
                     topK: 10,
                     minScore: 0, // RRF scores are much smaller than cosine similarity scores
                     includeNoteVectors: true,
-                    includeChunkVectors: false,
                     includeBlockVectors: true,
                     excludeNotePaths,
                     hybridWeight: 0.5 // Equal weighting by default
@@ -869,7 +772,6 @@ export default class Tezcat extends Plugin {
                     topK: 10,
                     minScore: 0.1,
                     includeNoteVectors: true,
-                    includeChunkVectors: false,
                     includeBlockVectors: true,
                     excludeNotePaths
                 });
@@ -944,9 +846,8 @@ export default class Tezcat extends Plugin {
             const existingNote = await this.databaseService.getNoteByPath(file.path);
             if (existingNote) {
                 logger.info('Plugin', `Removing deleted note from database: ${file.path}`);
-                // Delete in order: vectors, chunks, then note
+                // Delete vectors, then the note
                 await this.databaseService.deleteVectorsForNote(existingNote.id);
-                await this.databaseService.deleteChunksForNote(existingNote.id);
                 await this.databaseService.deleteNote(existingNote.id);
                 logger.info('Plugin', `Successfully removed note ${existingNote.id} (${file.path}) from database`);
             } else {
@@ -978,30 +879,6 @@ export default class Tezcat extends Plugin {
             }
         } catch (error) {
             logger.error('Plugin', `Failed to handle file rename from ${oldPath} to ${file.path}`, error);
-        }
-    }
-
-
-    private async handleNoteNavigation(leaf: WorkspaceLeaf | null) {
-        // Only handle markdown files
-        if (!leaf?.view || !(leaf.view instanceof MarkdownView) || !leaf.view.file) {
-            return;
-        }
-        
-        const file = leaf.view.file;
-        if (file.extension !== 'md') return;
-        
-        try {
-            // Get the note ID for the current file
-            const note = await this.databaseService.getNoteByPath(file.path);
-            const newNoteId = note?.id || null;
-            
-            
-            // Update current note tracking
-            this.currentNoteId = newNoteId;
-            
-        } catch (error) {
-            logger.warn('Plugin', `Failed to handle note navigation for ${file.path}`, error);
         }
     }
 
@@ -1151,87 +1028,8 @@ class TezcatSettingTab extends PluginSettingTab {
                     .onChange((value) => {
                         this.pendingSettings.embeddingModel = value;
                         this.hasSensitiveChanges = true;
-                        
-                        // Auto-update vector size based on model
-                        if (value === 'bge-m3') {
-                            this.pendingSettings.vectorSize = 1024;
-                        } else if (value === 'text-embedding-3-small') {
-                            this.pendingSettings.vectorSize = 1536;
-                        } else if (value === 'text-embedding-3-large') {
-                            this.pendingSettings.vectorSize = 3072;
-                        } else {
-                            this.pendingSettings.vectorSize = 768;
-                        }
-                        this.display(); // Refresh to update vector size field
-                    });
-            });
-
-        new Setting(containerEl)
-            .setName('Vector size')
-            .setDesc('The size of the embedding vectors (default: 768)')
-            .addText(text => {
-                const isReadOnly = this.pendingSettings.embeddingModel === 'bge-m3' || 
-                                 this.pendingSettings.embeddingModel === 'text-embedding-3-small' ||
-                                 this.pendingSettings.embeddingModel === 'text-embedding-3-large';
-                
-                text
-                    .setPlaceholder('768')
-                    .setValue(this.pendingSettings.vectorSize.toString())
-                    .setDisabled(isReadOnly);
-                
-                if (!isReadOnly) {
-                    const originalValue = this.plugin.settings.vectorSize;
-                    text.onChange((value) => {
-                        const vectorSize = parseInt(value) || 768;
-                        this.pendingSettings.vectorSize = vectorSize;
-                    });
-                    text.inputEl.addEventListener('blur', () => {
-                        if (this.pendingSettings.vectorSize !== originalValue) {
-                            this.hasSensitiveChanges = true;
-                            this.display();
-                        }
-                    });
-                }
-            });
-
-        new Setting(containerEl)
-            .setName('Chunk size')
-            .setDesc('The number of tokens per text chunk. Also affects the search context window size around your cursor (default: 128)')
-            .addText(text => {
-                const originalValue = this.plugin.settings.chunkSize;
-                text
-                    .setPlaceholder('128')
-                    .setValue(this.pendingSettings.chunkSize.toString())
-                    .onChange((value) => {
-                        const chunkSize = parseInt(value) || 128;
-                        this.pendingSettings.chunkSize = chunkSize;
-                    });
-                text.inputEl.addEventListener('blur', () => {
-                    if (this.pendingSettings.chunkSize !== originalValue) {
-                        this.hasSensitiveChanges = true;
                         this.display();
-                    }
-                });
-            });
-
-        new Setting(containerEl)
-            .setName('Chunk overlap')
-            .setDesc('The number of tokens to overlap between chunks for better context continuity (default: 16)')
-            .addText(text => {
-                const originalValue = this.plugin.settings.chunkOverlap;
-                text
-                    .setPlaceholder('16')
-                    .setValue(this.pendingSettings.chunkOverlap.toString())
-                    .onChange((value) => {
-                        const chunkOverlap = parseInt(value) || 16;
-                        this.pendingSettings.chunkOverlap = chunkOverlap;
                     });
-                text.inputEl.addEventListener('blur', () => {
-                    if (this.pendingSettings.chunkOverlap !== originalValue) {
-                        this.hasSensitiveChanges = true;
-                        this.display();
-                    }
-                });
             });
 
         // Conditional settings based on provider
@@ -1279,7 +1077,7 @@ class TezcatSettingTab extends PluginSettingTab {
 
         // Save and Cancel buttons for sensitive settings
         const buttonContainer = containerEl.createDiv('setting-item');
-        const buttonInfo = buttonContainer.createDiv('setting-item-info');
+        buttonContainer.createDiv('setting-item-info');
         const buttonControl = buttonContainer.createDiv('setting-item-control');
 
         if (this.hasSensitiveChanges) {
@@ -1317,7 +1115,7 @@ class TezcatSettingTab extends PluginSettingTab {
                 }));
 
         // Horizontal divider
-        const divider = containerEl.createEl('hr', {
+        containerEl.createEl('hr', {
             cls: 'tezcat-settings-divider'
         });
 
@@ -1435,13 +1233,6 @@ class TezcatSettingTab extends PluginSettingTab {
         const provider = this.createEmbeddingProvider();
         this.plugin.embeddingService = new EmbeddingService(provider, logger);
         
-        this.plugin.chunkingService = new ChunkingService(
-            this.plugin.settings.chunkSize, 
-            this.plugin.settings.chunkOverlap, 
-            this.plugin, 
-            logger
-        );
-        
         // Recreate search service to use the new embedding service
         this.plugin.searchService = new SearchService(
             this.plugin.databaseService, 
@@ -1485,10 +1276,7 @@ class TezcatSettingTab extends PluginSettingTab {
     private requiresReindex(): boolean {
         return (
             this.plugin.settings.embeddingProvider !== this.pendingSettings.embeddingProvider ||
-            this.plugin.settings.embeddingModel !== this.pendingSettings.embeddingModel ||
-            this.plugin.settings.vectorSize !== this.pendingSettings.vectorSize ||
-            this.plugin.settings.chunkSize !== this.pendingSettings.chunkSize ||
-            this.plugin.settings.chunkOverlap !== this.pendingSettings.chunkOverlap
+            this.plugin.settings.embeddingModel !== this.pendingSettings.embeddingModel
         );
     }
 
@@ -1719,12 +1507,12 @@ class SystemStatusModal extends Modal {
         
         if (this.isSystemValid) {
             overallEl.addClass('system-ready');
-            const strongEl = overallEl.createEl('strong', { text: 'System ready' });
+            overallEl.createEl('strong', { text: 'System ready' });
             overallEl.createEl('br');
             overallEl.appendText('All components are working correctly.');
         } else {
             overallEl.addClass('setup-required');
-            const strongEl = overallEl.createEl('strong', { text: 'Setup required' });
+            overallEl.createEl('strong', { text: 'Setup required' });
             overallEl.createEl('br');
             overallEl.appendText('Some components need attention.');
         }
@@ -1835,60 +1623,33 @@ class VectorSearchResultsModal extends Modal {
 
         const resultsContainer = contentEl.createDiv('tezcat-search-results');
 
-        this.results.forEach((result, index) => {
+        this.results.forEach((result) => {
             const resultEl = resultsContainer.createDiv('tezcat-search-result');
 
-            if (result.type === 'chunk') {
-                // For chunks: show chunk text first, then note info below
-                const textEl = resultEl.createDiv('tezcat-search-result-text');
-                textEl.textContent = result.text.length > 200 ? result.text.substring(0, 200) + '...' : result.text;
+            // Note name, result type and score, then path and text
+            const headerEl = resultEl.createDiv('tezcat-search-result-header');
 
-                // Note info with score and type
-                const headerEl = resultEl.createDiv('tezcat-search-result-header');
+            const titleEl = headerEl.createEl('strong');
+            titleEl.textContent = result.noteName;
 
-                const titleEl = headerEl.createEl('strong', { cls: 'tezcat-search-result-title' });
-                titleEl.textContent = result.noteName;
+            const metaEl = headerEl.createDiv();
+            metaEl.createEl('span', {
+                text: result.type,
+                cls: 'tezcat-search-result-type'
+            });
 
-                const metaEl = headerEl.createDiv();
-                const typeSpan = metaEl.createEl('span', {
-                    text: result.type,
-                    cls: 'tezcat-search-result-type'
-                });
+            metaEl.createEl('span', {
+                text: `Score: ${result.score.toFixed(3)}`,
+                cls: 'tezcat-search-result-score'
+            });
 
-                const scoreSpan = metaEl.createEl('span', {
-                    text: `Score: ${result.score.toFixed(3)}`,
-                    cls: 'tezcat-search-result-score'
-                });
+            // Path
+            const pathEl = resultEl.createDiv('tezcat-search-result-path note-path');
+            pathEl.textContent = result.notePath;
 
-                // Path
-                const pathEl = resultEl.createDiv('tezcat-search-result-path');
-                pathEl.textContent = result.notePath;
-            } else {
-                // For notes: show note info first, then path
-                const headerEl = resultEl.createDiv('tezcat-search-result-header');
-
-                const titleEl = headerEl.createEl('strong');
-                titleEl.textContent = result.noteName;
-
-                const metaEl = headerEl.createDiv();
-                const typeSpan = metaEl.createEl('span', {
-                    text: result.type,
-                    cls: 'tezcat-search-result-type'
-                });
-
-                const scoreSpan = metaEl.createEl('span', {
-                    text: `Score: ${result.score.toFixed(3)}`,
-                    cls: 'tezcat-search-result-score'
-                });
-
-                // Path
-                const pathEl = resultEl.createDiv('tezcat-search-result-path note-path');
-                pathEl.textContent = result.notePath;
-
-                // Text content (note path and name)
-                const textEl = resultEl.createDiv('tezcat-search-result-text');
-                textEl.textContent = result.text.length > 200 ? result.text.substring(0, 200) + '...' : result.text;
-            }
+            // Text content (block text, or note path and name)
+            const textEl = resultEl.createDiv('tezcat-search-result-text');
+            textEl.textContent = result.text.length > 200 ? result.text.substring(0, 200) + '...' : result.text;
 
             // Click to open note
             resultEl.onclick = () => {

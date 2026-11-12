@@ -1,7 +1,6 @@
 import { ItemView, WorkspaceLeaf, MarkdownView, Notice, Setting } from 'obsidian';
 import { SearchResult } from './search_service';
 import { logger } from './logger';
-import { Position } from './note_processor';
 import type Tezcat from './main';
 
 const VIEW_TYPE = 'remembrance-search';
@@ -67,8 +66,8 @@ class TezcatView extends ItemView {
       const batch = results.slice(i, i + BATCH_SIZE);
       
       // Render batch synchronously
-      batch.forEach((result, batchIndex) => {
-        this.createResultItem(result, i + batchIndex);
+      batch.forEach((result) => {
+        this.createResultItem(result);
       });
       
       // Yield control back to the browser after each batch
@@ -87,7 +86,7 @@ class TezcatView extends ItemView {
     emptyEl.createEl('p', { text: 'Move your cursor around in a markdown file to see related content.' });
   }
 
-  private createResultItem(result: SearchResult, index: number) {
+  private createResultItem(result: SearchResult) {
     const itemEl = this.resultsContainer.createEl('div', { cls: 'tezcat-search-result-item' });
 
     // Result content (text for blocks)
@@ -103,12 +102,12 @@ class TezcatView extends ItemView {
     pathEl.textContent = result.notePath;
 
     const metaEl = pathContainerEl.createDiv({ cls: 'tezcat-search-result-meta' });
-    const typeSpan = metaEl.createEl('span', {
+    metaEl.createEl('span', {
       text: result.type,
       cls: 'tezcat-search-result-type'
     });
 
-    const scoreSpan = metaEl.createEl('span', {
+    metaEl.createEl('span', {
       text: result.score.toFixed(3),
       cls: 'tezcat-search-result-score'
     });
