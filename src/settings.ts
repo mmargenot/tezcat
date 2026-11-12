@@ -20,6 +20,8 @@ export interface TezcatSettings {
     highlightBlockOnOpen: boolean;
     filterBoilerplate: boolean;
     filterCommonPhrasing: boolean;
+    /** The last model semantic search started with successfully; the fallback if the configured one is missing. */
+    lastWorkingModel: { model: string; queryPrefix: string; documentPrefix: string } | null;
 }
 
 export const DEFAULT_SETTINGS: TezcatSettings = {
@@ -35,6 +37,7 @@ export const DEFAULT_SETTINGS: TezcatSettings = {
     highlightBlockOnOpen: true,
     filterBoilerplate: true,
     filterCommonPhrasing: true,
+    lastWorkingModel: null,
 }
 
 export type EmbeddingSettings = Pick<TezcatSettings, 'embeddingEndpoint' | 'embeddingModel' | 'embeddingApiKeySecret' | 'queryPrefix' | 'documentPrefix'>;

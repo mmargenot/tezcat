@@ -33,7 +33,13 @@ export interface EmbeddingConfig {
 	prefixes: Prefixes;
 }
 
-export class EmbeddingError extends Error {}
+export type EmbeddingFailure = 'unreachable' | 'unauthorized' | 'model-not-found' | 'no-endpoint' | 'other';
+
+export class EmbeddingError extends Error {
+	constructor(readonly reason: EmbeddingFailure, message: string) {
+		super(message);
+	}
+}
 
 export type Request = (params: RequestUrlParam) => Promise<RequestUrlResponse>;
 
@@ -102,7 +108,7 @@ export class EmbeddingService {
 				res = await this.request({ url: this.url, method: 'POST', headers, body, throw: false });
 			} catch (e) {
 				// Network-level failure (server not running, wrong host): retrying won't help.
-				throw new EmbeddingError(`Could not connect to ${this.url}. Is the server running? (${(e as Error).message})`);
+				throw new EmbeddingError('unreachable', `Could not connect to ${this.url}. Is the server running? (${(e as Error).message})`);
 			}
 			const retryable = res.status === 429 || res.status >= 500;
 			if (retryable && attempt < MAX_ATTEMPTS) {
@@ -112,18 +118,18 @@ export class EmbeddingService {
 				await this.wait(delay);
 				continue;
 			}
-			if (res.status !== 200) throw new EmbeddingError(this.describeFailure(res));
+			if (res.status !== 200) throw this.failure(res);
 
 			const data = (res.json as { data?: { index?: number; embedding?: number[] }[] } | undefined)?.data;
 			if (!Array.isArray(data) || data.length !== input.length || data.some((d) => !Array.isArray(d.embedding))) {
-				throw new EmbeddingError(`Unexpected response from ${this.url}: expected ${input.length} embeddings`);
+				throw new EmbeddingError('other', `Unexpected response from ${this.url}: expected ${input.length} embeddings`);
 			}
 			// Items carry their position; don't rely on the order they arrive in.
 			return [...data].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)).map((d) => d.embedding!);
 		}
 	}
 
-	private describeFailure(res: RequestUrlResponse): string {
+	private failure(res: RequestUrlResponse): EmbeddingError {
 		let detail = '';
 		try {
 			const json = res.json as { error?: { message?: string } | string } | undefined;
@@ -131,11 +137,17 @@ export class EmbeddingService {
 		} catch { /* not JSON */ }
 		detail ||= String(res.text ?? '').slice(0, 200);
 		const { model } = this.config;
-		if (res.status === 401 || res.status === 403) return `The server rejected the API key (HTTP ${res.status}). ${detail}`.trim();
-		if (res.status === 404 && /model/i.test(detail)) {
-			return `Model "${model}" isn't available on this server (with Ollama: ollama pull ${model}). ${detail}`.trim();
+		if (res.status === 401 || res.status === 403) {
+			return new EmbeddingError('unauthorized', `The server rejected the API key (HTTP ${res.status}). ${detail}`.trim());
 		}
-		if (res.status === 404) return `No embeddings API at ${this.url} (HTTP 404). Check the endpoint URL; it usually ends in /v1.`;
-		return `${this.url} returned HTTP ${res.status}. ${detail}`.trim();
+		// Ollama: 404 "model ... not found, try pulling it first"; OpenAI: 404 "The model ... does
+		// not exist"; some servers use 400.
+		if ((res.status === 404 || res.status === 400) && /model/i.test(detail) && /not found|does not exist|unknown|no such/i.test(detail)) {
+			return new EmbeddingError('model-not-found', `Model "${model}" isn't available on this server (with Ollama: ollama pull ${model}). ${detail}`.trim());
+		}
+		if (res.status === 404) {
+			return new EmbeddingError('no-endpoint', `No embeddings API at ${this.url} (HTTP 404). Check the endpoint URL; it usually ends in /v1.`);
+		}
+		return new EmbeddingError('other', `${this.url} returned HTTP ${res.status}. ${detail}`.trim());
 	}
 }
