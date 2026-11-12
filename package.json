@@ -1,7 +1,7 @@
 {
 	"name": "tezcat",
 	"version": "2.0.0",
-	"description": "Surface related passages from your vault as you write. Keyword search by default, with optional semantic search using a local or hosted embedding model.",
+	"description": "Implements a remembrance agent using keyword and semantic search. Surface thoughts related to your current work from around your vault. Look into the mirror.",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
