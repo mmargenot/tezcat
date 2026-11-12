@@ -241,8 +241,9 @@ export class EmbeddingService {
 			return new EmbeddingError('unauthorized', `The server rejected the API key (HTTP ${res.status}). ${detail}`.trim());
 		}
 		// Ollama: 404 "model ... not found, try pulling it first"; OpenAI: 404 "The model ... does
-		// not exist"; some servers use 400.
-		if ((res.status === 404 || res.status === 400) && /model/i.test(detail) && /not found|does not exist|unknown|no such/i.test(detail)) {
+		// not exist"; OpenRouter names the model without saying "model"; some servers use 400.
+		const aboutModel = /model/i.test(detail) || (model !== '' && (detail.includes(model) || detail.includes(model.replace(/:latest$/, ''))));
+		if ((res.status === 404 || res.status === 400) && aboutModel && /not found|does not exist|unknown|no such|no endpoints|not available|not a valid|invalid/i.test(detail)) {
 			return new EmbeddingError('model-not-found', `Model "${model}" isn't available on this server (with Ollama: ollama pull ${model}). ${detail}`.trim());
 		}
 		if (res.status === 404) {
