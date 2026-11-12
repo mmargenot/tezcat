@@ -1,4 +1,5 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, WorkspaceLeaf} from 'obsidian';
+import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, WorkspaceLeaf} from 'obsidian';
+import { EditorView } from '@codemirror/view';
 import { TezcatView, VIEW_TYPE } from './search_view';
 import { DatabaseService, SqlJsDatabaseAdapter } from './database_service';
 import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, EmbeddingProvider, OllamaModelManager } from './embedding_service';
@@ -6,10 +7,14 @@ import { SearchService, SearchResult } from './search_service';
 import { logger, LogLevel } from './logger';
 import { ValidationService, SystemValidationResult, ValidationResult } from './validation_service';
 import { NoteProcessor } from './note_processor';
+import { cursorContext } from './context';
 
 
 type EmbeddingProviderType = 'openai' | 'ollama';
 type SearchCadence = 'always' | 'sometimes' | 'occasionally';
+
+/** Debounce before searching, per cadence setting. */
+const SEARCH_DELAY_MS: Record<SearchCadence, number> = { always: 500, sometimes: 2000, occasionally: 8000 };
 type SearchMode = 'vector' | 'hybrid';
 
 interface TezcatSettings {
@@ -49,9 +54,7 @@ export default class Tezcat extends Plugin {
     public isSystemValid: boolean = false;
     public isOperationInProgress: boolean = false;
     private searchDebounceTimer: number | null = null;
-    private get CONTEXT_WINDOW_WORDS() { 
-        return this.settings.contextWindowWords; // Words to extract around cursor for search context
-    }
+    private searchSeq = 0; // Increments per search; stale results are dropped
     private searchSuppressedUntil: number = 0; // Timestamp to suppress search until
     private statusBarItem: HTMLElement | null = null; // Status bar item for system status
 
@@ -132,27 +135,13 @@ export default class Tezcat extends Plugin {
             this.handleFileRename(file, oldPath);
         }));
         
-        // Listen for editor changes for dynamic search
-        this.registerEvent(this.app.workspace.on('editor-change', (editor, view) => {
-            if (view instanceof MarkdownView) {
-                this.onEditorChange(editor, view);
-            }
+        // Search as the user types or moves the cursor (keyboard or mouse)...
+        this.registerEditorExtension(EditorView.updateListener.of((update) => {
+            if (update.docChanged || update.selectionSet) this.scheduleSearch();
         }));
-
-        // Listen for active leaf changes to track navigation to different markdown files
-        this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf) => {
-            this.onActiveLeafChange(leaf);
-        }));
-
-        // Listen for file open events (covers both opening new files and switching between files)
-        this.registerEvent(this.app.workspace.on('file-open', () => {
-            this.onFileOpen();
-        }));
-
-        // Listen for clicks on the editor to detect cursor movements
-        this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-            this.onDocumentClick(evt);
-        });
+        // ...and when they switch to another note or pane.
+        this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.scheduleSearch()));
+        this.registerEvent(this.app.workspace.on('file-open', () => this.scheduleSearch()));
     }
 
     async processOneFileIntoDatabase(file: any) {
@@ -564,176 +553,14 @@ export default class Tezcat extends Plugin {
     }
 
 
-    private onEditorChange(editor: Editor, view: MarkdownView) {
-        // Only search if we're on a markdown file and search panel is visible
-        if (!view || !this.isSearchPanelVisible()) {
-            return;
-        }
-
-        const context = this.extractCursorContext(editor);
-        this.debouncedSearch(context);
-    }
-
-    private onActiveLeafChange(leaf: WorkspaceLeaf | null) {
-        if (!this.isSearchPanelVisible()) {
-            return;
-        }
-
-        // Check if we're on a markdown file
-        if (leaf?.view instanceof MarkdownView) {
-            const editor = leaf.view.editor;
-            const context = this.extractCursorContext(editor);
-            this.debouncedSearch(context);
-        }
-        // Note: We don't clear results when switching away from markdown files
-        // This allows users to interact with search results even when not in an editor
-    }
-
-    private onDocumentClick(evt: MouseEvent) {
-        // Only proceed if the search panel is open and visible
-        if (!this.isSearchPanelVisible()) {
-            return;
-        }
-
-        // Check if the click was in an editor area (lightweight check)
-        const target = evt.target as Element;
-        if (target && (target.closest('.cm-editor') || target.closest('.markdown-source-view'))) {
-            // Defer the heavy work to avoid blocking the click event
-            window.setTimeout(() => {
-                try {
-                    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-                    if (activeView && activeView.editor) {
-                        const context = this.extractCursorContext(activeView.editor);
-                        this.debouncedSearch(context);
-                    }
-                } catch (error) {
-                    logger.warn('Plugin', 'Error handling click event', error);
-                }
-            }, 10);
-        }
-    }
-
-    private onFileOpen() {
-        if (!this.isSearchPanelVisible()) {
-            return;
-        }
-
-        // Small delay to ensure the editor is ready
-        window.setTimeout(() => {
-            const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (activeView && activeView.editor) {
-                const context = this.extractCursorContext(activeView.editor);
-                this.debouncedSearch(context);
-            } else {
-                // Not a markdown file - clear results since there's no cursor context
-                this.updateSearchPanel([]);
-            }
-        }, 50);
-    }
-
-    private extractCursorContext(editor: Editor): string {
-        try {
-            const doc = editor.getDoc();
-            
-            // Get cursor position first, fallback to beginning if no cursor
-            let cursor;
-            try {
-                cursor = editor.getCursor();
-            } catch (error) {
-                cursor = { line: 0, ch: 0 };
-            }
-            
-            // Get a reasonable range around the cursor instead of the full document
-            // This is much faster for large documents
-            const lineCount = doc.lineCount();
-            const contextLines = 10; // Look at 10 lines before and after cursor
-            const startLine = Math.max(0, cursor.line - contextLines);
-            const endLine = Math.min(lineCount, cursor.line + contextLines + 1);
-            
-            // Get text from the limited range
-            const lines = [];
-            for (let i = startLine; i < endLine; i++) {
-                lines.push(doc.getLine(i));
-            }
-            const contextText = lines.join('\n');
-            
-            // Split into words
-            const words = contextText.split(/\s+/).filter(word => word.length > 0);
-            
-            if (words.length === 0) {
-                return '';
-            }
-            
-            // Find approximate cursor position within this limited context
-            let wordIndex = 0;
-            for (let i = startLine; i < cursor.line && i < lineCount; i++) {
-                const line = doc.getLine(i);
-                const lineWords = line.split(/\s+/).filter(word => word.length > 0);
-                wordIndex += lineWords.length;
-            }
-            
-            // Add words from current line up to cursor position
-            if (cursor.line < lineCount) {
-                const currentLine = doc.getLine(cursor.line);
-                const lineUpToCursor = currentLine.substring(0, cursor.ch);
-                const wordsBeforeCursor = lineUpToCursor.split(/\s+/).filter(word => word.length > 0);
-                wordIndex += wordsBeforeCursor.length;
-            }
-            
-            // Extract context window, but limit to what we actually retrieved
-            const halfWindow = Math.floor(this.CONTEXT_WINDOW_WORDS / 2);
-            const startIndex = Math.max(0, wordIndex - halfWindow);
-            const endIndex = Math.min(words.length, wordIndex + halfWindow);
-            
-            return words.slice(startIndex, endIndex).join(' ');
-            
-        } catch (error) {
-            logger.warn('Plugin', 'Error extracting cursor context', error);
-            return '';
-        }
-    }
-
-    /**
-     * Get debounce delay based on search cadence setting
-     */
-    private getSearchDebounceDelay(): number {
-        switch (this.settings.searchCadence) {
-            case 'always':
-                return 500; // 0.5 seconds - current behavior
-            case 'sometimes':
-                return 2000; // 2 seconds - slower
-            case 'occasionally':
-                return 8000; // 8 seconds - very slow
-            default:
-                return 500;
-        }
-    }
-
-    debouncedSearch(context: string) {
-        // Check if search is currently suppressed
-        if (Date.now() < this.searchSuppressedUntil) {
-            logger.debug('Plugin', 'Search suppressed due to recent button interaction');
-            return;
-        }
-
-        if (this.searchDebounceTimer) {
-            window.clearTimeout(this.searchDebounceTimer);
-        }
-        
-        const debounceDelay = this.getSearchDebounceDelay();
-        logger.debug('Plugin', `Using search cadence: ${this.settings.searchCadence} (${debounceDelay}ms delay)`);
-        
-        this.searchDebounceTimer = window.setTimeout(async () => {
-            // Double-check suppression at execution time
-            if (Date.now() < this.searchSuppressedUntil) {
-                logger.debug('Plugin', 'Search suppressed at execution time');
-                return;
-            }
-            
-            if (context.trim()) {
-                await this.performDynamicSearch(context);
-            }
-        }, debounceDelay);
+    /** Debounced: searches once the user pauses, using the cursor context at that moment. */
+    private scheduleSearch() {
+        if (!this.isSearchPanelVisible() || Date.now() < this.searchSuppressedUntil) return;
+        if (this.searchDebounceTimer) window.clearTimeout(this.searchDebounceTimer);
+        this.searchDebounceTimer = window.setTimeout(() => {
+            this.searchDebounceTimer = null;
+            void this.runSearch();
+        }, SEARCH_DELAY_MS[this.settings.searchCadence] ?? SEARCH_DELAY_MS.always);
     }
 
     /**
@@ -749,37 +576,29 @@ export default class Tezcat extends Plugin {
         return this.view?.containerEl.isShown() ?? false;
     }
 
-    private async performDynamicSearch(context: string) {
+    private async runSearch() {
+        if (Date.now() < this.searchSuppressedUntil) return;
+        // Results stay as they are when focus is somewhere other than a note (e.g. the panel).
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view) return;
+        const editor = view.editor;
+        const context = cursorContext(editor, editor.getCursor(), this.settings.contextWindowWords);
+        if (!context.trim()) return;
+
+        const seq = ++this.searchSeq;
+        const excludeNotePaths = view.file ? [view.file.path] : [];
         try {
-            const currentNotePath = this.getCurrentNotePath();
-            const excludeNotePaths = currentNotePath ? [currentNotePath] : [];
-            
-            // Perform search based on settings (vector or hybrid)
-            const searchPromise = this.settings.searchMode === 'hybrid' 
-                ? this.searchService.hybridSearch(context, {
-                    topK: 10,
-                    minScore: 0, // RRF scores are much smaller than cosine similarity scores
-                    includeNoteVectors: true,
-                    includeBlockVectors: true,
-                    excludeNotePaths,
-                    hybridWeight: 0.5 // Equal weighting by default
-                })
-                : this.searchService.vectorSearch(context, {
-                    topK: 10,
-                    minScore: 0.1,
-                    includeNoteVectors: true,
-                    includeBlockVectors: true,
-                    excludeNotePaths
-                });
-            
-            const results = await searchPromise;
-            
-            // Update panel asynchronously
+            const options = { topK: 10, includeNoteVectors: true, includeBlockVectors: true, excludeNotePaths };
+            const results = this.settings.searchMode === 'hybrid'
+                // RRF scores are much smaller than cosine similarities, hence minScore 0.
+                ? await this.searchService.hybridSearch(context, { ...options, minScore: 0, hybridWeight: 0.5 })
+                : await this.searchService.vectorSearch(context, { ...options, minScore: 0.1 });
+            // A newer search started while this one ran; its results win.
+            if (seq !== this.searchSeq) return;
             await this.updateSearchPanel(results);
-            
         } catch (error) {
             logger.error('Plugin', 'Dynamic search failed', error);
-            await this.updateSearchPanel([]);
+            if (seq === this.searchSeq) await this.updateSearchPanel([]);
         }
     }
 

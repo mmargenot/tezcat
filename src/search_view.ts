@@ -215,13 +215,7 @@ class TezcatView extends ItemView {
             from: { line: result.blockStartPosition.line, ch: result.blockStartPosition.col },
             to: { line: result.blockEndPosition?.line || result.blockStartPosition.line, ch: result.blockEndPosition?.col || result.blockStartPosition.col }
           });
-          
-          // Trigger a new search based on the block content we navigated to
-          if (result.text) {
-            // Use the block content itself as the search context
-            this.plugin.debouncedSearch(result.text);
-          }
-          
+          // Moving the cursor triggers a search around the block automatically.
         }
       }, 100);
     }
