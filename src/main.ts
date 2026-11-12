@@ -2,7 +2,7 @@ import { App, CachedMetadata, MarkdownView, Modal, Notice, Plugin, PluginSetting
 import { EditorView } from '@codemirror/view';
 import { TezcatView, VIEW_TYPE } from './search_view';
 import { DatabaseService, SqlJsDatabaseAdapter } from './database_service';
-import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, EmbeddingProvider, OllamaModelManager } from './embedding_service';
+import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, OllamaModelManager } from './embedding_service';
 import { SearchService, SearchResult } from './search_service';
 import { logger, LogLevel } from './logger';
 import { ValidationService, SystemValidationResult, ValidationResult } from './validation_service';
@@ -19,6 +19,12 @@ const INDEX_DELAY_MS = 2000;
 /** Debounce before searching, per cadence setting. */
 const SEARCH_DELAY_MS: Record<SearchCadence, number> = { always: 500, sometimes: 2000, occasionally: 8000 };
 type SearchMode = 'vector' | 'hybrid';
+
+/** Models offered per provider; the first is the default when switching provider. */
+const EMBEDDING_MODELS: Record<EmbeddingProviderType, [id: string, label: string][]> = {
+    ollama: [['nomic-embed-text:v1.5', 'Nomic Embed Text v1.5 (768d)'], ['bge-m3', 'BGE M3 (1024d)']],
+    openai: [['text-embedding-3-small', 'Text Embedding 3 Small (1536d)'], ['text-embedding-3-large', 'Text Embedding 3 Large (3072d)']],
+};
 
 interface TezcatSettings {
     embeddingProvider: EmbeddingProviderType;
@@ -43,6 +49,15 @@ const DEFAULT_SETTINGS: TezcatSettings = {
     logLevel: LogLevel.ERROR,
     highlightBlockOnOpen: true
 }
+
+type EmbeddingSettings = Pick<TezcatSettings, 'embeddingProvider' | 'embeddingModel' | 'openaiApiKey' | 'ollamaBaseUrl'>;
+
+const pickEmbeddingSettings = (s: TezcatSettings): EmbeddingSettings => ({
+    embeddingProvider: s.embeddingProvider,
+    embeddingModel: s.embeddingModel,
+    openaiApiKey: s.openaiApiKey,
+    ollamaBaseUrl: s.ollamaBaseUrl,
+});
 
 const isMarkdown = (file: TAbstractFile): file is TFile => file instanceof TFile && file.extension === 'md';
 
@@ -275,31 +290,47 @@ export default class Tezcat extends Plugin {
         return { firstRun: saved == null };
     }
 
+    /** Persist settings. Search and display settings take effect immediately. */
     async saveSettings() {
         await this.saveData(this.settings);
-        // Update logger level when settings are saved
         logger.setLevel(this.settings.logLevel);
-        // Reinitialize services to pick up new settings
-        this.reinitializeServicesAfterSettingsChange();
     }
 
-    private reinitializeServicesAfterSettingsChange(): void {
-        logger.info('Plugin', 'Reinitializing services after settings change');
-        
-        // Reinitialize embedding services with new settings
+    /** A different provider or model embeds into a different vector space, so the index must be rebuilt. */
+    needsReindex(changes: EmbeddingSettings): boolean {
+        return changes.embeddingProvider !== this.settings.embeddingProvider
+            || changes.embeddingModel !== this.settings.embeddingModel;
+    }
+
+    /**
+     * Save new embedding settings and rebuild the services that depend on them. Provider or model
+     * changes then rebuild the index; URL and API key changes re-run validation and setup.
+     */
+    async updateEmbeddingSettings(changes: EmbeddingSettings): Promise<void> {
+        const reindex = this.needsReindex(changes);
+        Object.assign(this.settings, changes);
+        await this.saveSettings();
+
         this.initializeEmbeddingServices();
-        
-        // Recreate search service with updated embedding service
-        this.searchService = new SearchService(
-            this.databaseService, 
-            this.embeddingService, 
-            logger
-        );
-        
-        // Clear any cached validation results to force fresh validation
+        this.searchService = new SearchService(this.databaseService, this.embeddingService, logger);
         this.clearValidationCache();
-        
-        logger.info('Plugin', 'Services reinitialized after settings change');
+
+        if (!reindex) {
+            new Notice('Settings saved.');
+            await this.performValidationAndSetup();
+            return;
+        }
+        try {
+            new Notice('Settings saved. Checking the embedding provider...');
+            await this.embeddingService.embeddingProvider.validate();
+        } catch (error) {
+            logger.error('Plugin', 'Embedding provider validation failed', error);
+            const message = error instanceof Error ? error.message : String(error);
+            new Notice(`Could not use the embedding provider: ${message}\nFix the settings, then run "Tezcat: Rebuild database".`, 10000);
+            this.updateStatusBar('alert-triangle', 'Tezcat: Setup required', 'tezcat-status-error');
+            return;
+        }
+        await this.rebuildDatabase();
     }
 
     /**
@@ -773,24 +804,27 @@ export default class Tezcat extends Plugin {
 
 class TezcatSettingTab extends PluginSettingTab {
     plugin: Tezcat;
-    private pendingSettings: TezcatSettings;
-    private hasSensitiveChanges: boolean = false;
+    /** Unsaved embedding settings; applied together with "Save changes". */
+    private pending: EmbeddingSettings;
+    private dirty = false;
 
     constructor(app: App, plugin: Tezcat) {
         super(app, plugin);
         this.plugin = plugin;
-        this.pendingSettings = { ...plugin.settings };
+        this.pending = pickEmbeddingSettings(plugin.settings);
     }
 
     display(): void {
         const {containerEl} = this;
 
         containerEl.empty();
+        if (!this.dirty) this.pending = pickEmbeddingSettings(this.plugin.settings);
+        const markDirty = () => { this.dirty = true; this.display(); };
 
         // Embedding Settings Section
         new Setting(containerEl).setHeading().setName('Embeddings');
         containerEl.createEl('p', {
-            text: 'Changing these settings will require reindexing all vault content.',
+            text: 'Changing the provider or model requires reindexing all vault content.',
             cls: 'setting-item-description'
         });
 
@@ -800,95 +834,54 @@ class TezcatSettingTab extends PluginSettingTab {
             .addDropdown(dropdown => dropdown
                 .addOption('ollama', 'Ollama')
                 .addOption('openai', 'OpenAI')
-                .setValue(this.pendingSettings.embeddingProvider)
+                .setValue(this.pending.embeddingProvider)
                 .onChange((value: EmbeddingProviderType) => {
-                    this.pendingSettings.embeddingProvider = value;
-                    this.hasSensitiveChanges = true;
-                    this.display(); // Refresh settings to show/hide conditional settings
+                    this.pending.embeddingProvider = value;
+                    // The previous provider's model isn't available here; start from this one's default.
+                    this.pending.embeddingModel = EMBEDDING_MODELS[value][0][0];
+                    markDirty();
                 }));
 
         new Setting(containerEl)
             .setName('Embedding model')
             .setDesc('The model to use for generating embeddings')
             .addDropdown(dropdown => {
-                if (this.pendingSettings.embeddingProvider === 'openai') {
-                    dropdown
-                        .addOption('text-embedding-3-small', 'Text Embedding 3 Small (1536d)')
-                        .addOption('text-embedding-3-large', 'Text Embedding 3 Large (3072d)');
-                } else if (this.pendingSettings.embeddingProvider === 'ollama') {
-                    dropdown
-                        .addOption('nomic-embed-text:v1.5', 'Nomic Embed Text v1.5 (768d)')
-                        .addOption('bge-m3', 'BGE M3 (1024d)');
-                }
-                
+                for (const [id, label] of EMBEDDING_MODELS[this.pending.embeddingProvider]) dropdown.addOption(id, label);
                 dropdown
-                    .setValue(this.pendingSettings.embeddingModel)
+                    .setValue(this.pending.embeddingModel)
                     .onChange((value) => {
-                        this.pendingSettings.embeddingModel = value;
-                        this.hasSensitiveChanges = true;
-                        this.display();
+                        this.pending.embeddingModel = value;
+                        markDirty();
                     });
             });
 
-        // Conditional settings based on provider
-        if (this.pendingSettings.embeddingProvider === 'openai') {
-            new Setting(containerEl)
-                .setName('OpenAI API key')
-                .setDesc('Your OpenAI API key for embedding generation')
-                .addText(text => {
-                    const originalValue = this.plugin.settings.openaiApiKey;
-                    text
-                        .setPlaceholder('sk-...')
-                        .setValue(this.pendingSettings.openaiApiKey)
-                        .onChange((value) => {
-                            this.pendingSettings.openaiApiKey = value;
-                        });
-                    text.inputEl.addEventListener('blur', () => {
-                        if (this.pendingSettings.openaiApiKey !== originalValue) {
-                            this.hasSensitiveChanges = true;
-                            this.display();
-                        }
-                    });
+        // Text fields update on every keystroke but only redraw (showing Save) on blur, so
+        // typing doesn't lose focus.
+        const textSetting = (key: 'openaiApiKey' | 'ollamaBaseUrl', name: string, desc: string, placeholder: string) =>
+            new Setting(containerEl).setName(name).setDesc(desc).addText(text => {
+                text.setPlaceholder(placeholder)
+                    .setValue(this.pending[key])
+                    .onChange((value) => { this.pending[key] = value; });
+                text.inputEl.addEventListener('blur', () => {
+                    if (this.pending[key] !== this.plugin.settings[key]) markDirty();
                 });
+            });
+
+        if (this.pending.embeddingProvider === 'openai') {
+            textSetting('openaiApiKey', 'OpenAI API key', 'Your OpenAI API key for embedding generation', 'sk-...');
+        } else {
+            textSetting('ollamaBaseUrl', 'Ollama base URL', 'The base URL for your Ollama server', 'http://localhost:11434');
         }
 
-        if (this.pendingSettings.embeddingProvider === 'ollama') {
+        if (this.dirty) {
             new Setting(containerEl)
-                .setName('Ollama base URL')
-                .setDesc('The base URL for your Ollama server')
-                .addText(text => {
-                    const originalValue = this.plugin.settings.ollamaBaseUrl;
-                    text
-                        .setPlaceholder('http://localhost:11434')
-                        .setValue(this.pendingSettings.ollamaBaseUrl)
-                        .onChange((value) => {
-                            this.pendingSettings.ollamaBaseUrl = value;
-                        });
-                    text.inputEl.addEventListener('blur', () => {
-                        if (this.pendingSettings.ollamaBaseUrl !== originalValue) {
-                            this.hasSensitiveChanges = true;
-                            this.display();
-                        }
-                    });
-                });
-        }
-
-        // Save and Cancel buttons for sensitive settings
-        const buttonContainer = containerEl.createDiv('setting-item');
-        buttonContainer.createDiv('setting-item-info');
-        const buttonControl = buttonContainer.createDiv('setting-item-control');
-
-        if (this.hasSensitiveChanges) {
-            const saveButton = buttonControl.createEl('button', {
-                text: 'Save changes',
-                cls: 'mod-cta'
-            });
-            saveButton.onclick = () => this.confirmAndSave();
-
-            const cancelButton = buttonControl.createEl('button', {
-                text: 'Cancel'
-            });
-            cancelButton.onclick = () => this.cancelChanges();
+                .addButton(button => button
+                    .setButtonText('Save changes')
+                    .setCta()
+                    .onClick(() => this.saveEmbeddingSettings()))
+                .addButton(button => button
+                    .setButtonText('Cancel')
+                    .onClick(() => { this.dirty = false; this.display(); }));
         }
 
         // Rebuild Database Button
@@ -996,168 +989,21 @@ class TezcatSettingTab extends PluginSettingTab {
                 }));
     }
 
-    private createEmbeddingProvider(): EmbeddingProvider {
-        switch (this.plugin.settings.embeddingProvider) {
-            case 'ollama':
-                // Create model manager if needed
-                if (!this.plugin.modelManager) {
-                    this.plugin.modelManager = new OllamaModelManager(this.plugin.settings.ollamaBaseUrl, logger);
-                }
-                
-                // Create Ollama provider with model manager
-                const ollamaProvider = new OllamaEmbeddingProvider(
-                    this.plugin.settings.ollamaBaseUrl, 
-                    this.plugin.settings.embeddingModel, 
-                    logger
-                );
-                ollamaProvider.setModelManager(this.plugin.modelManager);
-                return ollamaProvider;
-            case 'openai':
-                return new OpenAIEmbeddingProvider(
-                    this.plugin.settings.openaiApiKey,
-                    this.plugin.settings.embeddingModel,
-                    'https://api.openai.com',
-                    logger
-                );
-            default:
-                throw new Error(`Unknown embedding provider: ${this.plugin.settings.embeddingProvider}`);
-        }
-    }
-
-    private async reinitializeServices(): Promise<void> {
-        logger.info('Plugin', 'Reinitializing services with new settings...');
-        
-        // Always recreate all services for safety
-        const provider = this.createEmbeddingProvider();
-        this.plugin.embeddingService = new EmbeddingService(provider, logger);
-        
-        // Recreate search service to use the new embedding service
-        this.plugin.searchService = new SearchService(
-            this.plugin.databaseService, 
-            this.plugin.embeddingService, 
-            logger
-        );
-        
-        // Clear any cached validation results to force fresh validation
-        this.plugin.clearValidationCache();
-        
-        logger.info('Plugin', 'Services reinitialized successfully');
-    }
-
-    private async validateCurrentProvider(): Promise<void> {
-        const provider = this.plugin.embeddingService.embeddingProvider;
-        await provider.validate();
-    }
-
-    private async confirmAndSave() {
-        const requiresReindex = this.requiresReindex();
-        
-        if (requiresReindex) {
-            new ReindexConfirmModal(
-                this.app, 
-                async () => {
-                    // User confirmed - proceed with save and reindex
-                    await this.saveAndReindex();
-                },
-                () => {
-                    // User cancelled - reset pending settings and clear save/cancel state
-                    this.pendingSettings = { ...this.plugin.settings };
-                    this.hasSensitiveChanges = false;
-                    this.display();
-                }
-            ).open();
+    private saveEmbeddingSettings() {
+        const changes = { ...this.pending };
+        const apply = async () => {
+            // updateEmbeddingSettings applies the new values before its first await, so the
+            // redraw shows them while validation or reindexing continues.
+            const done = this.plugin.updateEmbeddingSettings(changes);
+            this.dirty = false;
+            this.display();
+            await done;
+        };
+        if (this.plugin.needsReindex(changes)) {
+            new ReindexConfirmModal(this.app, apply, () => {}).open();
         } else {
-            await this.saveSettings();
+            void apply();
         }
-    }
-
-    private requiresReindex(): boolean {
-        return (
-            this.plugin.settings.embeddingProvider !== this.pendingSettings.embeddingProvider ||
-            this.plugin.settings.embeddingModel !== this.pendingSettings.embeddingModel
-        );
-    }
-
-    private async saveAndReindex() {
-        if (this.plugin.isOperationInProgress) {
-            new Notice('Database operation already in progress. Please wait for it to complete.');
-            return;
-        }
-
-        this.plugin.isOperationInProgress = true;
-        try {
-            // Save settings first
-            this.plugin.settings = { ...this.pendingSettings };
-            await this.plugin.saveSettings();
-            this.hasSensitiveChanges = false;
-            this.display(); // Immediately refresh UI to clear save/cancel buttons
-            
-            new Notice('Settings saved. Validating configuration...');
-            logger.info('Plugin', 'Starting reindexing process with new settings');
-            
-            // Reinitialize services with new settings
-            await this.reinitializeServices();
-            
-            // Validate provider before destructive operations
-            new Notice('Validating embedding provider...');
-            await this.validateCurrentProvider();
-            
-            new Notice('Configuration validated. Rebuilding vector database...');
-            logger.info('Plugin', 'Beginning vector database rebuild');
-            
-            // Use the existing rebuildDatabase method which handles everything properly
-            await this.plugin.rebuildDatabase();
-            
-            new Notice('Reindexing completed successfully!');
-            logger.info('Plugin', 'Reindexing completed successfully');
-            
-            // Update system status to reflect successful reindex
-            this.plugin.isSystemValid = true;
-            this.plugin.updateStatusBar('check', 'Tezcat: System ready', 'tezcat-status-ready');
-            
-            // Reset pending settings to match saved settings and refresh UI
-            this.pendingSettings = { ...this.plugin.settings };
-            this.hasSensitiveChanges = false;
-            this.display();
-            
-        } catch (error) {
-            logger.error('Plugin', 'Reindexing failed', error);
-            
-            // Keep new settings but show clear error and reset UI state
-            let errorMessage = 'Reindexing failed: ';
-            if (error.message.includes('Ollama')) {
-                errorMessage += error.message;
-            } else if (error.message.includes('OpenAI')) {
-                errorMessage += error.message;
-            } else {
-                errorMessage += 'Unknown error occurred. Check console for details.';
-            }
-            
-            new Notice(errorMessage, 10000);
-            new Notice('Try using Command Palette - "Tezcat: Rebuild Vector Database" to retry with the new settings.', 8000);
-            
-            // Reset pending settings to match saved settings (even though save failed, we want UI to reflect current state)
-            this.pendingSettings = { ...this.plugin.settings };
-            this.hasSensitiveChanges = false;
-            this.display();
-        } finally {
-            this.plugin.isOperationInProgress = false;
-        }
-    }
-
-    private async saveSettings() {
-        this.plugin.settings = { ...this.pendingSettings };
-        await this.plugin.saveSettings();
-        this.hasSensitiveChanges = false;
-        
-        new Notice('Settings saved.');
-        this.display();
-    }
-
-    private cancelChanges() {
-        this.pendingSettings = { ...this.plugin.settings };
-        this.hasSensitiveChanges = false;
-        this.display();
     }
 }
 
