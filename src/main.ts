@@ -770,13 +770,17 @@ class TezcatSettingTab extends PluginSettingTab {
         const currentListed = ids?.some((id) => sameModel(id, current)) ?? false;
         const typing = this.typingModel || (ids !== null && !currentListed);
 
+        // The list only has models already on the server; say how to get another one.
+        const howToAdd = /:11434(\/|$)/.test(this.plugin.settings.embeddingEndpoint)
+            ? 'To use another model, download it first (e.g. ollama pull mxbai-embed-large), then refresh this list.'
+            : 'To use another model, download or enable it on your server first, then refresh this list.';
         const desc = this.models?.error
             ? `Couldn't get the server's model list: ${this.models.error} Choose "Other…" to type a model name.`
             : ids === null
                 ? 'Loading the server\'s models…'
                 : ids.length === 0
-                    ? 'The server lists no models. Choose "Other…" to type a model name.'
-                    : 'Embedding models available on the server.';
+                    ? `The server lists no models. ${howToAdd}`
+                    : `Embedding models installed on the server. ${howToAdd}`;
 
         const setting = new Setting(containerEl)
             .setName('Model')
