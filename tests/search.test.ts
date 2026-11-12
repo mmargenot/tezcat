@@ -104,3 +104,71 @@ describe('SearchService', () => {
         expect(await search.search('   ', { semanticWeight: 0.5, limit: 5 })).toEqual([]);
     });
 });
+
+describe('SearchService: boilerplate', () => {
+    /** A vault like the test vault: every note opens with a templated byline. */
+    const templatedVault = async () => {
+        const v = new FakeVault();
+        const topics = ['raven', 'lighthouse', 'pendulum', 'masque', 'maelstrom', 'tarn', 'gold', 'cask', 'heart', 'usher',
+            'ligeia', 'eleonora', 'morella', 'berenice', 'silence', 'shadow', 'eldorado', 'ulalume', 'lenore', 'annabel',
+            'tamerlane', 'israfel', 'helen', 'dreamland', 'bells'];
+        topics.forEach((t, i) => v.write(`notes/${t}.md`,
+            `_**by Edgar Allan Poe** (published ${1830 + i})_\n\nA story of the ${t}, its ${t} keeper and the ${t} omen.`));
+        // Unique to one note (not a template), but every word is in nearly every note.
+        v.write('notes/raven.md', (await v.read('notes/raven.md'))!.content + '\n\nThe omen, the keeper, the story.');
+        // the same stanza quoted in two notes
+        v.write('notes/quoted-a.md', 'Thy naiad airs have brought me home to the glory that was Greece.');
+        v.write('notes/quoted-b.md', 'Thy naiad airs have brought me home to the glory that was Greece!');
+        const r = new IndexRepository(`boilerplate-${++ns}`, log);
+        await r.load();
+        await r.sync(v);
+        return { v, s: new SearchService(r, async (p) => (await v.read(p))?.content ?? null, log) };
+    };
+
+    it('leaves out a template repeated across many notes', async () => {
+        const { s } = await templatedVault();
+        const results = await s.search('by Edgar Allan Poe (published 1849) the raven omen', { semanticWeight: 0, limit: 10 });
+        expect(results.length).toBeGreaterThan(0);
+        expect(results.some((r) => /Edgar Allan Poe/.test(r.text))).toBe(false);
+        expect(results[0].text).toMatch(/raven/);
+    });
+
+    it('leaves out passages with almost no distinctive words', async () => {
+        const { s } = await templatedVault();
+        const results = await s.search('the omen, the keeper, the story', { semanticWeight: 0, limit: 10 });
+        expect(results.length).toBeGreaterThan(0);
+        expect(results.map((r) => r.text)).not.toContain('The omen, the keeper, the story.');
+    });
+
+    it('shows a passage repeated in several notes only once', async () => {
+        const { s } = await templatedVault();
+        const results = await s.search('naiad airs glory Greece', { semanticWeight: 0, limit: 10 });
+        expect(results.filter((r) => /naiad/.test(r.text))).toHaveLength(1);
+    });
+
+    it('shows everything when the filters are turned off', async () => {
+        const { s } = await templatedVault();
+        const off = { semanticWeight: 0, limit: 10, filterBoilerplate: false, filterCommonPhrasing: false };
+        const bylines = await s.search('by Edgar Allan Poe (published 1849)', off);
+        expect(bylines.filter((r) => /Edgar Allan Poe/.test(r.text)).length).toBeGreaterThan(1);
+        expect((await s.search('the omen, the keeper, the story', off)).map((r) => r.text)).toContain('The omen, the keeper, the story.');
+        expect((await s.search('naiad airs glory Greece', off)).filter((r) => /naiad/.test(r.text))).toHaveLength(2);
+    });
+
+    it('applies each filter independently', async () => {
+        const { s } = await templatedVault();
+        const onlyPhrasing = await s.search('by Edgar Allan Poe (published 1849)', { semanticWeight: 0, limit: 10, filterBoilerplate: false });
+        // the byline is both templated and uninformative, so the phrasing filter alone still hides it
+        expect(onlyPhrasing.some((r) => /Edgar Allan Poe/.test(r.text))).toBe(false);
+        const onlyBoilerplate = await s.search('the omen, the keeper, the story', { semanticWeight: 0, limit: 10, filterCommonPhrasing: false });
+        expect(onlyBoilerplate.map((r) => r.text)).toContain('The omen, the keeper, the story.');
+    });
+
+    it('does not judge informativeness in a small vault', async () => {
+        // The 3-note vault from the other tests: everything is too rare/common to judge.
+        vault.write('Short.md', '"Yes," he said, quite sure of it.');
+        await repo.sync(vault);
+        const results = await search.search('yes he said', { semanticWeight: 0, limit: 10 });
+        expect(results.map((r) => r.path)).toContain('Short.md');
+    });
+});

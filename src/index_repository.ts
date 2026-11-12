@@ -3,7 +3,7 @@ import { clear, createStore, del, delMany, entries, get, set, setMany, type UseS
 import type { CachedMetadata } from 'obsidian';
 import { extractBlocks, type Block, type BlockRecord } from './blocks';
 import type { Logger } from './logger';
-import { processTerm, queryTerms, tokenize } from './text';
+import { contentTerms, processTerm, queryTerms, tokenize } from './text';
 import { quantize, type QVec } from './vectors';
 
 // ---------- vault access (an adapter over Obsidian's API lives in main.ts) ----------
@@ -40,6 +40,8 @@ export interface FileRecord {
 	 */
 	indexedAt: number;
 	blocks: BlockRecord[];
+	/** Distinct normalised content words across the note's blocks, for note frequencies. */
+	terms: string[];
 }
 
 export interface IndexedBlock {
@@ -60,7 +62,7 @@ export interface IndexStats {
 }
 
 /** Bump when the stored format changes; older data is discarded and rebuilt. */
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 interface Meta {
 	schemaVersion: number;
@@ -123,6 +125,9 @@ export class IndexRepository {
 	/** Files whose saved keyword entries may be out of date (see load). */
 	private keywordStale = new Set<string>();
 	private vectors = new Map<string, QVec>();
+	/** How many notes contain each normalised term, and each block signature. */
+	private termNotes = new Map<string, number>();
+	private signatureNotes = new Map<string, number>();
 	private lastStamp = 0;
 	private meta: Meta = { schemaVersion: SCHEMA_VERSION, embeddingSpace: null };
 	private chain: Promise<unknown> = Promise.resolve();
@@ -154,6 +159,7 @@ export class IndexRepository {
 
 			for (const [, rec] of await entries<string, FileRecord>(this.db.files)) {
 				this.files.set(rec.path, rec);
+				this.countNote(rec, 1);
 				this.lastStamp = Math.max(this.lastStamp, rec.indexedAt);
 			}
 			for (const [hash, vec] of await entries<string, QVec>(this.db.vectors)) this.vectors.set(hash, vec);
@@ -217,6 +223,8 @@ export class IndexRepository {
 	clear(): Promise<void> {
 		return this.serial(async () => {
 			this.files.clear();
+			this.termNotes.clear();
+			this.signatureNotes.clear();
 			this.keyword = new MiniSearch<KeywordDoc>(KEYWORD_OPTIONS);
 			this.keywordEntries.clear();
 			this.keywordStale.clear();
@@ -271,6 +279,26 @@ export class IndexRepository {
 		const path = id.slice(0, sep);
 		const block = this.files.get(path)?.blocks[Number(id.slice(sep + 1))];
 		return block ? { id, path, block } : null;
+	}
+
+	get noteCount(): number { return this.files.size; }
+
+	/** Number of notes containing a block with this signature (see text.signature). */
+	notesWithSignature(sig: string): number {
+		return this.signatureNotes.get(sig) ?? 0;
+	}
+
+	/**
+	 * How distinctive a piece of text is within this vault: the sum, over its distinct
+	 * normalised content words, of log(notes / notes containing the word), i.e. their IDF
+	 * across notes. Near 0 when every word is in nearly every note (templated headers,
+	 * filler); tens for ordinary prose.
+	 */
+	informativeness(text: string): number {
+		const notes = this.files.size;
+		let total = 0;
+		for (const term of contentTerms(text)) total += Math.log(notes / Math.max(1, this.termNotes.get(term) ?? 0));
+		return total;
 	}
 
 	/** BM25-ranked blocks for free text (e.g. the words around the cursor). */
@@ -383,14 +411,20 @@ export class IndexRepository {
 		if (!cache) return;
 		const blocks = extractBlocks(content, cache);
 		this.lastStamp = Math.max(Date.now(), this.lastStamp + 1);
+		const terms = new Set<string>();
+		for (const b of blocks) for (const t of contentTerms(b.text)) terms.add(t);
 		const rec: FileRecord = {
 			path: file.path,
 			mtime: file.mtime,
 			size: file.size,
 			indexedAt: this.lastStamp,
 			blocks: blocks.map(({ text: _text, ...block }) => block),
+			terms: [...terms],
 		};
+		const previous = this.files.get(file.path);
+		if (previous) this.countNote(previous, -1);
 		this.files.set(file.path, rec);
+		this.countNote(rec, 1);
 		this.removeKeywordEntries(file.path);
 		this.keyword.addAll(blocks.map((b, i) => ({ id: blockId(file.path, i), path: file.path, title: file.basename, text: b.text })));
 		this.keywordEntries.set(file.path, { stamp: rec.indexedAt, count: blocks.length });
@@ -400,7 +434,22 @@ export class IndexRepository {
 
 	private async removeNow(path: string) {
 		this.removeKeywordEntries(path);
-		if (this.files.delete(path)) await del(path, this.db.files);
+		const rec = this.files.get(path);
+		if (!rec) return;
+		this.countNote(rec, -1);
+		this.files.delete(path);
+		await del(path, this.db.files);
+	}
+
+	/** Add (+1) or remove (-1) a note's contribution to the term and signature note counts. */
+	private countNote(rec: FileRecord, delta: 1 | -1) {
+		const bump = (counts: Map<string, number>, key: string) => {
+			const n = (counts.get(key) ?? 0) + delta;
+			if (n > 0) counts.set(key, n);
+			else counts.delete(key);
+		};
+		for (const term of rec.terms) bump(this.termNotes, term);
+		for (const sig of new Set(rec.blocks.map((b) => b.sig))) bump(this.signatureNotes, sig);
 	}
 
 	private removeKeywordEntries(path: string) {

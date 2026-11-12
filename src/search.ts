@@ -23,12 +23,32 @@ export interface SearchOptions {
 	excludePath?: string;
 	/** At most this many results per note, so one long note can't fill the list. */
 	maxPerNote?: number;
+	/** Hide templates repeated across notes, and show any other repeated passage once (default true). */
+	filterBoilerplate?: boolean;
+	/** Hide passages made only of words common across the vault (default true). */
+	filterCommonPhrasing?: boolean;
 }
 
 /** RRF smoothing constant; 60 is the value from the original RRF paper. */
 const RRF_K = 60;
-/** Each retriever contributes this many times `limit` candidates to fusion. */
-const POOL_FACTOR = 5;
+/**
+ * Each retriever contributes this many times `limit` candidates to fusion; generous, since
+ * boilerplate and duplicates are filtered out afterwards.
+ */
+const POOL_FACTOR = 10;
+
+/**
+ * Boilerplate filtering. A block is left out of results if either:
+ * - the same template (see text.signature) appears in at least TEMPLATE_MIN_NOTES notes,
+ *   e.g. a byline or header repeated across a vault; or
+ * - it carries almost no information: its informativeness (see
+ *   IndexRepository.informativeness) is below MIN_INFORMATION, i.e. less than one word that
+ *   appears in about a third of notes. Applied only from MIN_NOTES_FOR_IDF notes up, since
+ *   word frequencies mean little in a tiny vault.
+ */
+const TEMPLATE_MIN_NOTES = 5;
+const MIN_INFORMATION = 1.0;
+const MIN_NOTES_FOR_IDF = 20;
 
 /**
  * Weighted Reciprocal Rank Fusion. Rank-based, so BM25 scores (unbounded) and cosine
@@ -60,7 +80,7 @@ export class SearchService {
 	) {}
 
 	async search(text: string, opts: SearchOptions): Promise<SearchResult[]> {
-		const { limit, excludePath, maxPerNote = 2 } = opts;
+		const { limit, excludePath, maxPerNote = 2, filterBoilerplate = true, filterCommonPhrasing = true } = opts;
 		if (!text.trim()) return [];
 		const pool = { limit: limit * POOL_FACTOR, excludePath };
 
@@ -76,7 +96,7 @@ export class SearchService {
 			if (semantic.length === 0) weight = 0;
 		}
 		const keyword = weight < 1 ? this.repo.keywordSearch(text, pool) : [];
-		return this.toResults(fuse(keyword, semantic, weight), limit, maxPerNote);
+		return this.toResults(fuse(keyword, semantic, weight), { limit, maxPerNote, filterBoilerplate, filterCommonPhrasing });
 	}
 
 	private async semanticSearch(text: string, { limit, excludePath }: { limit: number; excludePath?: string }): Promise<Hit[]> {
@@ -91,10 +111,18 @@ export class SearchService {
 		return hits.slice(0, limit);
 	}
 
-	/** Resolve hits to current block text, skipping blocks that changed since indexing. */
-	private async toResults(hits: Hit[], limit: number, maxPerNote: number): Promise<SearchResult[]> {
+	/**
+	 * Resolve hits to current block text, skipping boilerplate, repeats of a result already
+	 * shown, and blocks that changed since indexing.
+	 */
+	private async toResults(
+		hits: Hit[],
+		{ limit, maxPerNote, filterBoilerplate, filterCommonPhrasing }: { limit: number; maxPerNote: number; filterBoilerplate: boolean; filterCommonPhrasing: boolean },
+	): Promise<SearchResult[]> {
 		const contents = new Map<string, Promise<string | null>>();
 		const perNote = new Map<string, number>();
+		const seenSignatures = new Set<string>();
+		const useInformation = filterCommonPhrasing && this.repo.noteCount >= MIN_NOTES_FOR_IDF;
 		const results: SearchResult[] = [];
 		for (const hit of hits) {
 			if (results.length >= limit) break;
@@ -102,12 +130,16 @@ export class SearchService {
 			if (!found) continue;
 			const { path, block } = found;
 			if ((perNote.get(path) ?? 0) >= maxPerNote) continue;
+			// Cheap checks first: no file read needed.
+			if (filterBoilerplate && (seenSignatures.has(block.sig) || this.repo.notesWithSignature(block.sig) >= TEMPLATE_MIN_NOTES)) continue;
 			if (!contents.has(path)) contents.set(path, this.read(path));
 			const content = await contents.get(path)!;
 			const blockText = content?.slice(block.start, block.end).trim();
 			// The file changed since it was indexed and this block moved or changed; its
 			// re-index is on the way.
 			if (!blockText || hashText(blockText) !== block.hash) continue;
+			if (useInformation && this.repo.informativeness(blockText) < MIN_INFORMATION) continue;
+			seenSignatures.add(block.sig);
 			perNote.set(path, (perNote.get(path) ?? 0) + 1);
 			results.push({
 				path,

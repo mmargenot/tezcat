@@ -236,3 +236,34 @@ describe('IndexRepository: vectors', () => {
         expect(fakeEmbed).not.toHaveBeenCalled();
     });
 });
+
+describe('IndexRepository: note frequencies', () => {
+    it('counts the notes containing each signature and term, through edits, deletes and reloads', async () => {
+        for (const y of [1840, 1841, 1842]) vault.write(`stories/S${y}.md`, `_**by Edgar Allan Poe** (published ${y})_\n\nA tale about the sea, numbered ${y}.`);
+        const repo = await open();
+        await repo.sync(vault);
+        const byline = 'by edgar allan poe published #';
+        expect(repo.noteCount).toBe(6);
+        expect(repo.notesWithSignature(byline)).toBe(3);
+
+        vault.write('stories/S1840.md', 'Rewritten without the byline.');
+        await repo.indexFile((await vault.read('stories/S1840.md'))!);
+        await repo.removeFile('stories/S1841.md');
+        expect(repo.notesWithSignature(byline)).toBe(1);
+
+        await repo.flush();
+        const reopened = await open();
+        expect(reopened.notesWithSignature(byline)).toBe(1);
+        expect(reopened.noteCount).toBe(5);
+    });
+
+    it('scores text by how rare its words are across notes', async () => {
+        const repo = await open();
+        for (let i = 0; i < 10; i++) vault.write(`common/${i}.md`, `Everyday filler words appear here, note ${i}.`);
+        await repo.sync(vault);
+        const filler = repo.informativeness('Everyday filler words appear here, note 7.');
+        const distinctive = repo.informativeness('Quoth the Raven, "Nevermore."');
+        expect(filler).toBeLessThan(2);
+        expect(distinctive).toBeGreaterThan(filler + 3);
+    });
+});
