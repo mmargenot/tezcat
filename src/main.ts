@@ -742,6 +742,19 @@ class TezcatSettingTab extends PluginSettingTab {
                 .setValue(settings.embeddingApiKeySecret)
                 .onChange((secret) => this.apply({ embeddingApiKeySecret: secret ?? '' })));
 
+        new Setting(containerEl)
+            .setName('Test connection')
+            .setDesc('Embed a short text with these settings and report the result.')
+            .addButton(button => button
+                .setButtonText('Test')
+                .onClick(async () => {
+                    button.setDisabled(true);
+                    await this.plugin.testConnection();
+                    button.setDisabled(false);
+                }));
+
+        this.displayStoredVectors(containerEl);
+
         // Rarely needed: prefixes are filled in automatically for known models.
         const advanced = containerEl.createEl('details', { cls: 'tezcat-settings-advanced' });
         advanced.open = this.advancedOpen;
@@ -762,19 +775,6 @@ class TezcatSettingTab extends PluginSettingTab {
         prefixSetting('Document prefix',
             'Instruction some models expect before each passage being indexed. Changing it re-embeds every block.',
             settings.documentPrefix, (documentPrefix) => this.apply({ documentPrefix }));
-
-        new Setting(containerEl)
-            .setName('Test connection')
-            .setDesc('Embed a short text with these settings and report the result.')
-            .addButton(button => button
-                .setButtonText('Test')
-                .onClick(async () => {
-                    button.setDisabled(true);
-                    await this.plugin.testConnection();
-                    button.setDisabled(false);
-                }));
-
-        this.displayStoredVectors(containerEl);
     }
 
     /**
