@@ -44,6 +44,32 @@ export function processTerm(term: string): string | null {
 	return t;
 }
 
+/**
+ * Words with every run of digits replaced by `#`, so text that differs only in numbers
+ * (years, dates, counts) normalises to the same words. Used to spot templated boilerplate;
+ * the keyword index itself keeps numbers as typed, so they stay searchable.
+ */
+export function normalizedWords(text: string): string[] {
+	return tokenize(text).map((w) => w.replace(/\p{N}+/gu, '#'));
+}
+
+/**
+ * A block's template signature: its normalised words in order. Two blocks with the same
+ * signature differ at most in Markdown formatting, case, punctuation and numbers.
+ */
+export function signature(text: string): string {
+	return normalizedWords(text).join(' ');
+}
+
+/** Distinct normalised content words (stopwords dropped; `#` kept, standing for any number). */
+export function contentTerms(text: string): Set<string> {
+	const terms = new Set<string>();
+	for (const w of normalizedWords(text)) {
+		if (w === '#' || processTerm(w)) terms.add(w);
+	}
+	return terms;
+}
+
 /** Distinct query terms from free text (e.g. cursor context), in first-seen order. */
 export function queryTerms(text: string, max = 48): string[] {
 	const seen = new Set<string>();

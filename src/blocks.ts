@@ -1,4 +1,5 @@
 import type { CachedMetadata } from 'obsidian';
+import { signature } from './text';
 
 /** Section types worth indexing. Code, tables, YAML, math, etc. are skipped. */
 const INDEXED_TYPES = new Set(['paragraph', 'heading', 'list', 'blockquote', 'callout']);
@@ -16,6 +17,8 @@ export interface BlockRecord {
 	/** 0-based line numbers, for navigation. */
 	line: number;
 	endLine: number;
+	/** Template signature (see text.signature): identical for blocks that differ only in formatting or numbers. */
+	sig: string;
 }
 
 export interface Block extends BlockRecord {
@@ -33,6 +36,8 @@ export function extractBlocks(content: string, cache: CachedMetadata | null): Bl
 		const { start, end } = section.position;
 		const text = content.slice(start.offset, end.offset).trim();
 		if (text.length < MIN_BLOCK_CHARS) continue;
+		const sig = signature(text);
+		if (!sig) continue; // no words at all (e.g. a "* * *" scene break): nothing to find it by
 		blocks.push({
 			hash: hashText(text),
 			type: section.type,
@@ -40,6 +45,7 @@ export function extractBlocks(content: string, cache: CachedMetadata | null): Bl
 			end: end.offset,
 			line: start.line,
 			endLine: end.line,
+			sig,
 			text,
 		});
 	}

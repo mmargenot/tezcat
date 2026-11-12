@@ -36,6 +36,8 @@ interface TezcatSettings {
     searchCadence: SearchCadence;
     logLevel: LogLevel;
     highlightBlockOnOpen: boolean;
+    filterBoilerplate: boolean;
+    filterCommonPhrasing: boolean;
 }
 
 const DEFAULT_SETTINGS: TezcatSettings = {
@@ -47,7 +49,9 @@ const DEFAULT_SETTINGS: TezcatSettings = {
     contextWindowWords: 64, // Smaller context window for more focused search
     searchCadence: 'always',
     logLevel: LogLevel.ERROR,
-    highlightBlockOnOpen: true
+    highlightBlockOnOpen: true,
+    filterBoilerplate: true,
+    filterCommonPhrasing: true,
 }
 
 type EmbeddingSettings = Pick<TezcatSettings, 'embeddingProvider' | 'embeddingModel' | 'openaiApiKey' | 'ollamaBaseUrl'>;
@@ -431,16 +435,21 @@ export default class Tezcat extends Plugin {
 
         const seq = ++this.searchSeq;
         try {
-            const results = await this.search.search(context, {
-                semanticWeight: this.settings.semanticWeight,
-                limit: RESULT_LIMIT,
-                excludePath: view.file?.path,
-            });
+            const results = await this.search.search(context, { ...this.searchOptions, excludePath: view.file?.path });
             // A newer search started while this one ran; its results win.
             if (seq === this.searchSeq) this.view?.updateSearchResults(results);
         } catch (error) {
             logger.error('Plugin', 'Search failed', error);
         }
+    }
+
+    private get searchOptions() {
+        return {
+            semanticWeight: this.settings.semanticWeight,
+            limit: RESULT_LIMIT,
+            filterBoilerplate: this.settings.filterBoilerplate,
+            filterCommonPhrasing: this.settings.filterCommonPhrasing,
+        };
     }
 
     suppressSearchFor(milliseconds: number = 2000) {
@@ -449,11 +458,7 @@ export default class Tezcat extends Plugin {
 
     private searchFromModal() {
         new SearchQueryModal(this.app, async (query) => {
-            const results = await this.search.search(query, {
-                semanticWeight: this.settings.semanticWeight,
-                limit: RESULT_LIMIT,
-                excludePath: this.app.workspace.getActiveFile()?.path,
-            });
+            const results = await this.search.search(query, { ...this.searchOptions, excludePath: this.app.workspace.getActiveFile()?.path });
             if (results.length === 0) new Notice('No results found');
             else new SearchResultsModal(this.app, query, results).open();
         }).open();
@@ -541,6 +546,26 @@ class TezcatSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.contextWindowWords.toString())
                 .onChange(async (value) => {
                     this.plugin.settings.contextWindowWords = parseInt(value) || 64;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Filter detected boilerplate')
+            .setDesc('Hide passages repeated across 5 or more notes, such as templated headers and bylines, and show any other repeated passage only once.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.filterBoilerplate)
+                .onChange(async (value) => {
+                    this.plugin.settings.filterBoilerplate = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Filter common phrasing')
+            .setDesc('Hide passages made only of words that are common across your vault, such as "he said, at last." Applies once the vault has 20 or more notes.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.filterCommonPhrasing)
+                .onChange(async (value) => {
+                    this.plugin.settings.filterCommonPhrasing = value;
                     await this.plugin.saveSettings();
                 }));
 

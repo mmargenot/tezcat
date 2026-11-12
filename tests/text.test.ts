@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { processTerm, queryTerms, stripMarkdown, tokenize } from '../src/text';
+import { contentTerms, normalizedWords, processTerm, queryTerms, signature, stripMarkdown, tokenize } from '../src/text';
 
 describe('stripMarkdown', () => {
     it('keeps link text and drops link targets', () => {
@@ -44,5 +44,27 @@ describe('queryTerms', () => {
     it('caps the number of terms', () => {
         const text = Array.from({ length: 100 }, (_, i) => `word${i}`).join(' ');
         expect(queryTerms(text, 10)).toHaveLength(10);
+    });
+});
+
+describe('signature', () => {
+    it('ignores formatting, case, punctuation and numbers', () => {
+        expect(signature('_**by Edgar Allan Poe** (published 1849)_')).toBe('by edgar allan poe published #');
+        expect(signature('*by Edgar Allan Poe* *(published 1842)*')).toBe('by edgar allan poe published #');
+    });
+
+    it('keeps the words, so different text has a different signature', () => {
+        expect(signature('by Edgar Allan Poe')).not.toBe(signature('by Mary Shelley'));
+        expect(signature('*   *   *')).toBe('');
+    });
+});
+
+describe('normalizedWords / contentTerms', () => {
+    it('replaces digit runs inside and around words', () => {
+        expect(normalizedWords('Chapter 12, v2.0 in 1849')).toEqual(['chapter', '#', 'v#', '#', 'in', '#']);
+    });
+
+    it('keeps distinct content words and the number placeholder, without stopwords', () => {
+        expect([...contentTerms('The raven, the RAVEN, in 1845 and 1849')].sort()).toEqual(['#', 'raven']);
     });
 });

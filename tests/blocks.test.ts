@@ -48,6 +48,16 @@ describe('extractBlocks', () => {
         expect(extractBlocks(content, cache).map((b) => b.text)).toEqual(['Quoth the Raven, "Nevermore."']);
     });
 
+    it('records each block\'s template signature and skips blocks with no words', () => {
+        const { content, cache } = parse([
+            ['paragraph', '_**by Edgar Allan Poe** (published 1849)_'],
+            ['paragraph', '*\u00a0\u00a0\u00a0 *\u00a0\u00a0\u00a0 *\u00a0\u00a0\u00a0 *'],
+        ]);
+        const blocks = extractBlocks(content, cache);
+        expect(blocks).toHaveLength(1);
+        expect(blocks[0].sig).toBe('by edgar allan poe published #');
+    });
+
     it('returns nothing when the file has not been parsed', () => {
         expect(extractBlocks('Some text that is long enough.', null)).toEqual([]);
     });
