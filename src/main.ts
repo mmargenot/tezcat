@@ -1,4 +1,4 @@
-import { App, CachedMetadata, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, WorkspaceLeaf } from 'obsidian';
+import { App, CachedMetadata, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath } from 'obsidian';
 import { EditorView } from '@codemirror/view';
 import { TezcatView, VIEW_TYPE } from './search_view';
 import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, OllamaModelManager } from './embedding_service';
@@ -220,7 +220,9 @@ export default class Tezcat extends Plugin {
 
     private async startIndex() {
         try {
+            // Load first: file events may already be arriving, and the index takes them in order.
             await this.index.load();
+            await this.removeLegacyDatabase();
             await this.syncIndex();
             this.indexReady = true;
             this.refreshStatus();
@@ -228,6 +230,15 @@ export default class Tezcat extends Plugin {
         } catch (error) {
             logger.error('Plugin', 'Failed to load the search index', error);
             new Notice(`Tezcat could not load its index: ${errorMessage(error)}`, 10000);
+        }
+    }
+
+    /** Versions before 2.0 kept a sql.js database in the plugin folder; nothing reads it now. */
+    private async removeLegacyDatabase() {
+        const legacy = normalizePath(`${this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`}/tezcat.db`);
+        if (await this.app.vault.adapter.exists(legacy)) {
+            await this.app.vault.adapter.remove(legacy);
+            logger.info('Plugin', 'Removed the database from an earlier version');
         }
     }
 
