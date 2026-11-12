@@ -113,6 +113,9 @@ describe('EmbeddingService', () => {
         expect(await reason(response(404, { error: 'model "foo" not found, try pulling it first' }))).toBe('model-not-found'); // Ollama
         expect(await reason(response(404, { error: { message: 'The model `foo` does not exist' } }))).toBe('model-not-found'); // OpenAI
         expect(await reason(response(400, { error: 'unknown model: foo' }))).toBe('model-not-found');
+        // OpenRouter-style: names the model without the word "model"
+        expect(await reason(response(404, { error: { message: 'No endpoints found for nomic-embed-text.', code: 404 } }))).toBe('model-not-found');
+        expect(await reason(response(400, { error: { message: 'nomic-embed-text is not a valid model ID' } }))).toBe('model-not-found');
         expect(await reason(response(404, 'Not Found'))).toBe('no-endpoint');
         expect(await reason(response(400, { error: 'input too long' }))).toBe('other');
     });
