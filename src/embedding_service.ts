@@ -10,40 +10,10 @@ interface OllamaModelsResponse {
 import { Logger } from './logger';
 import { Notice, requestUrl } from 'obsidian';
 
-// Vector processing utilities
-export class VectorUtils {
-    /**
-     * L2 normalize a vector (make its magnitude = 1)
-     */
-    static l2Normalize(vector: number[]): number[] {
-        const magnitude = Math.sqrt(vector.reduce((sum, val) => sum + val * val, 0));
-        if (magnitude === 0) return vector; // Avoid division by zero
-        return vector.map(val => val / magnitude);
-    }
-
-    /**
-     * Quantize normalized float vector to int8 range [-128, 127]
-     */
-    static quantizeToInt8(normalizedVector: number[]): Int8Array {
-        return new Int8Array(normalizedVector.map(val => {
-            // Clamp to [-1, 1] range and scale to [-127, 127]
-            const clamped = Math.max(-1, Math.min(1, val));
-            return Math.round(clamped * 127);
-        }));
-    }
-
-    /**
-     * Complete processing: L2 normalize + quantize to int8
-     */
-    static processVector(vector: number[]): Int8Array {
-        const normalized = this.l2Normalize(vector);
-        return this.quantizeToInt8(normalized);
-    }
-}
-
+/** Embedding providers return raw vectors; the index normalises and quantises them. */
 export abstract class EmbeddingProvider {
-    abstract embed_one(text: string): Promise<Int8Array>;
-    abstract embed_many(texts: string[]): Promise<Int8Array[]>;
+    abstract embed_one(text: string): Promise<number[]>;
+    abstract embed_many(texts: string[]): Promise<number[][]>;
     abstract validate(): Promise<void>;
 }
 
@@ -70,7 +40,7 @@ export class OllamaEmbeddingProvider extends EmbeddingProvider {
         this.modelManager = modelManager;
     }
 
-    async embed_one(text: string): Promise<Int8Array> {
+    async embed_one(text: string): Promise<number[]> {
         const requestBody = {
             model: this.modelName,
             input: text
@@ -97,10 +67,10 @@ export class OllamaEmbeddingProvider extends EmbeddingProvider {
             throw new Error(`Ollama returned empty embedding for text: ${text.substring(0, 100)}...`);
         }
         
-        return VectorUtils.processVector(embedding);
+        return embedding;
     }
 
-    async embed_many(texts: string[]): Promise<Int8Array[]> {
+    async embed_many(texts: string[]): Promise<number[][]> {
         // Validate input data - should only be strings
         for (let j = 0; j < texts.length; j++) {
             const item = texts[j];
@@ -110,7 +80,7 @@ export class OllamaEmbeddingProvider extends EmbeddingProvider {
             }
         }
         
-        const embeddings: Int8Array[] = [];
+        const embeddings: number[][] = [];
         const batchSize = 8; // Conservative batch size to avoid quality degradation
         
         for (let i = 0; i < texts.length; i += batchSize) {
@@ -144,7 +114,7 @@ export class OllamaEmbeddingProvider extends EmbeddingProvider {
                 if (!embedding || embedding.length === 0) {
                     throw new Error('Ollama returned empty embedding in batch');
                 }
-                embeddings.push(VectorUtils.processVector(embedding));
+                embeddings.push(embedding);
             }
         }
         
@@ -211,7 +181,7 @@ export class OpenAIEmbeddingProvider extends EmbeddingProvider {
         this.logger.debug('OpenAIProvider', `API key length: ${apiKey?.length || 0}, starts with: ${apiKey?.substring(0, 7) || 'undefined'}`);
     }
 
-    async embed_one(text: string): Promise<Int8Array> {
+    async embed_one(text: string): Promise<number[]> {
         // Check token count - rough estimate: 1 token ≈ 4 characters for English text
         const estimatedTokens = Math.ceil(text.length / 4);
         const maxTokens = 8000; // Leave some buffer below the 8192 limit
@@ -247,11 +217,11 @@ export class OpenAIEmbeddingProvider extends EmbeddingProvider {
                 throw new Error('OpenAI returned invalid response format');
             }
             
-            return VectorUtils.processVector(data.data[0].embedding);
+            return data.data[0].embedding;
         });
     }
 
-    async embed_many(texts: string[]): Promise<Int8Array[]> {
+    async embed_many(texts: string[]): Promise<number[][]> {
         // Validate input data - should only be strings
         for (let j = 0; j < texts.length; j++) {
             const item = texts[j];
@@ -261,7 +231,7 @@ export class OpenAIEmbeddingProvider extends EmbeddingProvider {
             }
         }
         
-        const embeddings: Int8Array[] = [];
+        const embeddings: number[][] = [];
         const maxTokensPerRequest = 7500; // Leave buffer below 8192 limit
         
         // Process texts in dynamic batches based on token count
@@ -319,12 +289,12 @@ export class OpenAIEmbeddingProvider extends EmbeddingProvider {
                 }
                 
                 // Process each embedding in the batch
-                const batchResults: Int8Array[] = [];
+                const batchResults: number[][] = [];
                 for (const item of data.data) {
                     if (!item.embedding || item.embedding.length === 0) {
                         throw new Error('OpenAI returned empty embedding in batch');
                     }
-                    batchResults.push(VectorUtils.processVector(item.embedding));
+                    batchResults.push(item.embedding);
                 }
                 
                 return batchResults;
@@ -428,11 +398,11 @@ export class EmbeddingService {
         return this.provider;
     }
 
-    async embedText(text: string): Promise<Int8Array> {
+    async embedText(text: string): Promise<number[]> {
         return await this.provider.embed_one(text);
     }
 
-    async embedTexts(texts: string[]): Promise<Int8Array[]> {
+    async embedTexts(texts: string[]): Promise<number[][]> {
         return await this.provider.embed_many(texts);
     }
 }
