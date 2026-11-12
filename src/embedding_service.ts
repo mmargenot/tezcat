@@ -106,18 +106,36 @@ export class EmbeddingService {
 		return vectorSpace(this.config.model, this.config.prefixes.document);
 	}
 
-	/** Model ids the server offers (GET {endpoint}/models). */
-	async listModels(): Promise<string[]> {
+	/**
+	 * Model ids the server offers. Servers with a dedicated embeddings list (OpenRouter's
+	 * {endpoint}/embeddings/models) are asked for that first: their {endpoint}/models lists only
+	 * chat models. Elsewhere (Ollama, LM Studio, OpenAI, ...) that route doesn't exist and the
+	 * general {endpoint}/models list is used. `embeddingOnly` says which list it was.
+	 */
+	async listModels(): Promise<{ ids: string[]; embeddingOnly: boolean }> {
+		const dedicated = await this.getModelIds(`${this.base}/embeddings/models`).catch((e) => {
+			if (e instanceof EmbeddingError && e.reason === 'unreachable') throw e;
+			return null; // no such route on this server
+		});
+		if (dedicated) return { ids: dedicated, embeddingOnly: true };
+		const ids = await this.getModelIds(`${this.base}/models`);
+		if (!ids) throw new EmbeddingError('other', `Unexpected response from ${this.base}/models`);
+		return { ids, embeddingOnly: false };
+	}
+
+	/** GET an OpenAI-style model list ({ data: [{ id }] }); null if the response isn't one. */
+	private async getModelIds(url: string): Promise<string[] | null> {
 		let res: RequestUrlResponse;
 		try {
-			res = await this.request({ url: `${this.base}/models`, method: 'GET', headers: this.headers(), throw: false });
+			res = await this.request({ url, method: 'GET', headers: this.headers(), throw: false });
 		} catch (e) {
 			throw new EmbeddingError('unreachable', `Could not connect to ${this.base}. Is the server running? (${(e as Error).message})`);
 		}
 		if (res.status !== 200) throw this.failure(res);
-		const data = (res.json as { data?: { id?: unknown }[] } | undefined)?.data;
-		if (!Array.isArray(data)) throw new EmbeddingError('other', `Unexpected response from ${this.base}/models`);
-		return data.map((m) => m.id).filter((id): id is string => typeof id === 'string');
+		let data: unknown;
+		try { data = (res.json as { data?: unknown } | undefined)?.data; } catch { return null; }
+		if (!Array.isArray(data)) return null;
+		return data.map((m: { id?: unknown }) => m.id).filter((id): id is string => typeof id === 'string');
 	}
 
 	/** Ollama's native API sits beside its OpenAI-compatible one: the endpoint without /v1. */
