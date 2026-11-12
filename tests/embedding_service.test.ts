@@ -137,17 +137,39 @@ describe('EmbeddingService', () => {
 });
 
 describe('model lists', () => {
-    it('lists the server\'s models from {endpoint}/models', async () => {
-        const request = vi.fn(async (_req: RequestUrlParam) => response(200, { data: [{ id: 'bge-m3:latest' }, { id: 'llama3:8b' }] }));
-        const ids = await new EmbeddingService(config({ apiKey: 'k' }), log, request, noWait).listModels();
-        expect(ids).toEqual(['bge-m3:latest', 'llama3:8b']);
-        expect(request.mock.calls[0][0]).toMatchObject({ url: 'http://localhost:11434/v1/models', method: 'GET' });
-        expect(request.mock.calls[0][0].headers?.Authorization).toBe('Bearer k');
+    /** A fake server answering only the given model-list routes. */
+    const lists = (routes: Record<string, unknown>) => vi.fn(async (req: RequestUrlParam) => {
+        const path = new URL(req.url).pathname;
+        return path in routes ? response(200, routes[path]) : response(404, '404 page not found');
+    });
+
+    it('lists the server\'s models from {endpoint}/models when there is no embeddings list', async () => {
+        const request = lists({ '/v1/models': { data: [{ id: 'bge-m3:latest' }, { id: 'llama3:8b' }] } });
+        const result = await new EmbeddingService(config({ apiKey: 'k' }), log, request, noWait).listModels();
+        expect(result).toEqual({ ids: ['bge-m3:latest', 'llama3:8b'], embeddingOnly: false });
+        expect(request.mock.calls.map((c) => c[0].url)).toEqual(['http://localhost:11434/v1/embeddings/models', 'http://localhost:11434/v1/models']);
+        expect(request.mock.calls[1][0].headers?.Authorization).toBe('Bearer k');
+    });
+
+    it('prefers a dedicated embeddings list (OpenRouter)', async () => {
+        const request = lists({
+            '/api/v1/embeddings/models': { data: [{ id: 'openai/text-embedding-3-small' }, { id: 'voyage/voyage-3' }] },
+            '/api/v1/models': { data: [{ id: 'anthropic/claude-sonnet' }] },
+        });
+        const service = new EmbeddingService(config({ endpoint: 'https://openrouter.ai/api/v1' }), log, request, noWait);
+        expect(await service.listModels()).toEqual({ ids: ['openai/text-embedding-3-small', 'voyage/voyage-3'], embeddingOnly: true });
+        expect(request).toHaveBeenCalledTimes(1);
     });
 
     it('explains why the list could not be fetched', async () => {
         const down = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
         await expect(new EmbeddingService(config(), log, down, noWait).listModels()).rejects.toThrow(/Is the server running/);
+    });
+
+    it('picks out OpenAI\'s embedding models from its full model list', () => {
+        const openai = ['gpt-4o', 'gpt-4o-mini', 'o3', 'dall-e-3', 'whisper-1', 'tts-1', 'omni-moderation-latest',
+            'text-embedding-3-small', 'text-embedding-3-large', 'text-embedding-ada-002'];
+        expect(embeddingModels(openai)).toEqual(['text-embedding-3-large', 'text-embedding-3-small', 'text-embedding-ada-002']);
     });
 
     it('picks out embedding models by name, or keeps everything if none match', () => {

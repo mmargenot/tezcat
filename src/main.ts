@@ -264,8 +264,8 @@ export default class Tezcat extends Plugin {
         this.refreshStatus();
     }
 
-    /** Model ids the configured server offers. */
-    listModels(): Promise<string[]> {
+    /** Model ids the configured server offers (see EmbeddingService.listModels). */
+    listModels(): Promise<{ ids: string[]; embeddingOnly: boolean }> {
         return this.embeddingService.listModels();
     }
 
@@ -605,7 +605,7 @@ const OTHER_MODEL = '\u0000other';
 class TezcatSettingTab extends PluginSettingTab {
     plugin: Tezcat;
     /** The server's models (and whether it's Ollama), fetched once per endpoint/key and on refresh. */
-    private models: { source: string; ids: string[] | null; error: string | null; ollama: boolean } | null = null;
+    private models: { source: string; ids: string[] | null; embeddingOnly: boolean; error: string | null; ollama: boolean } | null = null;
     /** The user picked "Other…" to type a model name. */
     private typingModel = false;
     /** Whether the "Advanced" section is expanded; kept across redraws. */
@@ -731,7 +731,7 @@ class TezcatSettingTab extends PluginSettingTab {
         const settings = this.plugin.settings;
         new Setting(containerEl).setHeading().setName('Embedding provider');
         containerEl.createEl('p', {
-            text: 'Any server with an OpenAI-compatible embeddings API: Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1), llama.cpp, or a hosted service such as OpenAI (https://api.openai.com/v1).',
+            text: 'Any server with an OpenAI-compatible embeddings API: Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1), llama.cpp, or a hosted service such as OpenAI (https://api.openai.com/v1) or OpenRouter (https://openrouter.ai/api/v1). Hosted services charge for embedding.',
             cls: 'setting-item-description'
         });
 
@@ -849,7 +849,10 @@ class TezcatSettingTab extends PluginSettingTab {
         const current = this.plugin.settings.embeddingModel;
         this.loadModels();
         const ids = this.models?.ids ?? null;
-        const listed = ids ? embeddingModels(ids).filter((id) => !sameModel(id, current)) : [];
+        // A dedicated embeddings list needs no filtering by name (some embedding models' names
+        // don't say "embed"); a general list does.
+        const candidates = ids && !this.models?.embeddingOnly ? embeddingModels(ids) : ids ?? [];
+        const listed = candidates.filter((id) => !sameModel(id, current));
         const currentListed = ids?.some((id) => sameModel(id, current)) ?? false;
         const typing = this.typingModel || (ids !== null && !currentListed);
 
@@ -917,10 +920,10 @@ class TezcatSettingTab extends PluginSettingTab {
         const { embeddingEndpoint, embeddingApiKeySecret } = this.plugin.settings;
         const source = `${embeddingEndpoint}|${embeddingApiKeySecret}`;
         if (!force && this.models?.source === source) return;
-        const entry = this.models = { source, ids: null as string[] | null, error: null as string | null, ollama: false as boolean };
+        const entry = this.models = { source, ids: null as string[] | null, embeddingOnly: false as boolean, error: null as string | null, ollama: false as boolean };
         Promise.all([
             this.plugin.listModels().then(
-                (ids) => { entry.ids = ids; },
+                ({ ids, embeddingOnly }) => { entry.ids = ids; entry.embeddingOnly = embeddingOnly; },
                 (error) => { entry.ids = []; entry.error = errorMessage(error); },
             ),
             this.plugin.isOllama().then((ollama) => { entry.ollama = ollama; }),
