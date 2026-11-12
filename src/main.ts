@@ -1,7 +1,7 @@
 import { App, CachedMetadata, Component, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, SecretComponent, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath, setIcon } from 'obsidian';
 import { EditorView } from '@codemirror/view';
 import { TezcatView, VIEW_TYPE, renderResultText } from './search_view';
-import { EmbeddingError, EmbeddingService, embeddingModels, sameModel, suggestPrefixes } from './embedding_service';
+import { EmbeddingError, EmbeddingService, RECOMMENDED_OLLAMA_MODELS, embeddingModels, sameModel, suggestPrefixes } from './embedding_service';
 import { DEFAULT_SETTINGS, migrateSettings, vectorSpaceOf, type EmbeddingSettings, type SearchCadence, type TezcatSettings } from './settings';
 import { EmbeddingSpaceChanged, IndexRepository, type SourceFile, type VaultSource } from './index_repository';
 import { SearchService, type SearchResult } from './search';
@@ -267,6 +267,29 @@ export default class Tezcat extends Plugin {
     /** Model ids the configured server offers. */
     listModels(): Promise<string[]> {
         return this.embeddingService.listModels();
+    }
+
+    isOllama(): Promise<boolean> {
+        return this.embeddingService.isOllama();
+    }
+
+    /** Download models onto the Ollama server one at a time, with a progress notice. */
+    async downloadModels(models: string[]): Promise<void> {
+        const service = this.embeddingService;
+        const notice = new Notice('', 0);
+        try {
+            for (const [i, model] of models.entries()) {
+                notice.setMessage(`Tezcat: downloading ${model} (${i + 1} of ${models.length})…`);
+                await service.pullOllamaModel(model);
+            }
+            notice.setMessage(`Tezcat: downloaded ${models.join(', ')}.`);
+            window.setTimeout(() => notice.hide(), 4000);
+        } catch (error) {
+            notice.setMessage(`Tezcat: download failed: ${errorMessage(error)}`);
+            window.setTimeout(() => notice.hide(), 10000);
+        }
+        // The configured model may have been one of the missing ones.
+        if (this.fallback || this.semanticError) await this.updateSemanticSearch({ quiet: true });
     }
 
     /** Embed a short text with the current settings and report what happened. */
@@ -581,13 +604,14 @@ const OTHER_MODEL = '\u0000other';
 
 class TezcatSettingTab extends PluginSettingTab {
     plugin: Tezcat;
-    /** The server's models, fetched once per endpoint/key and on refresh. */
-    private models: { source: string; ids: string[] | null; error: string | null } | null = null;
+    /** The server's models (and whether it's Ollama), fetched once per endpoint/key and on refresh. */
+    private models: { source: string; ids: string[] | null; error: string | null; ollama: boolean } | null = null;
     /** The user picked "Other…" to type a model name. */
     private typingModel = false;
     /** Whether the "Advanced" and "Stored vectors" sections are expanded; kept across redraws. */
     private advancedOpen = false;
     private storedOpen = false;
+    private downloading = false;
 
     constructor(app: App, plugin: Tezcat) {
         super(app, plugin);
@@ -864,6 +888,27 @@ class TezcatSettingTab extends PluginSettingTab {
             textSetting('Model name', 'Any model name the server accepts, e.g. nomic-embed-text:v1.5, bge-m3, text-embedding-3-small.',
                 DEFAULT_SETTINGS.embeddingModel, current, (model) => this.chooseModel(model));
         }
+
+        // On Ollama, offer to download the recommended models that aren't installed yet.
+        const missing = this.models?.ollama && ids
+            ? RECOMMENDED_OLLAMA_MODELS.filter((m) => !ids.some((id) => sameModel(id, m.name)))
+            : [];
+        if (missing.length) {
+            new Setting(containerEl)
+                .setName('Recommended models')
+                .setDesc(`Not installed: ${missing.map((m) => `${m.name} (${m.size})`).join(', ')}. Download ${missing.length === 1 ? 'it' : 'them'} to choose from the recommended embedding models.`)
+                .addButton(button => button
+                    .setButtonText(this.downloading ? 'Downloading…' : 'Download')
+                    .setDisabled(this.downloading)
+                    .setCta()
+                    .onClick(async () => {
+                        this.downloading = true;
+                        this.display();
+                        await this.plugin.downloadModels(missing.map((m) => m.name));
+                        this.downloading = false;
+                        this.loadModels(true);
+                    }));
+        }
         return setting;
     }
 
@@ -872,11 +917,14 @@ class TezcatSettingTab extends PluginSettingTab {
         const { embeddingEndpoint, embeddingApiKeySecret } = this.plugin.settings;
         const source = `${embeddingEndpoint}|${embeddingApiKeySecret}`;
         if (!force && this.models?.source === source) return;
-        const entry = this.models = { source, ids: null as string[] | null, error: null as string | null };
-        this.plugin.listModels().then(
-            (ids) => { entry.ids = ids; },
-            (error) => { entry.ids = []; entry.error = errorMessage(error); },
-        ).finally(() => {
+        const entry = this.models = { source, ids: null as string[] | null, error: null as string | null, ollama: false as boolean };
+        Promise.all([
+            this.plugin.listModels().then(
+                (ids) => { entry.ids = ids; },
+                (error) => { entry.ids = []; entry.error = errorMessage(error); },
+            ),
+            this.plugin.isOllama().then((ollama) => { entry.ollama = ollama; }),
+        ]).finally(() => {
             if (this.models === entry) this.display();
         });
         if (force) this.display();

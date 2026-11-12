@@ -163,3 +163,29 @@ describe('model lists', () => {
         expect(new EmbeddingService(config({ model: 'bge-m3:latest' }), log).space).toBe(a.space);
     });
 });
+
+describe('Ollama model downloads', () => {
+    it('detects an Ollama server from its native API beside /v1', async () => {
+        const ollama = vi.fn(async (_req: RequestUrlParam) => response(200, { version: '0.34.1' }));
+        expect(await new EmbeddingService(config(), log, ollama, noWait).isOllama()).toBe(true);
+        expect(ollama.mock.calls[0][0].url).toBe('http://localhost:11434/api/version');
+
+        const other = vi.fn(async () => response(404, 'Not Found'));
+        expect(await new EmbeddingService(config({ endpoint: 'http://localhost:1234/v1' }), log, other, noWait).isOllama()).toBe(false);
+        const down = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
+        expect(await new EmbeddingService(config(), log, down, noWait).isOllama()).toBe(false);
+    });
+
+    it('pulls a model and waits for it to finish', async () => {
+        const request = vi.fn(async (_req: RequestUrlParam) => response(200, { status: 'success' }));
+        await new EmbeddingService(config(), log, request, noWait).pullOllamaModel('qwen3-embedding:0.6b');
+        const [req] = request.mock.calls[0];
+        expect(req.url).toBe('http://localhost:11434/api/pull');
+        expect(JSON.parse(req.body as string)).toEqual({ model: 'qwen3-embedding:0.6b', stream: false });
+    });
+
+    it('reports a failed pull', async () => {
+        const request = vi.fn(async () => response(500, { error: 'pull model manifest: file does not exist' }));
+        await expect(new EmbeddingService(config(), log, request, noWait).pullOllamaModel('nope')).rejects.toThrow(/file does not exist/);
+    });
+});
