@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, MarkdownView, Notice, Setting } from 'obsidian';
+import { Editor, ItemView, WorkspaceLeaf, MarkdownView, Notice, Setting } from 'obsidian';
 import { SearchResult } from './search_service';
 import { logger } from './logger';
 import type Tezcat from './main';
@@ -7,13 +7,9 @@ const VIEW_TYPE = 'remembrance-search';
 
 class TezcatView extends ItemView {
   private resultsContainer: HTMLElement;
-  private lastActiveMarkdownView: MarkdownView | null = null;
-  private plugin: Tezcat; // Reference to the main plugin
 
-  constructor(leaf: WorkspaceLeaf) {
+  constructor(leaf: WorkspaceLeaf, private plugin: Tezcat) {
     super(leaf);
-    // Get plugin reference from the leaf
-    this.plugin = (leaf as any).plugin || (this.app as any).plugins.plugins.tezcat;
   }
   
   getViewType() {
@@ -75,10 +71,6 @@ class TezcatView extends ItemView {
         await sleep(0);
       }
     }
-  }
-
-  setLastActiveMarkdownView(view: MarkdownView | null) {
-    this.lastActiveMarkdownView = view;
   }
 
   private showEmptyState() {
@@ -164,47 +156,28 @@ class TezcatView extends ItemView {
   }
 
   private insertText(result: SearchResult) {
-    // Suppress search for 2 seconds after button click
-    if (this.plugin && this.plugin.suppressSearchFor) {
-      this.plugin.suppressSearchFor(2000);
-    }
-    
-    // Try to get current active view first
-    let targetView = this.app.workspace.getActiveViewOfType(MarkdownView);
-    
-    // If no active view, use the last known markdown view
-    if (!targetView) {
-      targetView = this.lastActiveMarkdownView;
-    }
-    
-    if (targetView && targetView.editor) {
-      const text = result.type === 'block' ? result.text : result.noteName;
-      targetView.editor.replaceSelection(text);
-    } else {
-      logger.warn('SearchView', 'No valid markdown view found for text insertion');
-    }
+    this.insertAtCursor(result.type === 'block' ? result.text : result.noteName);
   }
 
   private insertLink(result: SearchResult) {
-    // Suppress search for 2 seconds after button click
-    if (this.plugin && this.plugin.suppressSearchFor) {
-      this.plugin.suppressSearchFor(2000);
-    }
-    
-    // Try to get current active view first
-    let targetView = this.app.workspace.getActiveViewOfType(MarkdownView);
-    
-    // If no active view, use the last known markdown view
-    if (!targetView) {
-      targetView = this.lastActiveMarkdownView;
-    }
-    
-    if (targetView && targetView.editor) {
-      const linkText = `[[${result.notePath}|${result.noteName}]]`;
-      targetView.editor.replaceSelection(linkText);
+    this.insertAtCursor(`[[${result.notePath}|${result.noteName}]]`);
+  }
+
+  /** Insert into the editor the user was last working in (the panel itself has focus now). */
+  private insertAtCursor(text: string) {
+    // Inserting moves the cursor; don't let that trigger a new search right away.
+    this.plugin.suppressSearchFor(2000);
+    const editor = this.targetEditor();
+    if (editor) {
+      editor.replaceSelection(text);
     } else {
-      logger.warn('SearchView', 'No valid markdown view found for link insertion');
+      logger.warn('SearchView', 'No markdown editor to insert into');
     }
+  }
+
+  private targetEditor(): Editor | null {
+    const leaf = this.app.workspace.getMostRecentLeaf();
+    return leaf?.view instanceof MarkdownView ? leaf.view.editor : null;
   }
 
   private openNote(result: SearchResult) {
@@ -230,7 +203,7 @@ class TezcatView extends ItemView {
           });
           
           // Highlight the block if the setting is enabled
-          if (this.plugin?.settings?.highlightBlockOnOpen && result.blockEndPosition) {
+          if (this.plugin.settings.highlightBlockOnOpen && result.blockEndPosition) {
             editor.setSelection(
               { line: result.blockStartPosition.line, ch: result.blockStartPosition.col },
               { line: result.blockEndPosition.line, ch: result.blockEndPosition.col }
@@ -244,9 +217,9 @@ class TezcatView extends ItemView {
           });
           
           // Trigger a new search based on the block content we navigated to
-          if (this.plugin && result.text) {
+          if (result.text) {
             // Use the block content itself as the search context
-            (this.plugin as any).debouncedSearch(result.text);
+            this.plugin.debouncedSearch(result.text);
           }
           
         }

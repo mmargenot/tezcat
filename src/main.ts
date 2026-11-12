@@ -88,10 +88,7 @@ export default class Tezcat extends Plugin {
         });
         
         //net new set up view
-        this.registerView(
-          VIEW_TYPE,
-          (leaf) => new TezcatView(leaf)
-        );
+        this.registerView(VIEW_TYPE, (leaf) => new TezcatView(leaf, this));
         
         // Add command to process all vault files
         this.addCommand({
@@ -260,7 +257,7 @@ export default class Tezcat extends Plugin {
 
         // "Reveal" the leaf in case it is in a collapsed sidebar
         if (leaf) {
-          workspace.revealLeaf(leaf);
+          await workspace.revealLeaf(leaf);
         }
     }
 
@@ -578,15 +575,6 @@ export default class Tezcat extends Plugin {
     }
 
     private onActiveLeafChange(leaf: WorkspaceLeaf | null) {
-        // Track the last active markdown view for the search panel
-        if (leaf?.view instanceof MarkdownView) {
-            const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-            if (leaves.length > 0 && leaves[0].view instanceof TezcatView) {
-                const searchView = leaves[0].view;
-                searchView.setLastActiveMarkdownView(leaf.view);
-            }
-        }
-
         if (!this.isSearchPanelVisible()) {
             return;
         }
@@ -721,7 +709,7 @@ export default class Tezcat extends Plugin {
         }
     }
 
-    private debouncedSearch(context: string) {
+    debouncedSearch(context: string) {
         // Check if search is currently suppressed
         if (Date.now() < this.searchSuppressedUntil) {
             logger.debug('Plugin', 'Search suppressed due to recent button interaction');
@@ -748,9 +736,17 @@ export default class Tezcat extends Plugin {
         }, debounceDelay);
     }
 
+    /**
+     * The search panel, if it is open and loaded. A deferred leaf (restored from the saved
+     * layout but never shown since startup) has no TezcatView yet and returns null.
+     */
+    private get view(): TezcatView | null {
+        const leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
+        return leaf?.view instanceof TezcatView ? leaf.view : null;
+    }
+
     private isSearchPanelVisible(): boolean {
-        const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-        return leaves.length > 0 && leaves[0].view instanceof TezcatView && leaves[0].view.containerEl.isShown();
+        return this.view?.containerEl.isShown() ?? false;
     }
 
     private async performDynamicSearch(context: string) {
@@ -788,14 +784,7 @@ export default class Tezcat extends Plugin {
     }
 
     private async updateSearchPanel(results: SearchResult[]) {
-        const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-        if (leaves.length > 0 && leaves[0].view instanceof TezcatView) {
-            const view = leaves[0].view;
-            // Update view asynchronously to avoid blocking the editor
-            window.setTimeout(async () => {
-                await view.updateSearchResults(results);
-            }, 0);
-        }
+        await this.view?.updateSearchResults(results);
     }
 
     private getCurrentNotePath(): string | null {
