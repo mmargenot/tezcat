@@ -19,6 +19,9 @@ const SEARCH_DELAY_MS: Record<SearchCadence, number> = { always: 500, sometimes:
 
 const RESULT_LIMIT = 10;
 
+/** While the embedding provider is unreachable, check it again at most this often (on search). */
+const SEMANTIC_RETRY_MS = 30_000;
+
 /** Models offered per provider; the first is the default when switching provider. */
 const EMBEDDING_MODELS: Record<EmbeddingProviderType, [id: string, label: string][]> = {
     ollama: [['nomic-embed-text:v1.5', 'Nomic Embed Text v1.5 (768d)'], ['bge-m3', 'BGE M3 (1024d)']],
@@ -80,6 +83,7 @@ export default class Tezcat extends Plugin {
     private indexProgress: { label: string; done: number; total: number } | null = null;
     /** Why semantic search is unavailable, if it is enabled but can't run. */
     private semanticError: string | null = null;
+    private semanticRetryAt = 0;
     private embedRun: AbortController | null = null;
     private embedAgain = false;
     private rebuilding = false;
@@ -288,8 +292,9 @@ export default class Tezcat extends Plugin {
     /**
      * Start or stop semantic search to match the settings: check the embedding provider, then
      * embed any blocks that need vectors in the background. Keyword search works throughout.
+     * `quiet` skips the notice when the provider is unreachable (used for automatic retries).
      */
-    async updateSemanticSearch() {
+    async updateSemanticSearch({ quiet = false }: { quiet?: boolean } = {}) {
         this.embedRun?.abort();
         this.semanticError = null;
         this.search.semanticError = null;
@@ -299,13 +304,14 @@ export default class Tezcat extends Plugin {
             return;
         }
         const service = this.embeddingService;
+        this.semanticRetryAt = Date.now() + SEMANTIC_RETRY_MS;
         try {
             await service.embeddingProvider.validate();
         } catch (error) {
-            logger.warn('Plugin', 'Embedding provider unavailable', error);
+            if (!quiet) logger.warn('Plugin', 'Embedding provider unavailable', error);
             this.semanticError = errorMessage(error);
             this.refreshStatus();
-            new Notice(`Tezcat: semantic search unavailable, using keyword search.\n${this.semanticError}`, 10000);
+            if (!quiet) new Notice(`Tezcat: semantic search unavailable, using keyword search.\n${this.semanticError}`, 10000);
             return;
         }
         if (service !== this.embeddingService) return; // settings changed while validating
@@ -428,6 +434,11 @@ export default class Tezcat extends Plugin {
 
     private async runSearch() {
         if (Date.now() < this.searchSuppressedUntil) return;
+        // The provider was unreachable when semantic search started: check again now and then,
+        // so it resumes on its own once the provider is back. This search uses keywords meanwhile.
+        if (this.semanticEnabled && this.semanticError && !this.search.embedQuery && Date.now() >= this.semanticRetryAt) {
+            void this.updateSemanticSearch({ quiet: true });
+        }
         // Results stay as they are when focus is somewhere other than a note (e.g. the panel).
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!view) return;
