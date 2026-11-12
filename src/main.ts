@@ -292,6 +292,7 @@ export default class Tezcat extends Plugin {
     async updateSemanticSearch() {
         this.embedRun?.abort();
         this.semanticError = null;
+        this.search.semanticError = null;
         this.search.embedQuery = null;
         if (!this.semanticEnabled || !this.indexReady) {
             this.refreshStatus();
@@ -438,6 +439,7 @@ export default class Tezcat extends Plugin {
             const results = await this.search.search(context, { ...this.searchOptions, excludePath: view.file?.path });
             // A newer search started while this one ran; its results win.
             if (seq === this.searchSeq) this.view?.updateSearchResults(results);
+            this.refreshStatus(); // a semantic search may have just failed or recovered
         } catch (error) {
             logger.error('Plugin', 'Search failed', error);
         }
@@ -474,6 +476,9 @@ export default class Tezcat extends Plugin {
         }
         if (!this.indexReady) return { icon: '○', text: 'Loading index', problem: false };
         if (this.semanticError) return { icon: '!', text: `Semantic search unavailable: ${this.semanticError}`, problem: true };
+        if (this.semanticEnabled && this.search.semanticError) {
+            return { icon: '!', text: `Semantic search failing, showing keyword results: ${this.search.semanticError}`, problem: true };
+        }
         if (this.semanticEnabled && !this.search.embedQuery) return { icon: '○', text: 'Starting semantic search', problem: false };
         return { icon: '✓', text: this.semanticEnabled ? 'Keyword and semantic search ready' : 'Keyword search ready', problem: false };
     }
