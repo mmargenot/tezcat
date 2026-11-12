@@ -62,8 +62,6 @@ class TezcatView extends ItemView {
 
     const pathContainerEl = itemEl.createEl('div', { cls: 'tezcat-search-result-path-container' });
     pathContainerEl.createEl('div', { cls: 'tezcat-search-result-path', text: result.path });
-    const metaEl = pathContainerEl.createDiv({ cls: 'tezcat-search-result-meta' });
-    metaEl.createEl('span', { cls: 'tezcat-search-result-score', text: result.score.toFixed(3) });
 
     const actionsEl = itemEl.createEl('div', { cls: 'tezcat-search-result-actions' });
     const button = (text: string, onClick: () => void, cls?: string) => {

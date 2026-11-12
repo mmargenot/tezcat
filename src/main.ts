@@ -776,7 +776,6 @@ class SearchResultsModal extends Modal {
             const resultEl = resultsContainer.createDiv('tezcat-search-result');
             const headerEl = resultEl.createDiv('tezcat-search-result-header');
             headerEl.createEl('strong', { text: result.noteName });
-            headerEl.createDiv().createEl('span', { text: `Score: ${result.score.toFixed(3)}`, cls: 'tezcat-search-result-score' });
             resultEl.createDiv({ cls: 'tezcat-search-result-path', text: result.path });
             resultEl.createDiv({
                 cls: 'tezcat-search-result-text',
