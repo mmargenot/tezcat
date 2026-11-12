@@ -1,14 +1,37 @@
-import { Editor, ItemView, WorkspaceLeaf, MarkdownView, Notice, Setting } from 'obsidian';
+import { App, Component, Editor, ItemView, Keymap, MarkdownRenderer, WorkspaceLeaf, MarkdownView, Notice, Setting } from 'obsidian';
 import type { SearchResult } from './search';
 import { logger } from './logger';
 import type Tezcat from './main';
 
 const VIEW_TYPE = 'remembrance-search';
 
-const PREVIEW_CHARS = 200;
+/** Embeds would pull whole notes or images into the list; show them as plain links instead. */
+const withoutEmbeds = (markdown: string) =>
+  markdown.replace(/!\[\[/g, '[[').replace(/!\[([^\]]*)\]\(([^)]*)\)/g, '[$1]($2)');
+
+/**
+ * Render a result's passage as Markdown, as it looks in the note. Long passages are clamped
+ * to a few lines by CSS rather than cut, so formatting is never broken mid-syntax.
+ */
+export function renderResultText(app: App, containerEl: HTMLElement, result: SearchResult, component: Component) {
+  const textEl = containerEl.createDiv({ cls: 'tezcat-search-result-text markdown-rendered' });
+  void MarkdownRenderer.render(app, withoutEmbeds(result.text), textEl, result.path, component);
+  // Links inside the passage open their target rather than triggering the result's own action.
+  textEl.addEventListener('click', (e) => {
+    const link = (e.target as HTMLElement).closest('a');
+    if (!link) return;
+    e.stopPropagation();
+    if (link.hasClass('internal-link')) {
+      e.preventDefault();
+      void app.workspace.openLinkText(link.getAttr('data-href') ?? link.getText(), result.path, Keymap.isModEvent(e));
+    }
+  });
+}
 
 class TezcatView extends ItemView {
   private resultsContainer!: HTMLElement;
+  /** Owns what the rendered passages create; replaced on every update so nothing accumulates. */
+  private renderScope: Component | null = null;
 
   constructor(leaf: WorkspaceLeaf, private plugin: Tezcat) {
     super(leaf);
@@ -38,6 +61,8 @@ class TezcatView extends ItemView {
   }
 
   updateSearchResults(results: SearchResult[]) {
+    if (this.renderScope) this.removeChild(this.renderScope);
+    this.renderScope = this.addChild(new Component());
     this.resultsContainer.empty();
     if (results.length === 0) {
       this.showEmptyState();
@@ -55,10 +80,7 @@ class TezcatView extends ItemView {
   private createResultItem(result: SearchResult) {
     const itemEl = this.resultsContainer.createEl('div', { cls: 'tezcat-search-result-item' });
 
-    itemEl.createEl('div', {
-      cls: 'tezcat-search-result-text',
-      text: result.text.length > PREVIEW_CHARS ? result.text.slice(0, PREVIEW_CHARS) + '…' : result.text,
-    });
+    renderResultText(this.app, itemEl, result, this.renderScope!);
 
     const pathContainerEl = itemEl.createEl('div', { cls: 'tezcat-search-result-path-container' });
     pathContainerEl.createEl('div', { cls: 'tezcat-search-result-path', text: result.path });
