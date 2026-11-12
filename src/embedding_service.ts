@@ -25,6 +25,22 @@ export function suggestPrefixes(model: string): Prefixes {
 	return KNOWN_PREFIXES.find(([re]) => re.test(model))?.[1] ?? { query: '', document: '' };
 }
 
+/** Ollama treats "name" and "name:latest" as the same model. */
+export const sameModel = (a: string, b: string) => modelKey(a) === modelKey(b);
+const modelKey = (model: string) => model.trim().replace(/:latest$/, '');
+
+/** Name patterns of common embedding model families (servers don't say which models embed). */
+const EMBEDDING_MODEL_NAME = /embed|bge|(^|[/_:-])e5-|gte|minilm|mpnet|nomic|mxbai|arctic|jina|sentence|instructor/i;
+
+/**
+ * The embedding models among a server's models, by name. Servers like Ollama list chat
+ * models too; if no name looks like an embedding model, all are returned.
+ */
+export function embeddingModels(ids: string[]): string[] {
+	const likely = ids.filter((id) => EMBEDDING_MODEL_NAME.test(id));
+	return (likely.length ? likely : ids).slice().sort((a, b) => a.localeCompare(b));
+}
+
 export interface EmbeddingConfig {
 	/** Base URL of an OpenAI-compatible API, e.g. http://localhost:11434/v1 */
 	endpoint: string;
@@ -34,6 +50,13 @@ export interface EmbeddingConfig {
 }
 
 export type EmbeddingFailure = 'unreachable' | 'unauthorized' | 'model-not-found' | 'no-endpoint' | 'other';
+
+/**
+ * Identifies a vector space: vectors are only comparable when produced by the same model with
+ * the same document prefix. (Not the endpoint: the same model served elsewhere produces the
+ * same vectors.)
+ */
+export const vectorSpace = (model: string, documentPrefix: string) => `${modelKey(model)}|${documentPrefix}`;
 
 export class EmbeddingError extends Error {
 	constructor(readonly reason: EmbeddingFailure, message: string) {
@@ -54,6 +77,7 @@ const MAX_ATTEMPTS = 3;
  */
 export class EmbeddingService {
 	private readonly url: string;
+	private readonly base: string;
 
 	constructor(
 		readonly config: EmbeddingConfig,
@@ -61,16 +85,33 @@ export class EmbeddingService {
 		private request: Request = (params) => requestUrl(params),
 		private wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
 	) {
-		this.url = `${config.endpoint.trim().replace(/\/+$/, '')}/embeddings`;
+		this.base = config.endpoint.trim().replace(/\/+$/, '');
+		this.url = `${this.base}/embeddings`;
 	}
 
-	/**
-	 * Identifies the vector space: vectors are only comparable when produced by the same
-	 * model with the same document prefix. (Not the endpoint: the same model served from a
-	 * different address produces the same vectors.)
-	 */
+	/** This configuration's vector space (see vectorSpace). */
 	get space(): string {
-		return `${this.config.model}|${this.config.prefixes.document}`;
+		return vectorSpace(this.config.model, this.config.prefixes.document);
+	}
+
+	/** Model ids the server offers (GET {endpoint}/models). */
+	async listModels(): Promise<string[]> {
+		let res: RequestUrlResponse;
+		try {
+			res = await this.request({ url: `${this.base}/models`, method: 'GET', headers: this.headers(), throw: false });
+		} catch (e) {
+			throw new EmbeddingError('unreachable', `Could not connect to ${this.base}. Is the server running? (${(e as Error).message})`);
+		}
+		if (res.status !== 200) throw this.failure(res);
+		const data = (res.json as { data?: { id?: unknown }[] } | undefined)?.data;
+		if (!Array.isArray(data)) throw new EmbeddingError('other', `Unexpected response from ${this.base}/models`);
+		return data.map((m) => m.id).filter((id): id is string => typeof id === 'string');
+	}
+
+	private headers(): Record<string, string> {
+		const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+		if (this.config.apiKey) headers.Authorization = `Bearer ${this.config.apiKey}`;
+		return headers;
 	}
 
 	async embedQuery(text: string): Promise<number[]> {
@@ -98,8 +139,7 @@ export class EmbeddingService {
 	}
 
 	private async post(input: string[]): Promise<number[][]> {
-		const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-		if (this.config.apiKey) headers.Authorization = `Bearer ${this.config.apiKey}`;
+		const headers = this.headers();
 		const body = JSON.stringify({ model: this.config.model, input });
 
 		for (let attempt = 1; ; attempt++) {
