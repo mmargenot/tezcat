@@ -364,13 +364,27 @@ export class IndexRepository {
 		});
 	}
 
-	/** Delete stored vectors of every model except the current one. */
-	clearOtherModels(): Promise<void> {
+	/** How many vectors are stored for each model with stored vectors, current model first. */
+	storedVectorCounts(): Promise<{ space: string; count: number }[]> {
+		return this.serial(async () => Promise.all(this.meta.storedSpaces.map(async (space) => ({
+			space,
+			count: await this.db.vectors('readonly', (store) => promisifyRequest(store.count(modelRange(space)))),
+		}))));
+	}
+
+	/**
+	 * Delete one model's stored vectors. For the current model, blocks then need embedding
+	 * again; for any other, switching back to it does.
+	 */
+	deleteStoredVectors(space: string): Promise<void> {
 		return this.serial(async () => {
-			const current = this.meta.embeddingSpace;
-			for (const old of this.meta.storedSpaces) if (old !== current) await this.deleteVectorsOf(old);
-			this.meta = { ...this.meta, storedSpaces: current ? [current] : [] };
-			await set('meta', this.meta, this.db.meta);
+			await this.deleteVectorsOf(space);
+			if (space === this.meta.embeddingSpace) {
+				this.vectors.clear();
+			} else {
+				this.meta = { ...this.meta, storedSpaces: this.meta.storedSpaces.filter((s) => s !== space) };
+				await set('meta', this.meta, this.db.meta);
+			}
 		});
 	}
 

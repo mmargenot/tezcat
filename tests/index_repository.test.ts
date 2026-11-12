@@ -230,18 +230,27 @@ describe('IndexRepository: vectors', () => {
         expect(repo.storedSpaces).toEqual(['model-a', 'model-c']);
     });
 
-    it('can delete other models\' vectors on request', async () => {
+    it('counts and deletes one model\'s stored vectors on request', async () => {
         const repo = await open();
         await repo.sync(vault);
         await repo.setEmbeddingSpace('model-a');
         await repo.embedMissing(vault, fakeEmbed);
         await repo.setEmbeddingSpace('model-b');
         await repo.embedMissing(vault, fakeEmbed);
-        await repo.clearOtherModels();
+        expect(await repo.storedVectorCounts()).toEqual([{ space: 'model-b', count: 5 }, { space: 'model-a', count: 5 }]);
+
+        await repo.deleteStoredVectors('model-a'); // another model: forgotten entirely
         expect(repo.storedSpaces).toEqual(['model-b']);
         expect(repo.stats.vectors).toBe(5);
         await repo.setEmbeddingSpace('model-a');
         expect(repo.stats.vectors).toBe(0);
+
+        await repo.embedMissing(vault, fakeEmbed);
+        await repo.deleteStoredVectors('model-a'); // the current model: kept, but needs embedding again
+        expect(repo.storedSpaces).toContain('model-a');
+        expect(repo.stats.vectors).toBe(0);
+        expect(repo.countMissingVectors()).toBe(5);
+        expect((await open()).stats.vectors).toBe(0);
     });
 
     it('drops vectors of blocks that changed while their model was not in use', async () => {
