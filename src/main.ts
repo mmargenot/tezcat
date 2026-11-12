@@ -1,6 +1,6 @@
-import { App, CachedMetadata, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath } from 'obsidian';
+import { App, CachedMetadata, Component, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath } from 'obsidian';
 import { EditorView } from '@codemirror/view';
-import { TezcatView, VIEW_TYPE } from './search_view';
+import { TezcatView, VIEW_TYPE, renderResultText } from './search_view';
 import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, OllamaModelManager } from './embedding_service';
 import { EmbeddingSpaceChanged, IndexRepository, type SourceFile, type VaultSource } from './index_repository';
 import { SearchService, type SearchResult } from './search';
@@ -787,12 +787,16 @@ class StatusModal extends Modal {
 }
 
 class SearchResultsModal extends Modal {
+    /** Owns what the rendered passages create; unloaded when the modal closes. */
+    private renderScope = new Component();
+
     constructor(app: App, private query: string, private results: SearchResult[]) {
         super(app);
     }
 
     onOpen() {
         const { contentEl } = this;
+        this.renderScope.load();
         new Setting(contentEl).setHeading().setName(`Search results for: "${this.query}"`);
         contentEl.createEl('p', { text: `Found ${this.results.length} matches` });
 
@@ -802,10 +806,7 @@ class SearchResultsModal extends Modal {
             const headerEl = resultEl.createDiv('tezcat-search-result-header');
             headerEl.createEl('strong', { text: result.noteName });
             resultEl.createDiv({ cls: 'tezcat-search-result-path', text: result.path });
-            resultEl.createDiv({
-                cls: 'tezcat-search-result-text',
-                text: result.text.length > 200 ? result.text.slice(0, 200) + '…' : result.text,
-            });
+            renderResultText(this.app, resultEl, result, this.renderScope);
             resultEl.onclick = () => {
                 this.close();
                 const file = this.app.vault.getFileByPath(result.path);
@@ -817,6 +818,7 @@ class SearchResultsModal extends Modal {
     }
 
     onClose() {
+        this.renderScope.unload();
         this.contentEl.empty();
     }
 }

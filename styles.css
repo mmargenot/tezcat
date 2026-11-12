@@ -140,6 +140,30 @@
     font-size: 0.9em;
     line-height: 1.4;
     margin-bottom: 8px;
+    /* Long passages are clamped rather than cut, so Markdown never breaks mid-syntax. */
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 6;
+    overflow: hidden;
+}
+
+/* Rendered passages: compact spacing, headings no larger than body text. */
+.tezcat-search-result-text > :first-child { margin-top: 0; }
+.tezcat-search-result-text > :last-child { margin-bottom: 0; }
+.tezcat-search-result-text p,
+.tezcat-search-result-text ul,
+.tezcat-search-result-text ol,
+.tezcat-search-result-text blockquote {
+    margin: 0 0 0.4em;
+}
+.tezcat-search-result-text h1,
+.tezcat-search-result-text h2,
+.tezcat-search-result-text h3,
+.tezcat-search-result-text h4,
+.tezcat-search-result-text h5,
+.tezcat-search-result-text h6 {
+    font-size: 1em;
+    margin: 0 0 0.3em;
 }
 
 .tezcat-search-result-header {
