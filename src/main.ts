@@ -40,7 +40,7 @@ const DEFAULT_SETTINGS: TezcatSettings = {
     contextWindowWords: 64, // Smaller context window for more focused search
     searchCadence: 'always',
     searchMode: 'hybrid',
-    logLevel: LogLevel.INFO,
+    logLevel: LogLevel.ERROR,
     highlightBlockOnOpen: true
 }
 
@@ -67,7 +67,7 @@ export default class Tezcat extends Plugin {
     private statusBarItem: HTMLElement | null = null; // Status bar item for system status
 
     async onload() {
-        await this.loadSettings();
+        const { firstRun } = await this.loadSettings();
         
         // Configure logger from settings
         logger.setLevel(this.settings.logLevel);
@@ -98,11 +98,20 @@ export default class Tezcat extends Plugin {
         this.app.workspace.onLayoutReady(() => {
             this.registerIndexingEvents();
             this.performValidationAndSetup();
+            // Open the panel once, on first install. After that Obsidian restores it with the
+            // saved layout, and a closed panel stays closed.
+            if (firstRun) {
+                void this.activateView();
+                void this.saveData(this.settings);
+            }
         });
         
         //net new set up view
         this.registerView(VIEW_TYPE, (leaf) => new TezcatView(leaf, this));
         
+        this.addRibbonIcon('eye', 'Open Tezcat panel', () => this.activateView());
+        this.addCommand({ id: 'open-panel', name: 'Open panel', callback: () => this.activateView() });
+
         // Add command to process all vault files
         this.addCommand({
             id: 'process-all-files',
@@ -261,7 +270,9 @@ export default class Tezcat extends Plugin {
     }
 
     async loadSettings() {
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        const saved = await this.loadData();
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+        return { firstRun: saved == null };
     }
 
     async saveSettings() {
@@ -399,13 +410,10 @@ export default class Tezcat extends Plugin {
                 await this.performAutomaticSetup();
                 // Only show "ready" status after setup completes successfully
                 this.updateStatusBar('check', 'Tezcat: System ready', 'tezcat-status-ready');
-                await this.activateView();
             } else {
                 logger.warn('Plugin', 'System validation failed, skipping automatic setup');
                 this.updateStatusBar('alert-triangle', 'Tezcat: Setup required', 'tezcat-status-error');
                 this.showValidationFailureGuidance();
-                // Still activate view so user can see guidance
-                await this.activateView();
             }
             
         } catch (error) {
@@ -413,7 +421,6 @@ export default class Tezcat extends Plugin {
             this.isSystemValid = false;
             this.updateStatusBar('x', 'Tezcat: Setup failed', 'tezcat-status-error');
             new Notice('Tezcat setup failed. Check console for details.', 10000);
-            await this.activateView(); // Show view with error state
         } finally {
             this.isOperationInProgress = false;
         }
@@ -468,10 +475,6 @@ export default class Tezcat extends Plugin {
             // Ensure FTS content exists for all notes (for hybrid search)
             logger.info('Plugin', 'Ensuring FTS content is populated...');
             await this.databaseService.ensureFTSContentForAllNotes();
-            
-            // Automatically activate the Tezcat view
-            logger.info('Plugin', 'Activating Tezcat view...');
-            await this.activateView();
             
             logger.info('Plugin', 'Automatic setup completed successfully');
         } catch (error) {
