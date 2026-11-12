@@ -554,6 +554,15 @@ export default class Tezcat extends Plugin {
 }
 
 
+/** The nearest element (itself or an ancestor) that scrolls vertically. */
+function scrollParent(el: HTMLElement | null): HTMLElement | null {
+    for (let e = el; e; e = e.parentElement) {
+        const { overflowY } = getComputedStyle(e);
+        if ((overflowY === 'auto' || overflowY === 'scroll') && e.scrollHeight > e.clientHeight) return e;
+    }
+    return null;
+}
+
 /** Dropdown value for "type a model name". */
 const OTHER_MODEL = '\u0000other';
 
@@ -569,7 +578,15 @@ class TezcatSettingTab extends PluginSettingTab {
         this.plugin = plugin;
     }
 
+    /** Redraws empty and rebuild the page; keep the user's scroll position instead of jumping to the top. */
     display(): void {
+        const scroller = scrollParent(this.containerEl);
+        const top = scroller?.scrollTop ?? 0;
+        this.render();
+        if (scroller) scroller.scrollTop = top;
+    }
+
+    private render(): void {
         const {containerEl} = this;
 
         containerEl.empty();
