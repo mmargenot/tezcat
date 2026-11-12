@@ -245,3 +245,17 @@
     width: 100%;
     font-family: var(--font-monospace);
 }
+
+/* Info icon with a tooltip, next to a setting's name */
+.tezcat-setting-info {
+    display: inline-flex;
+    vertical-align: middle;
+    margin-left: 4px;
+    color: var(--text-muted);
+    cursor: help;
+}
+
+.tezcat-setting-info svg {
+    width: 14px;
+    height: 14px;
+}

@@ -1,4 +1,4 @@
-import { App, CachedMetadata, Component, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, SecretComponent, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath, setIcon } from 'obsidian';
+import { App, CachedMetadata, Component, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, SecretComponent, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath, setIcon, setTooltip } from 'obsidian';
 import { EditorView } from '@codemirror/view';
 import { TezcatView, VIEW_TYPE, renderResultText } from './search_view';
 import { EmbeddingError, EmbeddingService, RECOMMENDED_OLLAMA_MODELS, embeddingModels, sameModel, suggestPrefixes } from './embedding_service';
@@ -783,19 +783,25 @@ class TezcatSettingTab extends PluginSettingTab {
         advanced.addEventListener('toggle', () => { this.advancedOpen = advanced.open; });
         advanced.createEl('summary', { text: 'Advanced' });
         // Prefixes are kept exactly as typed: trailing spaces and newlines are part of them.
-        const prefixSetting = (name: string, desc: string, value: string, apply: (value: string) => void) =>
-            new Setting(advanced).setName(name).setDesc(desc).addTextArea(text => {
+        // Short description; the full explanation is in a tooltip on an info icon by the name.
+        const prefixSetting = (name: string, desc: string, help: string, value: string, apply: (value: string) => void) => {
+            const setting = new Setting(advanced).setName(name).setDesc(desc).addTextArea(text => {
                 text.setValue(value);
                 text.inputEl.rows = 2;
                 text.inputEl.addEventListener('change', () => {
                     if (text.getValue() !== value) apply(text.getValue());
                 });
             });
-        prefixSetting('Query prefix',
-            'Instruction some models expect before a search query (your text around the cursor). Filled in for known models; leave as is unless your model needs a different one.',
+            const info = setting.nameEl.createSpan({ cls: 'tezcat-setting-info' });
+            setIcon(info, 'info');
+            setTooltip(info, help);
+            return setting;
+        };
+        prefixSetting('Query prefix', 'Added before your search text.',
+            'Instruction some embedding models expect before a search query (here, your text around the cursor). Filled in automatically for known models; change it only if your model needs a different one.',
             settings.queryPrefix, (queryPrefix) => this.apply({ queryPrefix }));
-        prefixSetting('Document prefix',
-            'Instruction some models expect before each passage being indexed. Changing it re-embeds every block.',
+        prefixSetting('Document prefix', 'Added before each passage. Changing it re-embeds.',
+            'Instruction some embedding models expect before each passage being indexed. Filled in automatically for known models. Changing it changes every stored vector, so all blocks are embedded again.',
             settings.documentPrefix, (documentPrefix) => this.apply({ documentPrefix }));
         this.displayStoredVectors(advanced);
     }
