@@ -784,7 +784,7 @@ class TezcatSettingTab extends PluginSettingTab {
         advanced.createEl('summary', { text: 'Advanced' });
         // Prefixes are kept exactly as typed: trailing spaces and newlines are part of them.
         // Short description; the full explanation is a hover tooltip on an info icon by the name.
-        // A native title tooltip: Obsidian's setTooltip didn't appear in the settings page.
+        // Obsidian shows its own tooltip for an element's aria-label (which screen readers read too).
         const prefixSetting = (name: string, desc: string, help: string, value: string, apply: (value: string) => void) => {
             const setting = new Setting(advanced).setName(name).setDesc(desc).addTextArea(text => {
                 text.setValue(value);
@@ -793,7 +793,7 @@ class TezcatSettingTab extends PluginSettingTab {
                     if (text.getValue() !== value) apply(text.getValue());
                 });
             });
-            const info = setting.nameEl.createSpan({ cls: 'tezcat-setting-info', attr: { title: help, tabindex: '0', role: 'img', 'aria-label': help } });
+            const info = setting.nameEl.createSpan({ cls: 'tezcat-setting-info', attr: { tabindex: '0', role: 'img', 'aria-label': help } });
             setIcon(info, 'info');
             return setting;
         };
