@@ -1,7 +1,7 @@
-import { App, CachedMetadata, Component, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, SecretComponent, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath } from 'obsidian';
+import { App, CachedMetadata, Component, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, SecretComponent, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath, setIcon } from 'obsidian';
 import { EditorView } from '@codemirror/view';
 import { TezcatView, VIEW_TYPE, renderResultText } from './search_view';
-import { EmbeddingService, suggestPrefixes } from './embedding_service';
+import { EmbeddingError, EmbeddingService, suggestPrefixes } from './embedding_service';
 import { DEFAULT_SETTINGS, migrateSettings, vectorSpaceOf, type EmbeddingSettings, type SearchCadence, type TezcatSettings } from './settings';
 import { EmbeddingSpaceChanged, IndexRepository, type SourceFile, type VaultSource } from './index_repository';
 import { SearchService, type SearchResult } from './search';
@@ -38,6 +38,10 @@ export default class Tezcat extends Plugin {
     /** Why semantic search is unavailable, if it is enabled but can't run. */
     private semanticError: string | null = null;
     private semanticRetryAt = 0;
+    /** The service search and embedding actually use: the configured one, or a fallback. */
+    private activeEmbedding: EmbeddingService | null = null;
+    /** Set while the configured model is missing and the last working model is used instead. */
+    private fallback: { configured: string; using: string } | null = null;
     private embedRun: AbortController | null = null;
     private embedAgain = false;
     private rebuilding = false;
@@ -253,6 +257,8 @@ export default class Tezcat extends Plugin {
         try {
             const { dimensions, ms } = await service.check();
             new Notice(`Connected: ${service.config.model} returns ${dimensions}-dimensional vectors (${ms} ms).`);
+            // It works now: stop using the fallback model, or start semantic search if it was down.
+            if (this.fallback || this.semanticError) await this.updateSemanticSearch();
         } catch (error) {
             new Notice(`Connection failed: ${errorMessage(error)}`, 10000);
         }
@@ -270,26 +276,71 @@ export default class Tezcat extends Plugin {
         this.semanticError = null;
         this.search.semanticError = null;
         this.search.embedQuery = null;
+        this.activeEmbedding = null;
+        this.fallback = null;
         if (!this.semanticEnabled || !this.indexReady) {
             this.refreshStatus();
             return;
         }
-        const service = this.embeddingService;
+        const configured = this.embeddingService;
+        let service = configured;
         this.semanticRetryAt = Date.now() + SEMANTIC_RETRY_MS;
         try {
-            await service.check();
+            await configured.check();
         } catch (error) {
-            if (!quiet) logger.warn('Plugin', 'Embedding provider unavailable', error);
-            this.semanticError = errorMessage(error);
-            this.refreshStatus();
-            if (!quiet) new Notice(`Tezcat: semantic search unavailable, using keyword search.\n${this.semanticError}`, 10000);
-            return;
+            const fallback = await this.workingFallback(error);
+            if (configured !== this.embeddingService) return; // settings changed meanwhile
+            if (!fallback) {
+                if (!quiet) logger.warn('Plugin', 'Embedding provider unavailable', error);
+                this.semanticError = errorMessage(error);
+                this.refreshStatus();
+                if (!quiet) new Notice(`Tezcat: semantic search unavailable, using keyword search.\n${this.semanticError}`, 10000);
+                return;
+            }
+            service = fallback;
+            this.fallback = { configured: configured.config.model, using: fallback.config.model };
+            if (!quiet) logger.warn('Plugin', `Model ${configured.config.model} not found; using ${fallback.config.model}`);
         }
-        if (service !== this.embeddingService) return; // settings changed while validating
+        if (configured !== this.embeddingService) return; // settings changed while validating
+        if (service === configured) await this.rememberWorkingModel();
         await this.index.setEmbeddingSpace(service.space);
+        this.activeEmbedding = service;
         this.search.embedQuery = (text) => service.embedQuery(text);
+        this.refreshStatus();
         void this.embedMissing();
     }
+
+    /**
+     * When the configured model isn't on the server, the last model that worked (if different
+     * and still available) — its vectors are kept, so switching to it is instant.
+     */
+    private async workingFallback(error: unknown): Promise<EmbeddingService | null> {
+        const last = this.settings.lastWorkingModel;
+        if (!(error instanceof EmbeddingError) || error.reason !== 'model-not-found') return null;
+        if (!last || last.model === this.settings.embeddingModel) return null;
+        const fallback = new EmbeddingService({
+            ...this.embeddingService.config,
+            model: last.model,
+            prefixes: { query: last.queryPrefix, document: last.documentPrefix },
+        }, logger);
+        try {
+            await fallback.check();
+            return fallback;
+        } catch {
+            return null;
+        }
+    }
+
+    private async rememberWorkingModel() {
+        const { embeddingModel: model, queryPrefix, documentPrefix } = this.settings;
+        const last = this.settings.lastWorkingModel;
+        if (last?.model === model && last.queryPrefix === queryPrefix && last.documentPrefix === documentPrefix) return;
+        this.settings.lastWorkingModel = { model, queryPrefix, documentPrefix };
+        await this.saveSettings();
+    }
+
+    /** While a fallback is in use: the configured model's name and the one used instead. */
+    get modelFallback() { return this.fallback; }
 
     /**
      * If the embedding provider was unreachable when semantic search started, check it again
@@ -297,17 +348,23 @@ export default class Tezcat extends Plugin {
      * it's back. Called on searches and edits rather than on a timer, so nothing runs while idle.
      */
     private retrySemanticSearchIfDue() {
-        if (this.semanticEnabled && this.semanticError && !this.search.embedQuery && Date.now() >= this.semanticRetryAt) {
+        if (!this.semanticEnabled || Date.now() < this.semanticRetryAt) return;
+        if (this.semanticError && !this.search.embedQuery) {
             void this.updateSemanticSearch({ quiet: true });
+        } else if (this.fallback) {
+            // Only switch over once the configured model works, so embedding with the fallback
+            // isn't interrupted by every check.
+            this.semanticRetryAt = Date.now() + SEMANTIC_RETRY_MS;
+            void this.embeddingService.check().then(() => this.updateSemanticSearch({ quiet: true }), () => {});
         }
     }
 
     /** Embed blocks that have no vector yet. One run at a time; later requests queue a re-run. */
     private async embedMissing() {
-        if (!this.search.embedQuery) return;
+        const service = this.activeEmbedding;
+        if (!service) return;
         if (this.embedRun) { this.embedAgain = true; return; }
         const run = this.embedRun = new AbortController();
-        const service = this.embeddingService;
         try {
             do {
                 this.embedAgain = false;
@@ -473,6 +530,9 @@ export default class Tezcat extends Plugin {
         if (this.semanticEnabled && this.search.semanticError) {
             return { icon: '!', text: `Semantic search failing, showing keyword results: ${this.search.semanticError}`, problem: true };
         }
+        if (this.fallback) {
+            return { icon: '!', text: `Model "${this.fallback.configured}" isn't available on the server; using ${this.fallback.using}`, problem: true };
+        }
         if (this.semanticEnabled && !this.search.embedQuery) return { icon: '○', text: 'Starting semantic search', problem: false };
         return { icon: '✓', text: this.semanticEnabled ? 'Keyword and semantic search ready' : 'Keyword search ready', problem: false };
     }
@@ -620,7 +680,7 @@ class TezcatSettingTab extends PluginSettingTab {
         textSetting('Endpoint URL', 'Base URL of the embeddings API, usually ending in /v1.', DEFAULT_SETTINGS.embeddingEndpoint,
             settings.embeddingEndpoint, (embeddingEndpoint) => this.apply({ embeddingEndpoint }));
 
-        textSetting('Model', 'Embedding model name as the server knows it, e.g. nomic-embed-text:v1.5, bge-m3, text-embedding-3-small.',
+        const modelSetting = textSetting('Model', 'Embedding model name as the server knows it, e.g. nomic-embed-text:v1.5, bge-m3, text-embedding-3-small.',
             DEFAULT_SETTINGS.embeddingModel, settings.embeddingModel, (embeddingModel) => {
                 // Follow the new model's recommended prefixes, unless the user customised them.
                 const previous = suggestPrefixes(settings.embeddingModel);
@@ -628,6 +688,14 @@ class TezcatSettingTab extends PluginSettingTab {
                 const prefixes = customised ? {} : { queryPrefix: suggestPrefixes(embeddingModel).query, documentPrefix: suggestPrefixes(embeddingModel).document };
                 this.apply({ embeddingModel, ...prefixes });
             });
+        const fallback = this.plugin.modelFallback;
+        if (fallback) {
+            const warning = modelSetting.descEl.createDiv({ cls: 'tezcat-setting-warning' });
+            setIcon(warning.createSpan({ cls: 'tezcat-setting-warning-icon' }), 'alert-triangle');
+            warning.createSpan({
+                text: `"${fallback.configured}" isn't available on this server, so Tezcat is using ${fallback.using}, the last model that worked. With Ollama, run: ollama pull ${fallback.configured}`,
+            });
+        }
 
         new Setting(containerEl)
             .setName('API key')
@@ -676,6 +744,7 @@ class TezcatSettingTab extends PluginSettingTab {
             const done = this.plugin.updateEmbeddingSettings(changes);
             this.display();
             await done;
+            this.display(); // show the outcome of checking the new settings (e.g. a model fallback)
         };
         if (this.plugin.needsReembedding(changes)) {
             new ReembedConfirmModal(this.app, run, () => this.display()).open();

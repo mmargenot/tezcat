@@ -210,3 +210,22 @@
 .tezcat-status-error {
     color: var(--text-error);
 }
+
+/* Inline warning under a setting (e.g. the configured model isn't on the server) */
+.tezcat-setting-warning {
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+    margin-top: 6px;
+    color: var(--text-warning);
+}
+
+.tezcat-setting-warning-icon {
+    flex-shrink: 0;
+    display: inline-flex;
+}
+
+.tezcat-setting-warning-icon svg {
+    width: 14px;
+    height: 14px;
+}

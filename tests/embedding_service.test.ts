@@ -94,6 +94,20 @@ describe('EmbeddingService', () => {
         await expect(fail(response(200, { data: [] }))).rejects.toBeInstanceOf(EmbeddingError);
     });
 
+    it('classifies failures, so callers can tell a missing model from a down server', async () => {
+        const reason = async (res: RequestUrlResponse | Error) => {
+            const service = new EmbeddingService(config(), log, vi.fn(async () => { if (res instanceof Error) throw res; return res; }), noWait);
+            return service.check().catch((e: EmbeddingError) => e.reason);
+        };
+        expect(await reason(new Error('ECONNREFUSED'))).toBe('unreachable');
+        expect(await reason(response(401, {}))).toBe('unauthorized');
+        expect(await reason(response(404, { error: 'model "foo" not found, try pulling it first' }))).toBe('model-not-found'); // Ollama
+        expect(await reason(response(404, { error: { message: 'The model `foo` does not exist' } }))).toBe('model-not-found'); // OpenAI
+        expect(await reason(response(400, { error: 'unknown model: foo' }))).toBe('model-not-found');
+        expect(await reason(response(404, 'Not Found'))).toBe('no-endpoint');
+        expect(await reason(response(400, { error: 'input too long' }))).toBe('other');
+    });
+
     it('does not retry when the server cannot be reached', async () => {
         const request = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
         await expect(new EmbeddingService(config(), log, request, noWait).check()).rejects.toThrow(EmbeddingError);
