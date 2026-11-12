@@ -192,16 +192,75 @@ describe('IndexRepository: vectors', () => {
         expect(fakeEmbed.mock.calls[0][0]).toEqual(['A new final stanza.']);
     });
 
-    it('drops vectors when the embedding model changes', async () => {
+    it('uses only the current model\'s vectors, and keeps the previous model\'s for switching back', async () => {
         const repo = await open();
         await repo.sync(vault);
         await repo.setEmbeddingSpace('model-a');
         await repo.embedMissing(vault, fakeEmbed);
-        await repo.setEmbeddingSpace('model-a');
+        await repo.setEmbeddingSpace('model-a'); // no-op
         expect(repo.stats.vectors).toBe(5);
+
         await repo.setEmbeddingSpace('model-b');
         expect(repo.stats.vectors).toBe(0);
-        expect((await open()).stats.vectors).toBe(0);
+        expect(repo.countMissingVectors()).toBe(5);
+        await repo.embedMissing(vault, fakeEmbed);
+
+        fakeEmbed.mockClear();
+        await repo.setEmbeddingSpace('model-a');
+        expect(repo.stats.vectors).toBe(5);
+        expect(await repo.embedMissing(vault, fakeEmbed)).toBe(0);
+        expect(fakeEmbed).not.toHaveBeenCalled();
+        expect(repo.storedSpaces).toEqual(['model-a', 'model-b']);
+
+        const reopened = await open();
+        expect(reopened.embeddingSpace).toBe('model-a');
+        expect(reopened.stats.vectors).toBe(5);
+    });
+
+    it('keeps vectors for two models at most', async () => {
+        const repo = await open();
+        await repo.sync(vault);
+        for (const model of ['model-a', 'model-b', 'model-c']) {
+            await repo.setEmbeddingSpace(model);
+            await repo.embedMissing(vault, fakeEmbed);
+        }
+        expect(repo.storedSpaces).toEqual(['model-c', 'model-b']);
+        await repo.setEmbeddingSpace('model-a'); // evicted: must be embedded again
+        expect(repo.stats.vectors).toBe(0);
+        expect(repo.storedSpaces).toEqual(['model-a', 'model-c']);
+    });
+
+    it('can delete other models\' vectors on request', async () => {
+        const repo = await open();
+        await repo.sync(vault);
+        await repo.setEmbeddingSpace('model-a');
+        await repo.embedMissing(vault, fakeEmbed);
+        await repo.setEmbeddingSpace('model-b');
+        await repo.embedMissing(vault, fakeEmbed);
+        await repo.clearOtherModels();
+        expect(repo.storedSpaces).toEqual(['model-b']);
+        expect(repo.stats.vectors).toBe(5);
+        await repo.setEmbeddingSpace('model-a');
+        expect(repo.stats.vectors).toBe(0);
+    });
+
+    it('drops vectors of blocks that changed while their model was not in use', async () => {
+        const repo = await open();
+        await repo.sync(vault);
+        await repo.setEmbeddingSpace('model-a');
+        await repo.embedMissing(vault, fakeEmbed);
+        await repo.setEmbeddingSpace('model-b');
+        vault.delete('poems/Annabel Lee.md');
+        await repo.sync(vault);
+        await repo.setEmbeddingSpace('model-a');
+        expect(repo.stats.vectors).toBe(3);
+    });
+
+    it('embeds nothing until a model is chosen', async () => {
+        const repo = await open();
+        await repo.sync(vault);
+        expect(await repo.embedMissing(vault, fakeEmbed)).toBe(0);
+        expect(fakeEmbed).not.toHaveBeenCalled();
     });
 
     it('drops vectors no block uses any more on sync', async () => {

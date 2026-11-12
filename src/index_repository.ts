@@ -1,7 +1,7 @@
 import MiniSearch from 'minisearch';
-import { clear, createStore, del, delMany, entries, get, set, setMany, type UseStore } from 'idb-keyval';
+import { clear, createStore, del, delMany, entries, get, promisifyRequest, set, setMany, type UseStore } from 'idb-keyval';
 import type { CachedMetadata } from 'obsidian';
-import { extractBlocks, type Block, type BlockRecord } from './blocks';
+import { extractBlocks, hashText, type Block, type BlockRecord } from './blocks';
 import type { Logger } from './logger';
 import { contentTerms, processTerm, queryTerms, tokenize } from './text';
 import { quantize, type QVec } from './vectors';
@@ -62,13 +62,27 @@ export interface IndexStats {
 }
 
 /** Bump when the stored format changes; older data is discarded and rebuilt. */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
+
+/** Vectors are kept for this many embedding models: the current one and the one before. */
+const KEEP_MODELS = 2;
 
 interface Meta {
 	schemaVersion: number;
-	/** Identifies the model the stored vectors came from; vectors are dropped when it changes. */
+	/** The embedding model (vector space) in use; only its vectors are loaded and searched. */
 	embeddingSpace: string | null;
+	/** Models with stored vectors, most recent first (at most KEEP_MODELS). */
+	storedSpaces: string[];
 }
+
+/** A stored vector. Keyed `${model id}|${block hash}` so one model's vectors form a key range. */
+interface StoredVector extends QVec {
+	hash: string;
+}
+
+const modelId = (space: string) => hashText(space);
+const vectorKey = (space: string, hash: string) => `${modelId(space)}|${hash}`;
+const modelRange = (space: string) => IDBKeyRange.bound(`${modelId(space)}|`, `${modelId(space)}|\uffff`);
 
 /** Which version of a file the keyword index holds, and how many blocks it indexed for it. */
 interface KeywordEntry {
@@ -129,7 +143,7 @@ export class IndexRepository {
 	private termNotes = new Map<string, number>();
 	private signatureNotes = new Map<string, number>();
 	private lastStamp = 0;
-	private meta: Meta = { schemaVersion: SCHEMA_VERSION, embeddingSpace: null };
+	private meta: Meta = { schemaVersion: SCHEMA_VERSION, embeddingSpace: null, storedSpaces: [] };
 	private chain: Promise<unknown> = Promise.resolve();
 	private readonly db: { meta: UseStore; files: UseStore; vectors: UseStore };
 
@@ -162,7 +176,7 @@ export class IndexRepository {
 				this.countNote(rec, 1);
 				this.lastStamp = Math.max(this.lastStamp, rec.indexedAt);
 			}
-			for (const [hash, vec] of await entries<string, QVec>(this.db.vectors)) this.vectors.set(hash, vec);
+			if (meta.embeddingSpace) await this.loadVectors(meta.embeddingSpace);
 
 			// File records are written as each file is indexed; the keyword index is saved in
 			// the background. Files whose record doesn't match the version in the saved keyword
@@ -219,7 +233,7 @@ export class IndexRepository {
 		});
 	}
 
-	/** Discard the whole index (including vectors). Follow with `sync` to rebuild. */
+	/** Discard the whole index, including vectors for every model. Follow with `sync` to rebuild. */
 	clear(): Promise<void> {
 		return this.serial(async () => {
 			this.files.clear();
@@ -231,6 +245,8 @@ export class IndexRepository {
 			this.keywordDirty = false;
 			this.vectors.clear();
 			await this.clearStores();
+			const current = this.meta.embeddingSpace;
+			this.meta = { ...this.meta, storedSpaces: current ? [current] : [] };
 			await set('meta', this.meta, this.db.meta);
 		});
 	}
@@ -325,17 +341,35 @@ export class IndexRepository {
 
 	get embeddingSpace(): string | null { return this.meta.embeddingSpace; }
 
+	/** Models with stored vectors, most recent (the current one) first. */
+	get storedSpaces(): readonly string[] { return this.meta.storedSpaces; }
+
 	/**
-	 * Declare which model vectors come from. Switching to a different model drops all stored
-	 * vectors, since vectors from different models can't be compared.
+	 * Switch the embedding model vectors come from and are searched against. Vectors from
+	 * different models can't be compared, so only the new model's vectors are used. Vectors
+	 * are kept for the previous model too, so switching back needs no re-embedding; older
+	 * models' vectors are deleted.
 	 */
 	setEmbeddingSpace(space: string): Promise<void> {
 		return this.serial(async () => {
 			if (space === this.meta.embeddingSpace) return;
-			this.log.info('Index', `Embedding model changed to ${space}; dropping stored vectors`);
-			this.vectors.clear();
-			await clear(this.db.vectors);
-			this.meta = { ...this.meta, embeddingSpace: space };
+			const storedSpaces = [space, ...this.meta.storedSpaces.filter((s) => s !== space)];
+			for (const old of storedSpaces.slice(KEEP_MODELS)) await this.deleteVectorsOf(old);
+			this.meta = { ...this.meta, embeddingSpace: space, storedSpaces: storedSpaces.slice(0, KEEP_MODELS) };
+			await set('meta', this.meta, this.db.meta);
+			await this.loadVectors(space);
+			// Blocks may have changed or gone while this model wasn't in use.
+			await this.dropUnusedVectors();
+			this.log.info('Index', `Embedding model is now ${space}; ${this.vectors.size} stored vectors`);
+		});
+	}
+
+	/** Delete stored vectors of every model except the current one. */
+	clearOtherModels(): Promise<void> {
+		return this.serial(async () => {
+			const current = this.meta.embeddingSpace;
+			for (const old of this.meta.storedSpaces) if (old !== current) await this.deleteVectorsOf(old);
+			this.meta = { ...this.meta, storedSpaces: current ? [current] : [] };
 			await set('meta', this.meta, this.db.meta);
 		});
 	}
@@ -358,6 +392,7 @@ export class IndexRepository {
 	): Promise<number> {
 		const { batchSize = 32, signal, onProgress } = opts;
 		const space = this.meta.embeddingSpace;
+		if (!space) return 0; // no embedding model chosen yet
 		const missing = this.missingHashes();
 		const total = missing.size;
 		let done = 0;
@@ -368,9 +403,9 @@ export class IndexRepository {
 			if (raw.length !== batch.length) throw new Error(`Expected ${batch.length} embeddings, got ${raw.length}`);
 			await this.serial(async () => {
 				if (this.meta.embeddingSpace !== space) throw new EmbeddingSpaceChanged();
-				const items: [string, QVec][] = batch.map((b, i) => [b.hash, quantize(raw[i])]);
-				for (const [hash, vec] of items) this.vectors.set(hash, vec);
-				await setMany(items, this.db.vectors);
+				const vectors = batch.map((b, i) => ({ hash: b.hash, ...quantize(raw[i]) }));
+				for (const v of vectors) this.vectors.set(v.hash, v);
+				await setMany(vectors.map((v): [string, StoredVector] => [vectorKey(space, v.hash), v]), this.db.vectors);
 			});
 			done += batch.length;
 			batch = [];
@@ -472,9 +507,20 @@ export class IndexRepository {
 	private async dropUnusedVectors() {
 		const used = new Set<string>();
 		for (const f of this.files.values()) for (const b of f.blocks) used.add(b.hash);
+		const space = this.meta.embeddingSpace;
 		const unused = [...this.vectors.keys()].filter((h) => !used.has(h));
 		for (const h of unused) this.vectors.delete(h);
-		if (unused.length) await delMany(unused, this.db.vectors);
+		if (space && unused.length) await delMany(unused.map((h) => vectorKey(space, h)), this.db.vectors);
+	}
+
+	/** Load one model's stored vectors into memory, replacing whatever was loaded. */
+	private async loadVectors(space: string) {
+		const rows = await this.db.vectors('readonly', (store) => promisifyRequest(store.getAll(modelRange(space)) as IDBRequest<StoredVector[]>));
+		this.vectors = new Map(rows.map((r) => [r.hash, { q: r.q, scale: r.scale }]));
+	}
+
+	private async deleteVectorsOf(space: string) {
+		await this.db.vectors('readwrite', (store) => promisifyRequest(store.delete(modelRange(space))));
 	}
 
 	private async saveKeywordIndex() {
