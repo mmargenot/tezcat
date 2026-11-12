@@ -19,7 +19,7 @@ const SEARCH_DELAY_MS: Record<SearchCadence, number> = { always: 500, sometimes:
 
 const RESULT_LIMIT = 10;
 
-/** While the embedding provider is unreachable, check it again at most this often (on search). */
+/** While the embedding provider is unreachable, check it again at most this often (on search or edit). */
 const SEMANTIC_RETRY_MS = 30_000;
 
 /** Models offered per provider; the first is the default when switching provider. */
@@ -320,6 +320,17 @@ export default class Tezcat extends Plugin {
         void this.embedMissing();
     }
 
+    /**
+     * If the embedding provider was unreachable when semantic search started, check it again
+     * (quietly, at most every SEMANTIC_RETRY_MS) so semantic search and embedding resume once
+     * it's back. Called on searches and edits rather than on a timer, so nothing runs while idle.
+     */
+    private retrySemanticSearchIfDue() {
+        if (this.semanticEnabled && this.semanticError && !this.search.embedQuery && Date.now() >= this.semanticRetryAt) {
+            void this.updateSemanticSearch({ quiet: true });
+        }
+    }
+
     /** Embed blocks that have no vector yet. One run at a time; later requests queue a re-run. */
     private async embedMissing() {
         if (!this.search.embedQuery) return;
@@ -383,7 +394,11 @@ export default class Tezcat extends Plugin {
             // Skip files deleted in the meantime; a renamed file is indexed under its new path.
             if (!latest || this.app.vault.getFileByPath(file.path) !== file) return;
             void this.index.indexFile({ file: toSourceFile(file), content: latest.content, cache: latest.cache })
-                .then(() => this.embedMissing());
+                .then(() => {
+                    // The edit needs embedding: a good moment to check whether the provider is back.
+                    this.retrySemanticSearchIfDue();
+                    return this.embedMissing();
+                });
         }, INDEX_DELAY_MS);
         this.pendingIndex.set(key, { timer, content, cache });
     }
@@ -434,11 +449,8 @@ export default class Tezcat extends Plugin {
 
     private async runSearch() {
         if (Date.now() < this.searchSuppressedUntil) return;
-        // The provider was unreachable when semantic search started: check again now and then,
-        // so it resumes on its own once the provider is back. This search uses keywords meanwhile.
-        if (this.semanticEnabled && this.semanticError && !this.search.embedQuery && Date.now() >= this.semanticRetryAt) {
-            void this.updateSemanticSearch({ quiet: true });
-        }
+        // This search uses keywords if semantic search is down; it may bring it back for the next.
+        this.retrySemanticSearchIfDue();
         // Results stay as they are when focus is somewhere other than a note (e.g. the panel).
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!view) return;
