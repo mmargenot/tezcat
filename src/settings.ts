@@ -1,4 +1,4 @@
-import { suggestPrefixes } from './embedding_service';
+import { suggestPrefixes, vectorSpace } from './embedding_service';
 import { LogLevel } from './logger';
 
 export type SearchCadence = 'always' | 'sometimes' | 'occasionally';
@@ -43,7 +43,7 @@ export const DEFAULT_SETTINGS: TezcatSettings = {
 export type EmbeddingSettings = Pick<TezcatSettings, 'embeddingEndpoint' | 'embeddingModel' | 'embeddingApiKeySecret' | 'queryPrefix' | 'documentPrefix'>;
 
 /** The vector space a configuration embeds into (matches EmbeddingService.space). */
-export const vectorSpaceOf = (s: Pick<TezcatSettings, 'embeddingModel' | 'documentPrefix'>) => `${s.embeddingModel}|${s.documentPrefix}`;
+export const vectorSpaceOf = (s: Pick<TezcatSettings, 'embeddingModel' | 'documentPrefix'>) => vectorSpace(s.embeddingModel, s.documentPrefix);
 
 /** Secret name used for an API key migrated from an earlier version's settings. */
 export const MIGRATED_KEY_SECRET = 'tezcat-api-key';

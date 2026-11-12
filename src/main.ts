@@ -1,7 +1,7 @@
 import { App, CachedMetadata, Component, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, SecretComponent, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath, setIcon } from 'obsidian';
 import { EditorView } from '@codemirror/view';
 import { TezcatView, VIEW_TYPE, renderResultText } from './search_view';
-import { EmbeddingError, EmbeddingService, suggestPrefixes } from './embedding_service';
+import { EmbeddingError, EmbeddingService, embeddingModels, sameModel, suggestPrefixes } from './embedding_service';
 import { DEFAULT_SETTINGS, migrateSettings, vectorSpaceOf, type EmbeddingSettings, type SearchCadence, type TezcatSettings } from './settings';
 import { EmbeddingSpaceChanged, IndexRepository, type SourceFile, type VaultSource } from './index_repository';
 import { SearchService, type SearchResult } from './search';
@@ -249,6 +249,11 @@ export default class Tezcat extends Plugin {
     async clearOtherModels() {
         await this.index.clearOtherModels();
         new Notice('Deleted stored vectors for other models.');
+    }
+
+    /** Model ids the configured server offers. */
+    listModels(): Promise<string[]> {
+        return this.embeddingService.listModels();
     }
 
     /** Embed a short text with the current settings and report what happened. */
@@ -549,8 +554,15 @@ export default class Tezcat extends Plugin {
 }
 
 
+/** Dropdown value for "type a model name". */
+const OTHER_MODEL = '\u0000other';
+
 class TezcatSettingTab extends PluginSettingTab {
     plugin: Tezcat;
+    /** The server's models, fetched once per endpoint/key and on refresh. */
+    private models: { source: string; ids: string[] | null; error: string | null } | null = null;
+    /** The user picked "Other…" to type a model name. */
+    private typingModel = false;
 
     constructor(app: App, plugin: Tezcat) {
         super(app, plugin);
@@ -680,14 +692,7 @@ class TezcatSettingTab extends PluginSettingTab {
         textSetting('Endpoint URL', 'Base URL of the embeddings API, usually ending in /v1.', DEFAULT_SETTINGS.embeddingEndpoint,
             settings.embeddingEndpoint, (embeddingEndpoint) => this.apply({ embeddingEndpoint }));
 
-        const modelSetting = textSetting('Model', 'Embedding model name as the server knows it, e.g. nomic-embed-text:v1.5, bge-m3, text-embedding-3-small.',
-            DEFAULT_SETTINGS.embeddingModel, settings.embeddingModel, (embeddingModel) => {
-                // Follow the new model's recommended prefixes, unless the user customised them.
-                const previous = suggestPrefixes(settings.embeddingModel);
-                const customised = settings.queryPrefix !== previous.query || settings.documentPrefix !== previous.document;
-                const prefixes = customised ? {} : { queryPrefix: suggestPrefixes(embeddingModel).query, documentPrefix: suggestPrefixes(embeddingModel).document };
-                this.apply({ embeddingModel, ...prefixes });
-            });
+        const modelSetting = this.displayModelSetting(containerEl, textSetting);
         const fallback = this.plugin.modelFallback;
         if (fallback) {
             const warning = modelSetting.descEl.createDiv({ cls: 'tezcat-setting-warning' });
@@ -734,6 +739,79 @@ class TezcatSettingTab extends PluginSettingTab {
                     this.display();
                 }));
         }
+    }
+
+    /**
+     * Model picker: a dropdown of the server's embedding models, plus "Other…" to type any
+     * name (also shown when the current model isn't in the server's list).
+     */
+    private displayModelSetting(containerEl: HTMLElement, textSetting: (name: string, desc: string, placeholder: string, value: string, apply: (value: string) => void) => Setting): Setting {
+        const current = this.plugin.settings.embeddingModel;
+        this.loadModels();
+        const ids = this.models?.ids ?? null;
+        const listed = ids ? embeddingModels(ids).filter((id) => !sameModel(id, current)) : [];
+        const currentListed = ids?.some((id) => sameModel(id, current)) ?? false;
+        const typing = this.typingModel || (ids !== null && !currentListed);
+
+        const desc = this.models?.error
+            ? `Couldn't get the server's model list: ${this.models.error} Choose "Other…" to type a model name.`
+            : ids === null
+                ? 'Loading the server\'s models…'
+                : ids.length === 0
+                    ? 'The server lists no models. Choose "Other…" to type a model name.'
+                    : 'Embedding models available on the server.';
+
+        const setting = new Setting(containerEl)
+            .setName('Model')
+            .setDesc(desc)
+            .addDropdown(dropdown => {
+                dropdown.addOption(current, current);
+                for (const id of listed) dropdown.addOption(id, id);
+                dropdown.addOption(OTHER_MODEL, 'Other…');
+                dropdown.setValue(this.typingModel ? OTHER_MODEL : current);
+                dropdown.onChange((value) => {
+                    this.typingModel = value === OTHER_MODEL;
+                    if (this.typingModel) this.display();
+                    else this.chooseModel(value);
+                });
+            })
+            .addExtraButton(button => button
+                .setIcon('refresh-cw')
+                .setTooltip('Refresh the list from the server')
+                .onClick(() => this.loadModels(true)));
+
+        if (typing) {
+            textSetting('Model name', 'Any model name the server accepts, e.g. nomic-embed-text:v1.5, bge-m3, text-embedding-3-small.',
+                DEFAULT_SETTINGS.embeddingModel, current, (model) => this.chooseModel(model));
+        }
+        return setting;
+    }
+
+    /** Fetch the server's model list, once per endpoint and key unless forced. */
+    private loadModels(force = false) {
+        const { embeddingEndpoint, embeddingApiKeySecret } = this.plugin.settings;
+        const source = `${embeddingEndpoint}|${embeddingApiKeySecret}`;
+        if (!force && this.models?.source === source) return;
+        const entry = this.models = { source, ids: null as string[] | null, error: null as string | null };
+        this.plugin.listModels().then(
+            (ids) => { entry.ids = ids; },
+            (error) => { entry.ids = []; entry.error = errorMessage(error); },
+        ).finally(() => {
+            if (this.models === entry) this.display();
+        });
+        if (force) this.display();
+    }
+
+    private chooseModel(embeddingModel: string) {
+        const settings = this.plugin.settings;
+        // The name field stays visible on its own if the chosen model isn't in the server's list.
+        this.typingModel = false;
+        if (!embeddingModel || embeddingModel === settings.embeddingModel) return this.display();
+        // Follow the new model's recommended prefixes, unless the user customised them.
+        const previous = suggestPrefixes(settings.embeddingModel);
+        const customised = settings.queryPrefix !== previous.query || settings.documentPrefix !== previous.document;
+        const next = suggestPrefixes(embeddingModel);
+        this.apply({ embeddingModel, ...(customised ? {} : { queryPrefix: next.query, documentPrefix: next.document }) });
     }
 
     /** Apply embedding settings now, asking first if every block would need embedding again. */

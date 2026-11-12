@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { RequestUrlParam, RequestUrlResponse } from 'obsidian';
-import { EmbeddingError, EmbeddingService, suggestPrefixes, type EmbeddingConfig } from '../src/embedding_service';
+import { EmbeddingError, EmbeddingService, embeddingModels, sameModel, suggestPrefixes, type EmbeddingConfig } from '../src/embedding_service';
 
 const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any;
 
@@ -124,5 +124,33 @@ describe('EmbeddingService', () => {
         expect(new EmbeddingService(config({ endpoint: 'http://127.0.0.1:11434/v1' }), log).space).toBe(a.space);
         expect(new EmbeddingService(config({ model: 'bge-m3' }), log).space).not.toBe(a.space);
         expect(new EmbeddingService(config({ prefixes: { query: '', document: '' } }), log).space).not.toBe(a.space);
+    });
+});
+
+describe('model lists', () => {
+    it('lists the server\'s models from {endpoint}/models', async () => {
+        const request = vi.fn(async (_req: RequestUrlParam) => response(200, { data: [{ id: 'bge-m3:latest' }, { id: 'llama3:8b' }] }));
+        const ids = await new EmbeddingService(config({ apiKey: 'k' }), log, request, noWait).listModels();
+        expect(ids).toEqual(['bge-m3:latest', 'llama3:8b']);
+        expect(request.mock.calls[0][0]).toMatchObject({ url: 'http://localhost:11434/v1/models', method: 'GET' });
+        expect(request.mock.calls[0][0].headers?.Authorization).toBe('Bearer k');
+    });
+
+    it('explains why the list could not be fetched', async () => {
+        const down = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
+        await expect(new EmbeddingService(config(), log, down, noWait).listModels()).rejects.toThrow(/Is the server running/);
+    });
+
+    it('picks out embedding models by name, or keeps everything if none match', () => {
+        expect(embeddingModels(['llama3:8b', 'nomic-embed-text:v1.5', 'bge-m3:latest', 'qwen2.5:7b', 'text-embedding-3-small', 'gpt-4o']))
+            .toEqual(['bge-m3:latest', 'nomic-embed-text:v1.5', 'text-embedding-3-small']);
+        expect(embeddingModels(['zeta', 'alpha'])).toEqual(['alpha', 'zeta']);
+    });
+
+    it('treats an Ollama ":latest" tag as the same model, including for the vector space', () => {
+        expect(sameModel('bge-m3', 'bge-m3:latest')).toBe(true);
+        expect(sameModel('bge-m3', 'bge-m3:567m')).toBe(false);
+        const a = new EmbeddingService(config({ model: 'bge-m3' }), log);
+        expect(new EmbeddingService(config({ model: 'bge-m3:latest' }), log).space).toBe(a.space);
     });
 });
