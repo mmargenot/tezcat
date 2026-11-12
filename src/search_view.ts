@@ -1,17 +1,19 @@
 import { Editor, ItemView, WorkspaceLeaf, MarkdownView, Notice, Setting } from 'obsidian';
-import { SearchResult } from './search_service';
+import type { SearchResult } from './search';
 import { logger } from './logger';
 import type Tezcat from './main';
 
 const VIEW_TYPE = 'remembrance-search';
 
+const PREVIEW_CHARS = 200;
+
 class TezcatView extends ItemView {
-  private resultsContainer: HTMLElement;
+  private resultsContainer!: HTMLElement;
 
   constructor(leaf: WorkspaceLeaf, private plugin: Tezcat) {
     super(leaf);
   }
-  
+
   getViewType() {
     return VIEW_TYPE;
   }
@@ -27,7 +29,7 @@ class TezcatView extends ItemView {
   async onOpen() {
     const container = this.containerEl.children[1];
     container.empty();
-    
+
     const header = container.createEl('div', { cls: 'tezcat-search-view-header' });
     new Setting(header).setHeading().setName('Tezcat search');
 
@@ -35,42 +37,14 @@ class TezcatView extends ItemView {
     this.showEmptyState();
   }
 
-  async onClose() {
-    // Nothing to clean up.
-  }
-
-  async updateSearchResults(results: SearchResult[]) {
+  updateSearchResults(results: SearchResult[]) {
     this.resultsContainer.empty();
-    
     if (results.length === 0) {
       this.showEmptyState();
       return;
     }
-
-    // Show results count immediately
-    const countEl = this.resultsContainer.createEl('div', { cls: 'tezcat-search-count' });
-    countEl.textContent = `${results.length} results`;
-
-    // Render results asynchronously in batches to avoid blocking the editor
-    await this.renderResultsBatched(results);
-  }
-
-  private async renderResultsBatched(results: SearchResult[]) {
-    const BATCH_SIZE = 3; // Render 3 items at a time
-    
-    for (let i = 0; i < results.length; i += BATCH_SIZE) {
-      const batch = results.slice(i, i + BATCH_SIZE);
-      
-      // Render batch synchronously
-      batch.forEach((result) => {
-        this.createResultItem(result);
-      });
-      
-      // Yield control back to the browser after each batch
-      if (i + BATCH_SIZE < results.length) {
-        await sleep(0);
-      }
-    }
+    this.resultsContainer.createEl('div', { cls: 'tezcat-search-count', text: `${results.length} results` });
+    for (const result of results) this.createResultItem(result);
   }
 
   private showEmptyState() {
@@ -81,93 +55,36 @@ class TezcatView extends ItemView {
   private createResultItem(result: SearchResult) {
     const itemEl = this.resultsContainer.createEl('div', { cls: 'tezcat-search-result-item' });
 
-    // Result content (text for blocks)
-    if (result.type === 'block') {
-      const textEl = itemEl.createEl('div', { cls: 'tezcat-search-result-text' });
-      textEl.textContent = result.text.length > 150 ? result.text.substring(0, 150) + '...' : result.text;
-    }
+    itemEl.createEl('div', {
+      cls: 'tezcat-search-result-text',
+      text: result.text.length > PREVIEW_CHARS ? result.text.slice(0, PREVIEW_CHARS) + '…' : result.text,
+    });
 
-    // Path with type and score
     const pathContainerEl = itemEl.createEl('div', { cls: 'tezcat-search-result-path-container' });
-
-    const pathEl = pathContainerEl.createEl('div', { cls: 'tezcat-search-result-path' });
-    pathEl.textContent = result.notePath;
-
+    pathContainerEl.createEl('div', { cls: 'tezcat-search-result-path', text: result.path });
     const metaEl = pathContainerEl.createDiv({ cls: 'tezcat-search-result-meta' });
-    metaEl.createEl('span', {
-      text: result.type,
-      cls: 'tezcat-search-result-type'
-    });
+    metaEl.createEl('span', { cls: 'tezcat-search-result-score', text: result.score.toFixed(3) });
 
-    metaEl.createEl('span', {
-      text: result.score.toFixed(3),
-      cls: 'tezcat-search-result-score'
-    });
-
-    // Action buttons
     const actionsEl = itemEl.createEl('div', { cls: 'tezcat-search-result-actions' });
-
-    if (result.type === 'note') {
-      // For note results: only show "Insert link" and "Open note"
-
-      // Insert link button
-      const insertLinkBtn = actionsEl.createEl('button', { text: 'Insert link' });
-      insertLinkBtn.onclick = (e) => {
+    const button = (text: string, onClick: () => void, cls?: string) => {
+      actionsEl.createEl('button', { text, cls }).onclick = (e) => {
         e.stopPropagation();
-        this.insertLink(result);
+        onClick();
       };
+    };
+    button('Insert text', () => this.insertAtCursor(result.text));
+    button('Insert link', () => this.insertLink(result));
+    button('Open', () => void this.openResult(result), 'mod-cta');
 
-      // Open note button
-      const openNoteBtn = actionsEl.createEl('button', { text: 'Open note', cls: 'mod-cta' });
-      openNoteBtn.onclick = (e) => {
-        e.stopPropagation();
-        this.openNote(result);
-      };
-
-    } else if (result.type === 'block') {
-      // For block results: show "Insert block", "Insert link", and "Open note" (goes to block location)
-
-      // Insert text button
-      const insertTextBtn = actionsEl.createEl('button', { text: 'Insert block' });
-      insertTextBtn.onclick = (e) => {
-        e.stopPropagation();
-        this.insertText(result);
-      };
-
-      // Insert link button
-      const insertLinkBtn = actionsEl.createEl('button', { text: 'Insert link' });
-      insertLinkBtn.onclick = (e) => {
-        e.stopPropagation();
-        this.insertLink(result);
-      };
-
-      // Open note button
-      const openNoteBtn = actionsEl.createEl('button', { text: 'Open note', cls: 'mod-cta' });
-      openNoteBtn.onclick = (e) => {
-        e.stopPropagation();
-        this.openBlockInNote(result);
-      };
-    }
-
-    // Hover effects are handled by CSS
-
-    // Click to copy content to clipboard (default action)
-    itemEl.onclick = () => this.copyToClipboard(result);
-  }
-
-  private insertText(result: SearchResult) {
-    this.insertAtCursor(result.type === 'block' ? result.text : result.noteName);
-  }
-
-  private insertLink(result: SearchResult) {
-    this.insertAtCursor(`[[${result.notePath}|${result.noteName}]]`);
+    // Click anywhere else on the result to copy its text
+    itemEl.onclick = () => void this.copyToClipboard(result);
   }
 
   /** Insert into the editor the user was last working in (the panel itself has focus now). */
   private insertAtCursor(text: string) {
     // Inserting moves the cursor; don't let that trigger a new search right away.
     this.plugin.suppressSearchFor(2000);
-    const editor = this.targetEditor();
+    const editor = this.targetEditor()?.editor;
     if (editor) {
       editor.replaceSelection(text);
     } else {
@@ -175,80 +92,44 @@ class TezcatView extends ItemView {
     }
   }
 
-  private targetEditor(): Editor | null {
+  /** A link in the user's configured style (wikilink or Markdown, shortest path, etc.). */
+  private insertLink(result: SearchResult) {
+    const file = this.app.vault.getFileByPath(result.path);
+    if (!file) return;
+    const sourcePath = this.targetEditor()?.file?.path ?? '';
+    this.insertAtCursor(this.app.fileManager.generateMarkdownLink(file, sourcePath));
+  }
+
+  private targetEditor(): MarkdownView | null {
     const leaf = this.app.workspace.getMostRecentLeaf();
-    return leaf?.view instanceof MarkdownView ? leaf.view.editor : null;
+    return leaf?.view instanceof MarkdownView ? leaf.view : null;
   }
 
-  private openNote(result: SearchResult) {
-    this.app.workspace.openLinkText(result.notePath, '', false);
-  }
-
-  private async openBlockInNote(result: SearchResult) {
-    // Open the note first
-    await this.app.workspace.openLinkText(result.notePath, '', false);
-    
-    // If we have block position data, navigate to the block
-    if (result.blockStartPosition) {
-      // Small delay to ensure the editor is ready
-      window.setTimeout(() => {
-        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (activeView && activeView.editor && result.blockStartPosition) {
-          const editor = activeView.editor;
-          
-          // Set cursor to the start of the block
-          editor.setCursor({
-            line: result.blockStartPosition.line,
-            ch: result.blockStartPosition.col
-          });
-          
-          // Highlight the block if the setting is enabled
-          if (this.plugin.settings.highlightBlockOnOpen && result.blockEndPosition) {
-            editor.setSelection(
-              { line: result.blockStartPosition.line, ch: result.blockStartPosition.col },
-              { line: result.blockEndPosition.line, ch: result.blockEndPosition.col }
-            );
-          }
-          
-          // Scroll the block into view
-          editor.scrollIntoView({
-            from: { line: result.blockStartPosition.line, ch: result.blockStartPosition.col },
-            to: { line: result.blockEndPosition?.line || result.blockStartPosition.line, ch: result.blockEndPosition?.col || result.blockStartPosition.col }
-          });
-          // Moving the cursor triggers a search around the block automatically.
-        }
-      }, 100);
-    }
+  /** Open the note and select (or place the cursor at) the result's text. */
+  private async openResult(result: SearchResult) {
+    const file = this.app.vault.getFileByPath(result.path);
+    if (!file) return;
+    const leaf = this.app.workspace.getLeaf(false);
+    await leaf.openFile(file);
+    if (!(leaf.view instanceof MarkdownView)) return;
+    const editor: Editor = leaf.view.editor;
+    const from = { line: result.line, ch: 0 };
+    const to = { line: result.endLine, ch: editor.getLine(result.endLine)?.length ?? 0 };
+    if (this.plugin.settings.highlightBlockOnOpen) editor.setSelection(from, to);
+    else editor.setCursor(from);
+    editor.scrollIntoView({ from, to }, true);
+    // Moving the cursor triggers a search around this text automatically.
   }
 
   private async copyToClipboard(result: SearchResult) {
     try {
-      let textToCopy: string;
-      let noticeMessage: string;
-
-      if (result.type === 'block') {
-        // For blocks: copy the block text
-        textToCopy = result.text;
-        noticeMessage = 'Block text copied to clipboard';
-      } else {
-        // For notes: copy a markdown link
-        textToCopy = `[[${result.notePath}|${result.noteName}]]`;
-        noticeMessage = 'Note link copied to clipboard';
-      }
-
-      // Copy to clipboard using the modern Clipboard API
-      await navigator.clipboard.writeText(textToCopy);
-      
-      // Show success notice
-      new Notice(noticeMessage, 2000);
-      
+      await navigator.clipboard.writeText(result.text);
+      new Notice('Text copied to clipboard', 2000);
     } catch (error) {
       logger.error('SearchView', 'Failed to copy to clipboard', error);
       new Notice('Failed to copy to clipboard', 3000);
     }
   }
-
 }
-
 
 export { TezcatView, VIEW_TYPE };
