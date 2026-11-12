@@ -649,27 +649,40 @@ export default class Tezcat extends Plugin {
             if (file.extension === 'md') this.scheduleIndexing(file, content, cache);
         }));
         this.registerEvent(this.app.vault.on('delete', (file) => {
-            if (isMarkdown(file)) void this.enqueueIndexing(() => this.handleFileDelete(file.path));
+            if (!isMarkdown(file)) return;
+            // A pending re-index would otherwise run after the delete and re-insert the note.
+            this.cancelPendingIndexing(file.path);
+            void this.enqueueIndexing(() => this.handleFileDelete(file.path));
         }));
         this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
             if (isMarkdown(file)) void this.enqueueIndexing(() => this.handleFileRename(file, oldPath));
         }));
         this.register(() => {
-            for (const { timer } of this.pendingIndex.values()) window.clearTimeout(timer);
-            this.pendingIndex.clear();
+            for (const path of [...this.pendingIndex.keys()]) this.cancelPendingIndexing(path);
         });
     }
 
     /** Index a changed file once it has stopped changing, using its latest parse. */
     private scheduleIndexing(file: TFile, content: string, cache: CachedMetadata) {
-        const pending = this.pendingIndex.get(file.path);
-        if (pending) window.clearTimeout(pending.timer);
+        // Keyed by the path at the time of the change: renaming mutates `file.path`.
+        const key = file.path;
+        this.cancelPendingIndexing(key);
         const timer = window.setTimeout(() => {
-            const latest = this.pendingIndex.get(file.path);
-            this.pendingIndex.delete(file.path);
-            if (latest) void this.enqueueIndexing(() => this.processOneFileIntoDatabase(file, latest));
+            const latest = this.pendingIndex.get(key);
+            this.pendingIndex.delete(key);
+            // Skip files deleted in the meantime. A renamed file is indexed under its new path;
+            // its rename was queued first, so the note's stored path is already updated.
+            if (!latest || this.app.vault.getAbstractFileByPath(file.path) !== file) return;
+            void this.enqueueIndexing(() => this.processOneFileIntoDatabase(file, latest));
         }, INDEX_DELAY_MS);
-        this.pendingIndex.set(file.path, { timer, content, cache });
+        this.pendingIndex.set(key, { timer, content, cache });
+    }
+
+    private cancelPendingIndexing(path: string) {
+        const pending = this.pendingIndex.get(path);
+        if (!pending) return;
+        window.clearTimeout(pending.timer);
+        this.pendingIndex.delete(path);
     }
 
     private enqueueIndexing<T>(task: () => Promise<T>): Promise<T> {
