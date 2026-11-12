@@ -237,6 +237,27 @@ export default class Tezcat extends Plugin {
 
     get indexStats() { return this.index.stats; }
 
+    /** Model names with stored vectors, the current one first. */
+    get storedModels(): string[] {
+        return this.index.storedSpaces.map((space) => space.slice(0, space.lastIndexOf('|')));
+    }
+
+    async clearOtherModels() {
+        await this.index.clearOtherModels();
+        new Notice('Deleted stored vectors for other models.');
+    }
+
+    /** Embed a short text with the current settings and report what happened. */
+    async testConnection(): Promise<void> {
+        const service = this.embeddingService;
+        try {
+            const { dimensions, ms } = await service.check();
+            new Notice(`Connected: ${service.config.model} returns ${dimensions}-dimensional vectors (${ms} ms).`);
+        } catch (error) {
+            new Notice(`Connection failed: ${errorMessage(error)}`, 10000);
+        }
+    }
+
     // ---------- semantic search ----------
 
     /**
@@ -619,6 +640,32 @@ class TezcatSettingTab extends PluginSettingTab {
             settings.queryPrefix, (queryPrefix) => this.apply({ queryPrefix }));
         textSetting('Document prefix', 'Text the model expects before a passage being indexed. Changing it re-embeds every block.', '',
             settings.documentPrefix, (documentPrefix) => this.apply({ documentPrefix }));
+
+        new Setting(containerEl)
+            .setName('Test connection')
+            .setDesc('Embed a short text with these settings and report the result.')
+            .addButton(button => button
+                .setButtonText('Test')
+                .onClick(async () => {
+                    button.setDisabled(true);
+                    await this.plugin.testConnection();
+                    button.setDisabled(false);
+                }));
+
+        const [current, ...others] = this.plugin.storedModels;
+        const stored = new Setting(containerEl)
+            .setName('Stored vectors')
+            .setDesc(current
+                ? `Kept for ${[current, ...others].join(' and ')}. Vectors for the current and previous model are kept, so switching back is instant.`
+                : 'None yet.');
+        if (others.length) {
+            stored.addButton(button => button
+                .setButtonText('Delete other models')
+                .onClick(async () => {
+                    await this.plugin.clearOtherModels();
+                    this.display();
+                }));
+        }
     }
 
     /** Apply embedding settings now, asking first if every block would need embedding again. */
@@ -725,9 +772,11 @@ class StatusModal extends Modal {
             el.createDiv({ cls: 'tezcat-validation-message', text: value });
         };
         item('Index', `${files} notes, ${blocks} blocks`);
+        const [model, ...others] = plugin.storedModels;
         item('Semantic search', plugin.semanticEnabled
-            ? `${vectors} block vectors (weight ${plugin.settings.semanticWeight})`
+            ? `${vectors} block vectors from ${model ?? plugin.settings.embeddingModel} (weight ${plugin.settings.semanticWeight})`
             : 'Off: keyword search only');
+        if (others.length) item('Also stored', `Vectors for ${others.join(', ')}`);
 
         new Setting(contentEl)
             .addButton(button => button.setButtonText('Update index').onClick(() => { this.close(); void plugin.updateIndex(); }))
