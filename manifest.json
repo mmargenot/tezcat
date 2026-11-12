@@ -3,7 +3,7 @@
 	"name": "Tezcat",
 	"version": "2.0.0",
 	"minAppVersion": "1.11.4",
-	"description": "Implements a remembrance agent using traditional and semantic search. Look into the mirror.",
+	"description": "Implements a remembrance agent using keyword and semantic search. Surface thoughts related to your current work from around your vault. Look into the mirror.",
 	"author": "Max Margenot",
 	"authorUrl": "https://github.com/mmargenot",
 	"fundingUrl": "https://coff.ee/mmargenot",
