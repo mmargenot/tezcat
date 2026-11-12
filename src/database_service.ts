@@ -3,8 +3,7 @@ import { EmbeddingService } from './embedding_service';
 import { Logger } from './logger';
 import { Block, BlockType } from './note_processor';
 import initSqlJs, { Database, SqlValue, SqlJsStatic, BindParams } from 'sql.js';
-import sqlWasmPath from '../node_modules/sql.js/dist/sql-wasm.wasm';
-const sqlWasm = sqlWasmPath;
+import sqlWasm from '../node_modules/sql.js/dist/sql-wasm.wasm';
 
 /** Tables from earlier versions that nothing uses any more (token chunks and the LSH index). */
 const OBSOLETE_TABLES = ['lsh_buckets', 'lsh_vector_buckets', 'lsh_hash_functions', 'lsh_configs', 'chunks'];
@@ -216,11 +215,10 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         if (!this.db) return;
         
         const data = this.db.export();
-        const buffer = Buffer.from(data);
         
         const adapter = this.plugin.app.vault.adapter;
         const dbPath = `${this.plugin.app.vault.configDir}/plugins/tezcat/tezcat.db`;
-        await adapter.writeBinary(dbPath, buffer);
+        await adapter.writeBinary(dbPath, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer);
     }
 
     async load(): Promise<void> {

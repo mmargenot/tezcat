@@ -1,6 +1,6 @@
 import esbuild from "esbuild";
 import process from "process";
-import builtins from "builtin-modules";
+import { builtinModules } from "node:module";
 
 const banner =
 `/*
@@ -31,7 +31,7 @@ const context = await esbuild.context({
 		"@lezer/common",
 		"@lezer/highlight",
 		"@lezer/lr",
-		...builtins],
+		...builtinModules],
 	loader: {
 		// Disable default WASM loader to let our plugin handle it
 	},
@@ -39,7 +39,7 @@ const context = await esbuild.context({
 		{
 			name: 'wasm-plugin',
 			setup(build) {
-				// Embed WASM files as base64 strings
+				// Embed WASM files as base64 strings, exported as an ArrayBuffer
 				build.onLoad({ filter: /\.wasm$/ }, async (args) => {
 					const fs = await import('fs');
 					const wasmBuffer = await fs.promises.readFile(args.path);
@@ -47,8 +47,8 @@ const context = await esbuild.context({
 					return {
 						contents: `
 							const wasmBase64 = "${base64}";
-							const wasmBuffer = Uint8Array.from(atob(wasmBase64), c => c.charCodeAt(0));
-							export default wasmBuffer;
+							const wasmBytes = Uint8Array.from(atob(wasmBase64), c => c.charCodeAt(0));
+							export default wasmBytes.buffer;
 						`,
 						loader: 'js'
 					};
