@@ -1,15 +1,13 @@
-import { App, CachedMetadata, Component, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath } from 'obsidian';
+import { App, CachedMetadata, Component, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, SecretComponent, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath } from 'obsidian';
 import { EditorView } from '@codemirror/view';
 import { TezcatView, VIEW_TYPE, renderResultText } from './search_view';
-import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, OllamaModelManager } from './embedding_service';
+import { EmbeddingService, suggestPrefixes } from './embedding_service';
+import { DEFAULT_SETTINGS, migrateSettings, vectorSpaceOf, type EmbeddingSettings, type SearchCadence, type TezcatSettings } from './settings';
 import { EmbeddingSpaceChanged, IndexRepository, type SourceFile, type VaultSource } from './index_repository';
 import { SearchService, type SearchResult } from './search';
 import { logger, LogLevel } from './logger';
 import { cursorContext } from './context';
 
-
-type EmbeddingProviderType = 'openai' | 'ollama';
-type SearchCadence = 'always' | 'sometimes' | 'occasionally';
 
 /** Wait this long after a file's last change before re-indexing it (Obsidian saves while you type). */
 const INDEX_DELAY_MS = 2000;
@@ -21,50 +19,6 @@ const RESULT_LIMIT = 10;
 
 /** While the embedding provider is unreachable, check it again at most this often (on search or edit). */
 const SEMANTIC_RETRY_MS = 30_000;
-
-/** Models offered per provider; the first is the default when switching provider. */
-const EMBEDDING_MODELS: Record<EmbeddingProviderType, [id: string, label: string][]> = {
-    ollama: [['nomic-embed-text:v1.5', 'Nomic Embed Text v1.5 (768d)'], ['bge-m3', 'BGE M3 (1024d)']],
-    openai: [['text-embedding-3-small', 'Text Embedding 3 Small (1536d)'], ['text-embedding-3-large', 'Text Embedding 3 Large (3072d)']],
-};
-
-interface TezcatSettings {
-    /** 0 = keyword search only; above 0 mixes in semantic matches; 1 = semantic only. */
-    semanticWeight: number;
-    embeddingProvider: EmbeddingProviderType;
-    embeddingModel: string;
-    openaiApiKey: string;
-    ollamaBaseUrl: string;
-    contextWindowWords: number;
-    searchCadence: SearchCadence;
-    logLevel: LogLevel;
-    highlightBlockOnOpen: boolean;
-    filterBoilerplate: boolean;
-    filterCommonPhrasing: boolean;
-}
-
-const DEFAULT_SETTINGS: TezcatSettings = {
-    semanticWeight: 0,
-    embeddingProvider: 'ollama',
-    embeddingModel: 'nomic-embed-text:v1.5',
-    openaiApiKey: '',
-    ollamaBaseUrl: 'http://localhost:11434',
-    contextWindowWords: 64, // Smaller context window for more focused search
-    searchCadence: 'always',
-    logLevel: LogLevel.ERROR,
-    highlightBlockOnOpen: true,
-    filterBoilerplate: true,
-    filterCommonPhrasing: true,
-}
-
-type EmbeddingSettings = Pick<TezcatSettings, 'embeddingProvider' | 'embeddingModel' | 'openaiApiKey' | 'ollamaBaseUrl'>;
-
-const pickEmbeddingSettings = (s: TezcatSettings): EmbeddingSettings => ({
-    embeddingProvider: s.embeddingProvider,
-    embeddingModel: s.embeddingModel,
-    openaiApiKey: s.openaiApiKey,
-    ollamaBaseUrl: s.ollamaBaseUrl,
-});
 
 const isMarkdown = (file: TAbstractFile): file is TFile => file instanceof TFile && file.extension === 'md';
 
@@ -160,7 +114,9 @@ export default class Tezcat extends Plugin {
 
     async loadSettings() {
         const saved = await this.loadData();
+        const migrated = saved ? migrateSettings(saved, (name, key) => this.app.secretStorage.setSecret(name, key)) : false;
         this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+        if (migrated) await this.saveData(this.settings);
         return { firstRun: saved == null };
     }
 
@@ -170,18 +126,21 @@ export default class Tezcat extends Plugin {
         logger.setLevel(this.settings.logLevel);
     }
 
-    /** Vectors from a different provider or model can't be compared, so every block is re-embedded. */
-    changesEmbeddingModel(changes: EmbeddingSettings): boolean {
-        return changes.embeddingProvider !== this.settings.embeddingProvider
-            || changes.embeddingModel !== this.settings.embeddingModel;
+    /**
+     * Whether applying these changes means embedding every block again: they switch to a
+     * different model (or document prefix) whose vectors aren't stored. Vectors from different
+     * models can't be compared; the previous model's are kept, so switching back is free.
+     */
+    needsReembedding(changes: Partial<EmbeddingSettings>): boolean {
+        const space = vectorSpaceOf({ ...this.settings, ...changes });
+        return this.semanticEnabled && space !== vectorSpaceOf(this.settings) && !this.index.storedSpaces.includes(space);
     }
 
-    /** Save new embedding settings and restart semantic search with them. */
-    async updateEmbeddingSettings(changes: EmbeddingSettings): Promise<void> {
+    /** Apply new embedding settings and restart semantic search with them. */
+    async updateEmbeddingSettings(changes: Partial<EmbeddingSettings>): Promise<void> {
         Object.assign(this.settings, changes);
         await this.saveSettings();
         this.createEmbeddingService();
-        new Notice('Settings saved.');
         await this.updateSemanticSearch();
     }
 
@@ -196,22 +155,13 @@ export default class Tezcat extends Plugin {
     get semanticEnabled() { return this.settings.semanticWeight > 0; }
 
     private createEmbeddingService(): void {
-        if (this.settings.embeddingProvider === 'ollama') {
-            const modelManager = new OllamaModelManager(this.settings.ollamaBaseUrl, logger);
-            const provider = new OllamaEmbeddingProvider(this.settings.ollamaBaseUrl, this.settings.embeddingModel, logger);
-            provider.setModelManager(modelManager);
-            this.embeddingService = new EmbeddingService(provider, logger);
-        } else {
-            this.embeddingService = new EmbeddingService(
-                new OpenAIEmbeddingProvider(this.settings.openaiApiKey, this.settings.embeddingModel, 'https://api.openai.com', logger),
-                logger
-            );
-        }
-    }
-
-    /** Identifies the vector space of the configured model. */
-    private get embeddingSpace() {
-        return `${this.settings.embeddingProvider}:${this.settings.embeddingModel}`;
+        const { embeddingEndpoint, embeddingModel, embeddingApiKeySecret, queryPrefix, documentPrefix } = this.settings;
+        this.embeddingService = new EmbeddingService({
+            endpoint: embeddingEndpoint,
+            model: embeddingModel,
+            apiKey: embeddingApiKeySecret ? this.app.secretStorage.getSecret(embeddingApiKeySecret) : null,
+            prefixes: { query: queryPrefix, document: documentPrefix },
+        }, logger);
     }
 
     // ---------- index ----------
@@ -306,7 +256,7 @@ export default class Tezcat extends Plugin {
         const service = this.embeddingService;
         this.semanticRetryAt = Date.now() + SEMANTIC_RETRY_MS;
         try {
-            await service.embeddingProvider.validate();
+            await service.check();
         } catch (error) {
             if (!quiet) logger.warn('Plugin', 'Embedding provider unavailable', error);
             this.semanticError = errorMessage(error);
@@ -315,8 +265,8 @@ export default class Tezcat extends Plugin {
             return;
         }
         if (service !== this.embeddingService) return; // settings changed while validating
-        await this.index.setEmbeddingSpace(this.embeddingSpace);
-        this.search.embedQuery = (text) => service.embedText(text);
+        await this.index.setEmbeddingSpace(service.space);
+        this.search.embedQuery = (text) => service.embedQuery(text);
         void this.embedMissing();
     }
 
@@ -340,7 +290,7 @@ export default class Tezcat extends Plugin {
         try {
             do {
                 this.embedAgain = false;
-                await this.index.embedMissing(this.vault, (texts) => service.embedTexts(texts), {
+                await this.index.embedMissing(this.vault, (texts) => service.embedDocuments(texts), {
                     signal: run.signal,
                     onProgress: (done, total) => {
                         this.indexProgress = done < total ? { label: 'Embedding', done, total } : null;
@@ -520,22 +470,16 @@ export default class Tezcat extends Plugin {
 
 class TezcatSettingTab extends PluginSettingTab {
     plugin: Tezcat;
-    /** Unsaved embedding settings; applied together with "Save changes". */
-    private pending: EmbeddingSettings;
-    private dirty = false;
 
     constructor(app: App, plugin: Tezcat) {
         super(app, plugin);
         this.plugin = plugin;
-        this.pending = pickEmbeddingSettings(plugin.settings);
     }
 
     display(): void {
         const {containerEl} = this;
 
         containerEl.empty();
-        if (!this.dirty) this.pending = pickEmbeddingSettings(this.plugin.settings);
-        const markDirty = () => { this.dirty = true; this.display(); };
 
         new Setting(containerEl).setHeading().setName('Search');
 
@@ -607,7 +551,7 @@ class TezcatSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        if (this.plugin.semanticEnabled) this.displayEmbeddingSettings(containerEl, markDirty);
+        if (this.plugin.semanticEnabled) this.displayEmbeddingSettings(containerEl);
 
         new Setting(containerEl).setHeading().setName('Maintenance');
 
@@ -634,90 +578,70 @@ class TezcatSettingTab extends PluginSettingTab {
                 }));
     }
 
-    private displayEmbeddingSettings(containerEl: HTMLElement, markDirty: () => void) {
+    private displayEmbeddingSettings(containerEl: HTMLElement) {
+        const settings = this.plugin.settings;
         new Setting(containerEl).setHeading().setName('Embedding provider');
         containerEl.createEl('p', {
-            text: 'Changing the provider or model re-embeds every block.',
+            text: 'Any server with an OpenAI-compatible embeddings API: Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1), llama.cpp, or a hosted service such as OpenAI (https://api.openai.com/v1).',
             cls: 'setting-item-description'
         });
 
-        new Setting(containerEl)
-            .setName('Embedding provider')
-            .setDesc('Choose the provider for generating embeddings')
-            .addDropdown(dropdown => dropdown
-                .addOption('ollama', 'Ollama')
-                .addOption('openai', 'OpenAI')
-                .setValue(this.pending.embeddingProvider)
-                .onChange((value: EmbeddingProviderType) => {
-                    this.pending.embeddingProvider = value;
-                    // The previous provider's model isn't available here; start from this one's default.
-                    this.pending.embeddingModel = EMBEDDING_MODELS[value][0][0];
-                    markDirty();
-                }));
-
-        new Setting(containerEl)
-            .setName('Embedding model')
-            .setDesc('The model to use for generating embeddings')
-            .addDropdown(dropdown => {
-                for (const [id, label] of EMBEDDING_MODELS[this.pending.embeddingProvider]) dropdown.addOption(id, label);
-                dropdown
-                    .setValue(this.pending.embeddingModel)
-                    .onChange((value) => {
-                        this.pending.embeddingModel = value;
-                        markDirty();
-                    });
-            });
-
-        // Text fields update on every keystroke but only redraw (showing Save) on blur, so
-        // typing doesn't lose focus.
-        const textSetting = (key: 'openaiApiKey' | 'ollamaBaseUrl', name: string, desc: string, placeholder: string) =>
+        // Text settings apply when the field is committed (Enter or leaving it), not per keystroke.
+        const textSetting = (name: string, desc: string, placeholder: string, value: string, apply: (value: string) => void) =>
             new Setting(containerEl).setName(name).setDesc(desc).addText(text => {
-                text.setPlaceholder(placeholder)
-                    .setValue(this.pending[key])
-                    .onChange((value) => { this.pending[key] = value; });
-                text.inputEl.addEventListener('blur', () => {
-                    if (this.pending[key] !== this.plugin.settings[key]) markDirty();
+                text.setPlaceholder(placeholder).setValue(value);
+                text.inputEl.addEventListener('change', () => {
+                    const next = text.getValue().trim();
+                    if (next !== value) apply(next);
                 });
             });
 
-        if (this.pending.embeddingProvider === 'openai') {
-            textSetting('openaiApiKey', 'OpenAI API key', 'Your OpenAI API key for embedding generation', 'sk-...');
-        } else {
-            textSetting('ollamaBaseUrl', 'Ollama base URL', 'The base URL for your Ollama server', 'http://localhost:11434');
-        }
+        textSetting('Endpoint URL', 'Base URL of the embeddings API, usually ending in /v1.', DEFAULT_SETTINGS.embeddingEndpoint,
+            settings.embeddingEndpoint, (embeddingEndpoint) => this.apply({ embeddingEndpoint }));
 
-        if (this.dirty) {
-            new Setting(containerEl)
-                .addButton(button => button
-                    .setButtonText('Save changes')
-                    .setCta()
-                    .onClick(() => this.saveEmbeddingSettings()))
-                .addButton(button => button
-                    .setButtonText('Cancel')
-                    .onClick(() => { this.dirty = false; this.display(); }));
-        }
+        textSetting('Model', 'Embedding model name as the server knows it, e.g. nomic-embed-text:v1.5, bge-m3, text-embedding-3-small.',
+            DEFAULT_SETTINGS.embeddingModel, settings.embeddingModel, (embeddingModel) => {
+                // Follow the new model's recommended prefixes, unless the user customised them.
+                const previous = suggestPrefixes(settings.embeddingModel);
+                const customised = settings.queryPrefix !== previous.query || settings.documentPrefix !== previous.document;
+                const prefixes = customised ? {} : { queryPrefix: suggestPrefixes(embeddingModel).query, documentPrefix: suggestPrefixes(embeddingModel).document };
+                this.apply({ embeddingModel, ...prefixes });
+            });
+
+        new Setting(containerEl)
+            .setName('API key')
+            .setDesc('Only needed for hosted services. Kept in Obsidian\'s secret storage, not in the plugin\'s settings file.')
+            .addComponent(el => new SecretComponent(this.app, el)
+                .setValue(settings.embeddingApiKeySecret)
+                .onChange((secret) => this.apply({ embeddingApiKeySecret: secret ?? '' })));
+
+        textSetting('Query prefix', 'Text the model expects before a search query. Filled in automatically for known models.', '',
+            settings.queryPrefix, (queryPrefix) => this.apply({ queryPrefix }));
+        textSetting('Document prefix', 'Text the model expects before a passage being indexed. Changing it re-embeds every block.', '',
+            settings.documentPrefix, (documentPrefix) => this.apply({ documentPrefix }));
     }
 
-    private saveEmbeddingSettings() {
-        const changes = { ...this.pending };
-        const apply = async () => {
-            // updateEmbeddingSettings applies the new values before its first await, so the
-            // redraw shows them while the provider is checked and blocks are re-embedded.
+    /** Apply embedding settings now, asking first if every block would need embedding again. */
+    private apply(changes: Partial<EmbeddingSettings>) {
+        const run = async () => {
+            // updateEmbeddingSettings applies the values before its first await, so the redraw
+            // shows them while the provider is checked and blocks are embedded.
             const done = this.plugin.updateEmbeddingSettings(changes);
-            this.dirty = false;
             this.display();
             await done;
         };
-        if (this.plugin.changesEmbeddingModel(changes)) {
-            new ReembedConfirmModal(this.app, apply).open();
+        if (this.plugin.needsReembedding(changes)) {
+            new ReembedConfirmModal(this.app, run, () => this.display()).open();
         } else {
-            void apply();
+            void run();
         }
     }
 }
 
 class ReembedConfirmModal extends Modal {
-    constructor(app: App, private onConfirm: () => void) {
+    private confirmed = false;
+
+    constructor(app: App, private onConfirm: () => void, private onCancel: () => void) {
         super(app);
     }
 
@@ -725,13 +649,13 @@ class ReembedConfirmModal extends Modal {
         const { contentEl } = this;
         new Setting(contentEl).setHeading().setName('Re-embed all notes?');
         contentEl.createEl('p', {
-            text: 'Vectors from different models can\'t be compared, so every block will be embedded again with the new model. This may take a while for a large vault; keyword search keeps working meanwhile.'
+            text: 'Vectors from different models can\'t be compared, so every block will be embedded with the new model. This may take a while for a large vault; keyword search keeps working meanwhile. Vectors for the previous model are kept, so switching back is instant.'
         });
         new Setting(contentEl)
             .addButton(button => button
-                .setButtonText('Save and re-embed')
+                .setButtonText('Switch and re-embed')
                 .setCta()
-                .onClick(() => { this.close(); this.onConfirm(); }))
+                .onClick(() => { this.confirmed = true; this.close(); this.onConfirm(); }))
             .addButton(button => button
                 .setButtonText('Cancel')
                 .onClick(() => this.close()));
@@ -739,6 +663,7 @@ class ReembedConfirmModal extends Modal {
 
     onClose() {
         this.contentEl.empty();
+        if (!this.confirmed) this.onCancel(); // also on Escape: put the field back
     }
 }
 
