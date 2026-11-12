@@ -1,7 +1,7 @@
 {
 	"name": "tezcat",
-	"version": "1.1.0",
-	"description": "Implements a remembrance agent for Obsidian. Look into the mirror.",
+	"version": "2.0.0",
+	"description": "Surface related passages from your vault as you write. Keyword search by default, with optional semantic search using a local or hosted embedding model.",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
