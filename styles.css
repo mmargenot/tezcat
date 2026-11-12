@@ -229,3 +229,19 @@
     width: 14px;
     height: 14px;
 }
+
+/* Collapsible "Advanced" group in settings */
+.tezcat-settings-advanced {
+    margin-top: 8px;
+}
+
+.tezcat-settings-advanced > summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    padding: 6px 0;
+}
+
+.tezcat-settings-advanced textarea {
+    width: 100%;
+    font-family: var(--font-monospace);
+}

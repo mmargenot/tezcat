@@ -15,6 +15,8 @@ export interface Prefixes {
 const KNOWN_PREFIXES: [RegExp, Prefixes][] = [
 	[/nomic-embed/i, { query: 'search_query: ', document: 'search_document: ' }],
 	[/embeddinggemma/i, { query: 'task: search result | query: ', document: 'title: none | text: ' }],
+	// Qwen3-Embedding: an instruction on queries only (format from the model card).
+	[/qwen3-embedding/i, { query: 'Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:', document: '' }],
 	[/(^|[/:-])(multilingual-)?e5-/i, { query: 'query: ', document: 'passage: ' }],
 	[/bge-(small|base|large)-en|mxbai-embed|snowflake-arctic-embed/i,
 		{ query: 'Represent this sentence for searching relevant passages: ', document: '' }],

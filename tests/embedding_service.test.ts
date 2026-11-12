@@ -30,6 +30,15 @@ describe('suggestPrefixes', () => {
         expect(suggestPrefixes('BAAI/bge-small-en-v1.5').document).toBe('');
     });
 
+    it('gives Qwen3-Embedding its query instruction under each server\'s naming', () => {
+        for (const name of ['qwen3-embedding:0.6b', 'Qwen/Qwen3-Embedding-0.6B', 'text-embedding-qwen3-embedding-4b']) {
+            expect(suggestPrefixes(name)).toEqual({
+                query: 'Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:',
+                document: '',
+            });
+        }
+    });
+
     it('suggests none for models that do not use them', () => {
         expect(suggestPrefixes('bge-m3')).toEqual({ query: '', document: '' });
         expect(suggestPrefixes('text-embedding-3-small')).toEqual({ query: '', document: '' });

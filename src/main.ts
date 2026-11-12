@@ -572,6 +572,8 @@ class TezcatSettingTab extends PluginSettingTab {
     private models: { source: string; ids: string[] | null; error: string | null } | null = null;
     /** The user picked "Other…" to type a model name. */
     private typingModel = false;
+    /** Whether the "Advanced" section is expanded; kept across redraws. */
+    private advancedOpen = false;
 
     constructor(app: App, plugin: Tezcat) {
         super(app, plugin);
@@ -726,9 +728,25 @@ class TezcatSettingTab extends PluginSettingTab {
                 .setValue(settings.embeddingApiKeySecret)
                 .onChange((secret) => this.apply({ embeddingApiKeySecret: secret ?? '' })));
 
-        textSetting('Query prefix', 'Text the model expects before a search query. Filled in automatically for known models.', '',
+        // Rarely needed: prefixes are filled in automatically for known models.
+        const advanced = containerEl.createEl('details', { cls: 'tezcat-settings-advanced' });
+        advanced.open = this.advancedOpen;
+        advanced.addEventListener('toggle', () => { this.advancedOpen = advanced.open; });
+        advanced.createEl('summary', { text: 'Advanced' });
+        // Prefixes are kept exactly as typed: trailing spaces and newlines are part of them.
+        const prefixSetting = (name: string, desc: string, value: string, apply: (value: string) => void) =>
+            new Setting(advanced).setName(name).setDesc(desc).addTextArea(text => {
+                text.setValue(value);
+                text.inputEl.rows = 2;
+                text.inputEl.addEventListener('change', () => {
+                    if (text.getValue() !== value) apply(text.getValue());
+                });
+            });
+        prefixSetting('Query prefix',
+            'Instruction some models expect before a search query (your text around the cursor). Filled in for known models; leave as is unless your model needs a different one.',
             settings.queryPrefix, (queryPrefix) => this.apply({ queryPrefix }));
-        textSetting('Document prefix', 'Text the model expects before a passage being indexed. Changing it re-embeds every block.', '',
+        prefixSetting('Document prefix',
+            'Instruction some models expect before each passage being indexed. Changing it re-embeds every block.',
             settings.documentPrefix, (documentPrefix) => this.apply({ documentPrefix }));
 
         new Setting(containerEl)
