@@ -608,9 +608,8 @@ class TezcatSettingTab extends PluginSettingTab {
     private models: { source: string; ids: string[] | null; error: string | null; ollama: boolean } | null = null;
     /** The user picked "Other…" to type a model name. */
     private typingModel = false;
-    /** Whether the "Advanced" and "Stored vectors" sections are expanded; kept across redraws. */
+    /** Whether the "Advanced" section is expanded; kept across redraws. */
     private advancedOpen = false;
-    private storedOpen = false;
     private downloading = false;
 
     constructor(app: App, plugin: Tezcat) {
@@ -777,7 +776,6 @@ class TezcatSettingTab extends PluginSettingTab {
                     button.setDisabled(false);
                 }));
 
-        this.displayStoredVectors(containerEl);
 
         // Rarely needed: prefixes are filled in automatically for known models.
         const advanced = containerEl.createEl('details', { cls: 'tezcat-settings-advanced' });
@@ -799,25 +797,21 @@ class TezcatSettingTab extends PluginSettingTab {
         prefixSetting('Document prefix',
             'Instruction some models expect before each passage being indexed. Changing it re-embeds every block.',
             settings.documentPrefix, (documentPrefix) => this.apply({ documentPrefix }));
+        this.displayStoredVectors(advanced);
     }
 
     /**
-     * Collapsible list of models with stored vectors, each with a delete button. Vectors are
-     * kept for the current and previous model, so switching back is instant.
+     * Models with stored vectors, each with a delete button. Vectors are kept for the current
+     * and previous model, so switching back is instant.
      */
     private displayStoredVectors(containerEl: HTMLElement) {
-        const models = this.plugin.storedModels;
-        const section = containerEl.createEl('details', { cls: 'tezcat-settings-advanced' });
-        section.open = this.storedOpen;
-        section.addEventListener('toggle', () => { this.storedOpen = section.open; });
-        section.createEl('summary', {
-            text: models.length ? `Stored vectors (${models.length} model${models.length === 1 ? '' : 's'})` : 'Stored vectors (none yet)',
-        });
-        section.createEl('p', {
-            cls: 'setting-item-description',
-            text: 'Vectors are kept for the current and previous model, so switching back is instant.',
-        });
-        const list = section.createDiv();
+        new Setting(containerEl)
+            .setHeading()
+            .setName('Stored vectors')
+            .setDesc(this.plugin.storedModels.length
+                ? 'Kept for the current and previous model, so switching back is instant.'
+                : 'None yet.');
+        const list = containerEl.createDiv();
         void this.plugin.storedVectors().then((stored) => {
             for (const { space, model, count, current } of stored) {
                 new Setting(list)
