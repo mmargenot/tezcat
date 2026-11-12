@@ -1,4 +1,4 @@
-import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, WorkspaceLeaf} from 'obsidian';
+import { App, CachedMetadata, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, WorkspaceLeaf} from 'obsidian';
 import { EditorView } from '@codemirror/view';
 import { TezcatView, VIEW_TYPE } from './search_view';
 import { DatabaseService, SqlJsDatabaseAdapter } from './database_service';
@@ -12,6 +12,9 @@ import { cursorContext } from './context';
 
 type EmbeddingProviderType = 'openai' | 'ollama';
 type SearchCadence = 'always' | 'sometimes' | 'occasionally';
+
+/** Wait this long after a file's last change before re-indexing it (Obsidian saves while you type). */
+const INDEX_DELAY_MS = 2000;
 
 /** Debounce before searching, per cadence setting. */
 const SEARCH_DELAY_MS: Record<SearchCadence, number> = { always: 500, sometimes: 2000, occasionally: 8000 };
@@ -41,6 +44,8 @@ const DEFAULT_SETTINGS: TezcatSettings = {
     highlightBlockOnOpen: true
 }
 
+const isMarkdown = (file: TAbstractFile): file is TFile => file instanceof TFile && file.extension === 'md';
+
 export default class Tezcat extends Plugin {
     settings: TezcatSettings;
     public databaseService: DatabaseService;
@@ -56,6 +61,9 @@ export default class Tezcat extends Plugin {
     private searchDebounceTimer: number | null = null;
     private searchSeq = 0; // Increments per search; stale results are dropped
     private searchSuppressedUntil: number = 0; // Timestamp to suppress search until
+    // File indexing runs one file at a time, so a file is never processed twice concurrently.
+    private indexQueue: Promise<unknown> = Promise.resolve();
+    private pendingIndex = new Map<string, { timer: number; content: string; cache: CachedMetadata }>();
     private statusBarItem: HTMLElement | null = null; // Status bar item for system status
 
     async onload() {
@@ -85,8 +93,10 @@ export default class Tezcat extends Plugin {
         this.statusBarItem = this.addStatusBarItem();
         this.updateStatusBar('sync', 'Tezcat: Initializing...', 'tezcat-status-initializing');
         
-        // Schedule validation and setup to run when workspace is ready
+        // Once the vault has loaded: keep the index in sync with file changes, then validate and
+        // index. Registering earlier would also receive an event for every file during vault load.
         this.app.workspace.onLayoutReady(() => {
+            this.registerIndexingEvents();
             this.performValidationAndSetup();
         });
         
@@ -111,30 +121,6 @@ export default class Tezcat extends Plugin {
         // This adds a settings tab so the user can configure various aspects of the plugin
         this.addSettingTab(new TezcatSettingTab(this.app, this));
 
-        // Listen for file modifications
-        this.registerEvent(this.app.vault.on('modify', (file) => {
-            logger.debug('Plugin', `File modified: ${file.path}`);
-            this.handleFileModify(file);
-        }));
-        
-        // Listen for file creation
-        this.registerEvent(this.app.vault.on('create', (file) => {
-            logger.debug('Plugin', `File created: ${file.path}`);
-            this.handleFileCreate(file);
-        }));
-        
-        // Listen for file deletion
-        this.registerEvent(this.app.vault.on('delete', (file) => {
-            logger.info('Plugin', `File deletion event triggered: ${file.path}`);
-            this.handleFileDelete(file);
-        }));
-        
-        // Listen for file rename
-        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
-            logger.debug('Plugin', `File renamed: ${oldPath} -> ${file.path}`);
-            this.handleFileRename(file, oldPath);
-        }));
-        
         // Search as the user types or moves the cursor (keyboard or mouse)...
         this.registerEditorExtension(EditorView.updateListener.of((update) => {
             if (update.docChanged || update.selectionSet) this.scheduleSearch();
@@ -144,11 +130,13 @@ export default class Tezcat extends Plugin {
         this.registerEvent(this.app.workspace.on('file-open', () => this.scheduleSearch()));
     }
 
-    async processOneFileIntoDatabase(file: any) {
+    /** Index one file. Run through `enqueueIndexing` so files are processed one at a time. */
+    private async processOneFileIntoDatabase(file: TFile, parsed?: { content: string; cache: CachedMetadata }) {
         try {
-            // Get file content
-            const content = await this.app.vault.read(file);
-            const metadata = await this.app.metadataCache.getFileCache(file);
+            // Blocks are cut from the content using the parsed sections' offsets, so the two must
+            // come from the same version of the file.
+            const content = parsed?.content ?? await this.app.vault.cachedRead(file);
+            const metadata = parsed?.cache ?? this.app.metadataCache.getFileCache(file);
 
             const blocks = await this.noteProcessor.getBlocksFromFile(content, metadata)
             
@@ -202,7 +190,7 @@ export default class Tezcat extends Plugin {
             let skipped = 0;
             
             for (const file of files) {
-                const result = await this.processOneFileIntoDatabase(file);
+                const result = await this.enqueueIndexing(() => this.processOneFileIntoDatabase(file));
                 processed++;
                 if (result?.changed) {
                     created++;
@@ -620,58 +608,58 @@ export default class Tezcat extends Plugin {
         logger.debug('Plugin', `Search suppressed for ${milliseconds}ms`);
     }
 
-    // File event handlers for note reprocessing
-    private async handleFileModify(file: any) {
-        // Only process markdown files
-        if (file.extension !== 'md') return;
-        
-        try {
-            // Use the complete blocks workflow for modified files
-            await this.processOneFileIntoDatabase(file);
-        } catch (error) {
-            logger.error('Plugin', `Failed to handle file modify for ${file.path}`, error);
-        }
+    private registerIndexingEvents() {
+        // Fires after Obsidian has re-parsed a file (including newly created files), with the
+        // content and sections from the same parse.
+        this.registerEvent(this.app.metadataCache.on('changed', (file, content, cache) => {
+            if (file.extension === 'md') this.scheduleIndexing(file, content, cache);
+        }));
+        this.registerEvent(this.app.vault.on('delete', (file) => {
+            if (isMarkdown(file)) void this.enqueueIndexing(() => this.handleFileDelete(file.path));
+        }));
+        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+            if (isMarkdown(file)) void this.enqueueIndexing(() => this.handleFileRename(file, oldPath));
+        }));
+        this.register(() => {
+            for (const { timer } of this.pendingIndex.values()) window.clearTimeout(timer);
+            this.pendingIndex.clear();
+        });
     }
 
-    private async handleFileCreate(file: any) {
-        // Only process markdown files
-        if (file.extension !== 'md') return;
-        
-        try {
-            // Use the complete blocks workflow for new files
-            await this.processOneFileIntoDatabase(file);
-        } catch (error) {
-            logger.error('Plugin', `Failed to handle file create for ${file.path}`, error);
-        }
+    /** Index a changed file once it has stopped changing, using its latest parse. */
+    private scheduleIndexing(file: TFile, content: string, cache: CachedMetadata) {
+        const pending = this.pendingIndex.get(file.path);
+        if (pending) window.clearTimeout(pending.timer);
+        const timer = window.setTimeout(() => {
+            const latest = this.pendingIndex.get(file.path);
+            this.pendingIndex.delete(file.path);
+            if (latest) void this.enqueueIndexing(() => this.processOneFileIntoDatabase(file, latest));
+        }, INDEX_DELAY_MS);
+        this.pendingIndex.set(file.path, { timer, content, cache });
     }
 
-    private async handleFileDelete(file: any) {
-        // Only process markdown files
-        if (file.extension !== 'md') return;
-        
+    private enqueueIndexing<T>(task: () => Promise<T>): Promise<T> {
+        const run = this.indexQueue.then(task, task);
+        this.indexQueue = run.catch(() => {});
+        return run;
+    }
+
+    private async handleFileDelete(path: string) {
         try {
-            // Check if note exists in database
-            const existingNote = await this.databaseService.getNoteByPath(file.path);
+            const existingNote = await this.databaseService.getNoteByPath(path);
             if (existingNote) {
-                logger.info('Plugin', `Removing deleted note from database: ${file.path}`);
+                logger.info('Plugin', `Removing deleted note from database: ${path}`);
                 // Delete vectors, then the note
                 await this.databaseService.deleteVectorsForNote(existingNote.id);
                 await this.databaseService.deleteNote(existingNote.id);
-                logger.info('Plugin', `Successfully removed note ${existingNote.id} (${file.path}) from database`);
-            } else {
-                logger.debug('Plugin', `Note not found in database for deletion: ${file.path}`);
             }
         } catch (error) {
-            logger.error('Plugin', `Failed to handle file delete for ${file.path}`, error);
+            logger.error('Plugin', `Failed to handle file delete for ${path}`, error);
         }
     }
 
-    private async handleFileRename(file: any, oldPath: string) {
-        // Only process markdown files
-        if (file.extension !== 'md') return;
-        
+    private async handleFileRename(file: TFile, oldPath: string) {
         try {
-            // Look for note by old path
             const existingNote = await this.databaseService.getNoteByPath(oldPath);
             if (existingNote) {
                 logger.debug('Plugin', `Updating renamed note path: ${oldPath} -> ${file.path}`);
@@ -681,9 +669,8 @@ export default class Tezcat extends Plugin {
                     path: file.path
                 });
             } else {
-                // Note not found by old path - might be a new file, handle as create
-                logger.debug('Plugin', `Note not found for rename, treating as new file: ${file.path}`);
-                await this.handleFileCreate(file);
+                // Not indexed under the old path (e.g. renamed from another extension): index it now
+                await this.processOneFileIntoDatabase(file);
             }
         } catch (error) {
             logger.error('Plugin', `Failed to handle file rename from ${oldPath} to ${file.path}`, error);
@@ -1480,4 +1467,3 @@ class VectorSearchResultsModal extends Modal {
         contentEl.empty();
     }
 }
-
