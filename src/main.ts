@@ -246,9 +246,22 @@ export default class Tezcat extends Plugin {
         return this.index.storedSpaces.map((space) => space.slice(0, space.lastIndexOf('|')));
     }
 
-    async clearOtherModels() {
-        await this.index.clearOtherModels();
-        new Notice('Deleted stored vectors for other models.');
+    /** Each model with stored vectors (current first) and how many vectors it has. */
+    async storedVectors(): Promise<{ space: string; model: string; count: number; current: boolean }[]> {
+        const counts = await this.index.storedVectorCounts();
+        return counts.map(({ space, count }) => ({
+            space,
+            model: space.slice(0, space.lastIndexOf('|')),
+            count,
+            current: space === this.index.embeddingSpace,
+        }));
+    }
+
+    async deleteStoredVectors(space: string) {
+        await this.index.deleteStoredVectors(space);
+        // The model in use lost its vectors: embed again (keyword search works meanwhile).
+        if (space === this.index.embeddingSpace) void this.embedMissing();
+        this.refreshStatus();
     }
 
     /** Model ids the configured server offers. */
@@ -572,8 +585,9 @@ class TezcatSettingTab extends PluginSettingTab {
     private models: { source: string; ids: string[] | null; error: string | null } | null = null;
     /** The user picked "Other…" to type a model name. */
     private typingModel = false;
-    /** Whether the "Advanced" section is expanded; kept across redraws. */
+    /** Whether the "Advanced" and "Stored vectors" sections are expanded; kept across redraws. */
     private advancedOpen = false;
+    private storedOpen = false;
 
     constructor(app: App, plugin: Tezcat) {
         super(app, plugin);
@@ -760,20 +774,47 @@ class TezcatSettingTab extends PluginSettingTab {
                     button.setDisabled(false);
                 }));
 
-        const [current, ...others] = this.plugin.storedModels;
-        const stored = new Setting(containerEl)
-            .setName('Stored vectors')
-            .setDesc(current
-                ? `Kept for ${[current, ...others].join(' and ')}. Vectors for the current and previous model are kept, so switching back is instant.`
-                : 'None yet.');
-        if (others.length) {
-            stored.addButton(button => button
-                .setButtonText('Delete other models')
-                .onClick(async () => {
-                    await this.plugin.clearOtherModels();
-                    this.display();
-                }));
-        }
+        this.displayStoredVectors(containerEl);
+    }
+
+    /**
+     * Collapsible list of models with stored vectors, each with a delete button. Vectors are
+     * kept for the current and previous model, so switching back is instant.
+     */
+    private displayStoredVectors(containerEl: HTMLElement) {
+        const models = this.plugin.storedModels;
+        const section = containerEl.createEl('details', { cls: 'tezcat-settings-advanced' });
+        section.open = this.storedOpen;
+        section.addEventListener('toggle', () => { this.storedOpen = section.open; });
+        section.createEl('summary', {
+            text: models.length ? `Stored vectors (${models.length} model${models.length === 1 ? '' : 's'})` : 'Stored vectors (none yet)',
+        });
+        section.createEl('p', {
+            cls: 'setting-item-description',
+            text: 'Vectors are kept for the current and previous model, so switching back is instant.',
+        });
+        const list = section.createDiv();
+        void this.plugin.storedVectors().then((stored) => {
+            for (const { space, model, count, current } of stored) {
+                new Setting(list)
+                    .setName(current ? `${model} (in use)` : model)
+                    .setDesc(`${count.toLocaleString()} vectors`)
+                    .addExtraButton(button => button
+                        .setIcon('trash-2')
+                        .setTooltip('Delete these vectors')
+                        .onClick(() => new ConfirmModal(this.app, {
+                            title: `Delete vectors for ${model}?`,
+                            body: current
+                                ? `${model} is the model in use, so every block will be embedded again, starting now. Keyword search keeps working meanwhile.`
+                                : `Switching back to ${model} later will embed every block again.`,
+                            confirm: 'Delete',
+                            onConfirm: async () => {
+                                await this.plugin.deleteStoredVectors(space);
+                                this.display();
+                            },
+                        }).open()));
+            }
+        });
     }
 
     /**
@@ -868,6 +909,31 @@ class TezcatSettingTab extends PluginSettingTab {
         } else {
             void run();
         }
+    }
+}
+
+/** A yes/no confirmation for a destructive action. */
+class ConfirmModal extends Modal {
+    constructor(app: App, private opts: { title: string; body: string; confirm: string; onConfirm: () => void }) {
+        super(app);
+    }
+
+    onOpen() {
+        const { contentEl, opts } = this;
+        new Setting(contentEl).setHeading().setName(opts.title);
+        contentEl.createEl('p', { text: opts.body });
+        new Setting(contentEl)
+            .addButton(button => button
+                .setButtonText(opts.confirm)
+                .setWarning()
+                .onClick(() => { this.close(); opts.onConfirm(); }))
+            .addButton(button => button
+                .setButtonText('Cancel')
+                .onClick(() => this.close()));
+    }
+
+    onClose() {
+        this.contentEl.empty();
     }
 }
 
