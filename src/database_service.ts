@@ -1,4 +1,4 @@
-import { Plugin } from 'obsidian';
+import { Plugin, normalizePath } from 'obsidian';
 import { EmbeddingService } from './embedding_service';
 import { Logger } from './logger';
 import { Block, BlockType } from './note_processor';
@@ -40,10 +40,14 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
     private SQL: SqlJsStatic | null = null;
     private plugin: Plugin;
     private logger: Logger;
+    /** Stored in the plugin's own folder, whatever that folder is named. */
+    private readonly dbPath: string;
 
     constructor(plugin: Plugin, logger: Logger) {
         this.plugin = plugin;
         this.logger = logger;
+        const pluginDir = plugin.manifest.dir ?? `${plugin.app.vault.configDir}/plugins/${plugin.manifest.id}`;
+        this.dbPath = normalizePath(`${pluginDir}/tezcat.db`);
     }
 
     async initialize(): Promise<void> {
@@ -216,18 +220,15 @@ export class SqlJsDatabaseAdapter implements DatabaseAdapter {
         
         const data = this.db.export();
         
-        const adapter = this.plugin.app.vault.adapter;
-        const dbPath = `${this.plugin.app.vault.configDir}/plugins/tezcat/tezcat.db`;
-        await adapter.writeBinary(dbPath, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer);
+        await this.plugin.app.vault.adapter.writeBinary(this.dbPath, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer);
     }
 
     async load(): Promise<void> {
         try {
             const adapter = this.plugin.app.vault.adapter;
-            const dbPath = `${this.plugin.app.vault.configDir}/plugins/tezcat/tezcat.db`;
 
-            if (await adapter.exists(dbPath)) {
-                const buffer = await adapter.readBinary(dbPath);
+            if (await adapter.exists(this.dbPath)) {
+                const buffer = await adapter.readBinary(this.dbPath);
                 const data = new Uint8Array(buffer);
                 if (!this.SQL) throw new Error('SQL not initialized');
                 this.db = new this.SQL.Database(data);
