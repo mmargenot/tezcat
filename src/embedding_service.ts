@@ -43,6 +43,16 @@ export function embeddingModels(ids: string[]): string[] {
 	return (likely.length ? likely : ids).slice().sort((a, b) => a.localeCompare(b));
 }
 
+/**
+ * Embedding models worth having on an Ollama server, offered for download together. The 0.6B
+ * Qwen3 variant is used because the untagged name is the 8B model (4.7 GB).
+ */
+export const RECOMMENDED_OLLAMA_MODELS: { name: string; size: string }[] = [
+	{ name: 'bge-m3', size: '1.2 GB' },
+	{ name: 'nomic-embed-text:v1.5', size: '274 MB' },
+	{ name: 'qwen3-embedding:0.6b', size: '639 MB' },
+];
+
 export interface EmbeddingConfig {
 	/** Base URL of an OpenAI-compatible API, e.g. http://localhost:11434/v1 */
 	endpoint: string;
@@ -108,6 +118,36 @@ export class EmbeddingService {
 		const data = (res.json as { data?: { id?: unknown }[] } | undefined)?.data;
 		if (!Array.isArray(data)) throw new EmbeddingError('other', `Unexpected response from ${this.base}/models`);
 		return data.map((m) => m.id).filter((id): id is string => typeof id === 'string');
+	}
+
+	/** Ollama's native API sits beside its OpenAI-compatible one: the endpoint without /v1. */
+	private get ollamaBase(): string {
+		return this.base.replace(/\/v1$/, '');
+	}
+
+	/** Whether the endpoint is an Ollama server (it answers Ollama's /api/version). */
+	async isOllama(): Promise<boolean> {
+		try {
+			const res = await this.request({ url: `${this.ollamaBase}/api/version`, method: 'GET', throw: false });
+			return res.status === 200 && typeof (res.json as { version?: unknown } | undefined)?.version === 'string';
+		} catch {
+			return false;
+		}
+	}
+
+	/** Download a model onto an Ollama server. Resolves when the download has finished. */
+	async pullOllamaModel(model: string): Promise<void> {
+		let res: RequestUrlResponse;
+		try {
+			res = await this.request({
+				url: `${this.ollamaBase}/api/pull`, method: 'POST', headers: this.headers(),
+				body: JSON.stringify({ model, stream: false }), throw: false,
+			});
+		} catch (e) {
+			throw new EmbeddingError('unreachable', `Could not connect to ${this.ollamaBase}. Is Ollama running? (${(e as Error).message})`);
+		}
+		const status = (res.json as { status?: string } | undefined)?.status;
+		if (res.status !== 200 || status !== 'success') throw this.failure(res);
 	}
 
 	private headers(): Record<string, string> {
