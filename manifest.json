@@ -3,7 +3,7 @@
 	"name": "Tezcat",
 	"version": "2.0.0",
 	"minAppVersion": "1.11.4",
-	"description": "Surface related passages from your vault as you write. Keyword search by default, with optional semantic search using a local or hosted embedding model.",
+	"description": "Implements a remembrance agent using traditional and semantic search. Look into the mirror.",
 	"author": "Max Margenot",
 	"authorUrl": "https://github.com/mmargenot",
 	"fundingUrl": "https://coff.ee/mmargenot",
