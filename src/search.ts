@@ -72,6 +72,13 @@ export class SearchService {
 	/** Embeds a search query; null when semantic search isn't configured. */
 	embedQuery: ((text: string) => Promise<ArrayLike<number>>) | null = null;
 
+	/**
+	 * Why the most recent semantic search failed, or null once one succeeds again. Lets the
+	 * plugin report an outage (e.g. the embedding server stopped) while results fall back to
+	 * keyword search, and clear it when the server comes back.
+	 */
+	semanticError: string | null = null;
+
 	constructor(
 		private repo: IndexRepository,
 		/** Current content of a file, or null if it no longer exists. */
@@ -89,8 +96,12 @@ export class SearchService {
 		if (weight > 0) {
 			try {
 				semantic = await this.semanticSearch(text, pool);
+				if (this.semanticError) this.log.info('Search', 'Semantic search is working again');
+				this.semanticError = null;
 			} catch (e) {
-				this.log.warn('Search', 'Semantic search failed; showing keyword results only', e);
+				// Log when it starts failing, not on every search while it stays down.
+				if (!this.semanticError) this.log.warn('Search', 'Semantic search failed; showing keyword results only', e);
+				this.semanticError = e instanceof Error ? e.message : String(e);
 			}
 			// No vectors yet, or the embedding service failed: fall back to keyword search.
 			if (semantic.length === 0) weight = 0;

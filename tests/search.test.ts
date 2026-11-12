@@ -78,6 +78,21 @@ describe('SearchService', () => {
         expect(search.embedQuery).toHaveBeenCalledTimes(1);
     });
 
+    it('reports a failing embedding service once, and clears it when it recovers', async () => {
+        await enableSemantic();
+        log.warn.mockClear();
+        const working = search.embedQuery!;
+        search.embedQuery = vi.fn(async () => { throw new Error('connection refused'); });
+        await search.search('nevermore', { semanticWeight: 0.5, limit: 5 });
+        await search.search('nevermore', { semanticWeight: 0.5, limit: 5 });
+        expect(search.semanticError).toBe('connection refused');
+        expect(log.warn).toHaveBeenCalledTimes(1);
+
+        search.embedQuery = working;
+        await search.search('nevermore', { semanticWeight: 0.5, limit: 5 });
+        expect(search.semanticError).toBeNull();
+    });
+
     it('falls back to keyword results when no vectors exist or embedding fails', async () => {
         search.embedQuery = vi.fn(async (t: string) => embedText(t));
         expect((await search.search('nevermore', { semanticWeight: 1, limit: 5 }))[0]?.path).toBe('Raven.md');
