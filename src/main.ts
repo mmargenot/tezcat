@@ -115,7 +115,7 @@ export default class Tezcat extends Plugin {
     // ---------- settings ----------
 
     async loadSettings() {
-        const saved = await this.loadData();
+        const saved = (await this.loadData()) as Record<string, unknown> | null;
         const migrated = saved ? migrateSettings(saved, (name, key) => this.app.secretStorage.setSecret(name, key)) : false;
         this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
         if (migrated) await this.saveData(this.settings);
@@ -169,11 +169,10 @@ export default class Tezcat extends Plugin {
 
     /** Per-vault, per-device name for the index databases, kept in Obsidian's vault-scoped local storage. */
     private indexNamespace(): string {
-        let id = this.app.loadLocalStorage('tezcat-index-id');
-        if (typeof id !== 'string') {
-            id = crypto.randomUUID();
-            this.app.saveLocalStorage('tezcat-index-id', id);
-        }
+        const saved: unknown = this.app.loadLocalStorage('tezcat-index-id');
+        if (typeof saved === 'string') return `tezcat-${saved}`;
+        const id = crypto.randomUUID();
+        this.app.saveLocalStorage('tezcat-index-id', id);
         return `tezcat-${id}`;
     }
 
