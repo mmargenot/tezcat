@@ -42,6 +42,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The same checks the community directory runs on each release. Warnings don't fail it.
+      - name: Lint
+        run: npm run lint
+
       - name: Test
         run: npm test
 
