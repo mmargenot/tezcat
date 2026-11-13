@@ -732,7 +732,7 @@ class TezcatSettingTab extends PluginSettingTab {
                 .addOption(LogLevel.DEBUG.toString(), 'DEBUG')
                 .setValue(this.plugin.settings.logLevel.toString())
                 .onChange(async (value) => {
-                    this.plugin.settings.logLevel = parseInt(value) as LogLevel;
+                    this.plugin.settings.logLevel = parseInt(value);
                     await this.plugin.saveSettings();
                 }));
     }
