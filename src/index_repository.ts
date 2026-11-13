@@ -117,7 +117,7 @@ const SYNC_YIELD_EVERY = 25;
 /** Stable id for a block: its file path and position within the file. */
 export const blockId = (path: string, index: number) => `${path}\u0000${index}`;
 
-const yieldToUi = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+const yieldToUi = () => new Promise<void>((resolve) => window.setTimeout(resolve, 0));
 
 export class EmbeddingSpaceChanged extends Error {}
 
@@ -135,7 +135,7 @@ export class IndexRepository {
 	private keyword = new MiniSearch<KeywordDoc>(KEYWORD_OPTIONS);
 	private keywordEntries = new Map<string, KeywordEntry>();
 	private keywordDirty = false;
-	private keywordSaveTimer: ReturnType<typeof setTimeout> | null = null;
+	private keywordSaveTimer: number | null = null;
 	/** Files whose saved keyword entries may be out of date (see load). */
 	private keywordStale = new Set<string>();
 	private vectors = new Map<string, QVec>();
@@ -538,7 +538,7 @@ export class IndexRepository {
 	}
 
 	private async saveKeywordIndex() {
-		if (this.keywordSaveTimer) { clearTimeout(this.keywordSaveTimer); this.keywordSaveTimer = null; }
+		if (this.keywordSaveTimer) { window.clearTimeout(this.keywordSaveTimer); this.keywordSaveTimer = null; }
 		if (!this.keywordDirty) return;
 		const snap: KeywordSnapshot = {
 			json: JSON.stringify(this.keyword),
@@ -549,8 +549,8 @@ export class IndexRepository {
 	}
 
 	private scheduleKeywordSave() {
-		if (this.keywordSaveTimer) clearTimeout(this.keywordSaveTimer);
-		this.keywordSaveTimer = setTimeout(() => {
+		if (this.keywordSaveTimer) window.clearTimeout(this.keywordSaveTimer);
+		this.keywordSaveTimer = window.setTimeout(() => {
 			this.keywordSaveTimer = null;
 			void this.serial(() => this.saveKeywordIndex());
 		}, KEYWORD_SAVE_DELAY_MS);
