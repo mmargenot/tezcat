@@ -95,7 +95,7 @@ export class EmbeddingService {
 		readonly config: EmbeddingConfig,
 		private log: Logger,
 		private request: Request = (params) => requestUrl(params),
-		private wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+		private wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => window.setTimeout(r, ms)),
 	) {
 		this.base = config.endpoint.trim().replace(/\/+$/, '');
 		this.url = `${this.base}/embeddings`;
