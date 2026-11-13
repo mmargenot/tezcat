@@ -55,10 +55,10 @@ describe('Logger', () => {
             [LogLevel.WARN, 'debug', 'debug', false],
             [LogLevel.ERROR, 'debug', 'debug', false],
             
-            [LogLevel.DEBUG, 'info', 'log', true],
-            [LogLevel.INFO, 'info', 'log', true],
-            [LogLevel.WARN, 'info', 'log', false],
-            [LogLevel.ERROR, 'info', 'log', false],
+            [LogLevel.DEBUG, 'info', 'debug', true],
+            [LogLevel.INFO, 'info', 'debug', true],
+            [LogLevel.WARN, 'info', 'debug', false],
+            [LogLevel.ERROR, 'info', 'debug', false],
             
             [LogLevel.DEBUG, 'warn', 'warn', true],
             [LogLevel.INFO, 'warn', 'warn', true],
@@ -103,7 +103,7 @@ describe('Logger', () => {
         it('formats component names correctly', () => {
             logger.info('DatabaseService', 'Test message');
             
-            expect(mockConsole.log).toHaveBeenCalledWith(
+            expect(mockConsole.debug).toHaveBeenCalledWith(
                 '[INFO] [DatabaseService]',
                 'Test message'
             );
@@ -113,7 +113,7 @@ describe('Logger', () => {
             const multilineMessage = 'Line 1\nLine 2\nLine 3';
             logger.info('TestComponent', multilineMessage);
             
-            expect(mockConsole.log).toHaveBeenCalledWith(
+            expect(mockConsole.debug).toHaveBeenCalledWith(
                 '[INFO] [TestComponent]',
                 'Line 1\nLine 2\nLine 3'
             );
@@ -123,7 +123,7 @@ describe('Logger', () => {
             const specialMessage = 'Message with émojis 🚀 and symbols @#$%';
             logger.info('TestComponent', specialMessage);
             
-            expect(mockConsole.log).toHaveBeenCalledWith(
+            expect(mockConsole.debug).toHaveBeenCalledWith(
                 '[INFO] [TestComponent]',
                 'Message with émojis 🚀 and symbols @#$%'
             );
@@ -140,7 +140,7 @@ describe('Logger', () => {
             
             logger.info('TestComponent', 'Message with object', extraData);
             
-            expect(mockConsole.log).toHaveBeenCalledWith(
+            expect(mockConsole.debug).toHaveBeenCalledWith(
                 '[INFO] [TestComponent]',
                 'Message with object',
                 extraData
@@ -152,7 +152,7 @@ describe('Logger', () => {
             
             logger.info('TestComponent', 'Message with array', extraData);
             
-            expect(mockConsole.log).toHaveBeenCalledWith(
+            expect(mockConsole.debug).toHaveBeenCalledWith(
                 '[INFO] [TestComponent]',
                 'Message with array',
                 extraData
@@ -189,8 +189,8 @@ describe('Logger', () => {
             // Errors
             logger.error('SearchService', 'Failed to search similar content', new Error('Database connection lost'));
             
-            expect(mockConsole.log).toHaveBeenCalledTimes(2); // info calls
-            expect(mockConsole.debug).not.toHaveBeenCalled(); // filtered out
+            expect(mockConsole.debug).toHaveBeenCalledTimes(2); // the info calls
+            expect(mockConsole.debug).not.toHaveBeenCalledWith('[DEBUG] [Settings]', expect.anything(), expect.anything()); // filtered out
             expect(mockConsole.warn).toHaveBeenCalledTimes(1);
             expect(mockConsole.error).toHaveBeenCalledTimes(1);
         });
