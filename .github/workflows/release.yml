@@ -1,0 +1,67 @@
+# Builds the plugin when a version tag is pushed and attaches it to a draft GitHub release.
+# Based on Obsidian's "Release your plugin with GitHub Actions" guide. Publish the draft
+# after checking it; the community directory then scans the release and checks that it
+# was built from the committed source.
+#
+# To release: bump the version (npm version <x.y.z>), merge to main, then
+#   git tag -a 2.0.0 -m "2.0.0" && git push origin 2.0.0
+name: Release Obsidian plugin
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+      id-token: write # sign the build provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Use Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.x"
+          cache: npm
+
+      - name: Check the tag matches the manifest version
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="$(node -p "require('./manifest.json').version")"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::Tag $tag does not match manifest.json version $version (Obsidian requires them to be identical)"
+            exit 1
+          fi
+
+      # npm ci installs exactly what package-lock.json pins, so the release is built from the
+      # committed dependency versions.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+
+      - name: Create draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" \
+            --title="$tag" \
+            --draft \
+            main.js manifest.json styles.css

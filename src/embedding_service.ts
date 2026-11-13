@@ -1,810 +1,254 @@
-// LSH configuration interfaces
-export interface LSHConfig {
-    id: number;
-    num_hash_functions: number;
-    vector_dimensions: number;
-    vector_count_at_build: number;
-    created_at: string;
+import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from 'obsidian';
+import type { Logger } from './logger';
+
+export type EmbedKind = 'query' | 'document';
+
+export interface Prefixes {
+	query: string;
+	document: string;
 }
 
-export type LSHHashFunction = {
-    id: string;
-    configId: string;
-    hashIndex: number;
-    projectionMatrix: Float32Array;
-    createdAt: Date;
-};
+/**
+ * Instruction prefixes some embedding models are trained with. Leaving them out noticeably
+ * lowers retrieval quality (nomic-embed-text, for example, expects them).
+ */
+const KNOWN_PREFIXES: [RegExp, Prefixes][] = [
+	[/nomic-embed/i, { query: 'search_query: ', document: 'search_document: ' }],
+	[/embeddinggemma/i, { query: 'task: search result | query: ', document: 'title: none | text: ' }],
+	// Qwen3-Embedding: an instruction on queries only (format from the model card).
+	[/qwen3-embedding/i, { query: 'Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:', document: '' }],
+	[/(^|[/:-])(multilingual-)?e5-/i, { query: 'query: ', document: 'passage: ' }],
+	[/bge-(small|base|large)-en|mxbai-embed|snowflake-arctic-embed/i,
+		{ query: 'Represent this sentence for searching relevant passages: ', document: '' }],
+];
 
-// Ollama API response interfaces
-interface OllamaModel {
-    name: string;
+/** Prefixes recommended for a model (empty for models that don't use them, e.g. bge-m3). */
+export function suggestPrefixes(model: string): Prefixes {
+	return KNOWN_PREFIXES.find(([re]) => re.test(model))?.[1] ?? { query: '', document: '' };
 }
 
-interface OllamaModelsResponse {
-    models: OllamaModel[];
+/** Ollama treats "name" and "name:latest" as the same model. */
+export const sameModel = (a: string, b: string) => modelKey(a) === modelKey(b);
+const modelKey = (model: string) => model.trim().replace(/:latest$/, '');
+
+/** Name patterns of common embedding model families (servers don't say which models embed). */
+const EMBEDDING_MODEL_NAME = /embed|bge|(^|[/_:-])e5-|gte|minilm|mpnet|nomic|mxbai|arctic|jina|sentence|instructor/i;
+
+/**
+ * The embedding models among a server's models, by name. Servers like Ollama list chat
+ * models too; if no name looks like an embedding model, all are returned.
+ */
+export function embeddingModels(ids: string[]): string[] {
+	const likely = ids.filter((id) => EMBEDDING_MODEL_NAME.test(id));
+	return (likely.length ? likely : ids).slice().sort((a, b) => a.localeCompare(b));
 }
 
-import { Logger } from './logger';
-import { Notice, requestUrl } from 'obsidian';
+/**
+ * Embedding models worth having on an Ollama server, offered for download together. The 0.6B
+ * Qwen3 variant is used because the untagged name is the 8B model (4.7 GB).
+ */
+export const RECOMMENDED_OLLAMA_MODELS: { name: string; size: string }[] = [
+	{ name: 'bge-m3', size: '1.2 GB' },
+	{ name: 'nomic-embed-text:v1.5', size: '274 MB' },
+	{ name: 'qwen3-embedding:0.6b', size: '639 MB' },
+];
 
-// Vector processing utilities
-export class VectorUtils {
-    private logger: Logger;
-
-    constructor(logger: Logger) {
-        this.logger = logger;
-    }
-
-    /**
-     * Generate random projection vectors for LSH hash functions
-     */
-    createHashFunctions(vectorCount: number, vectorDimensions: number): { 
-        numHashFunctions: number; 
-        hashFunctions: { hashIndex: number; projectionMatrix: Float32Array }[] 
-    } {
-        this.logger.info('VectorUtils', `Creating hash functions for ${vectorCount} vectors, ${vectorDimensions} dimensions`);
-
-        // Calculate number of hash functions
-        const numHashFunctions = Math.ceil(Math.log2(vectorCount));
-        this.logger.info('VectorUtils', `Using ${numHashFunctions} hash functions`);
-
-        // Generate random projection vectors
-        const hashFunctions: { hashIndex: number; projectionMatrix: Float32Array }[] = [];
-        for (let i = 0; i < numHashFunctions; i++) {
-            const projectionMatrix = this.generateRandomProjectionVector(vectorDimensions);
-            hashFunctions.push({
-                hashIndex: i,
-                projectionMatrix
-            });
-        }
-
-        this.logger.info('VectorUtils', `Created ${numHashFunctions} hash functions`);
-        
-        return { numHashFunctions, hashFunctions };
-    }
-
-    /**
-     * Compute hash vector (bit string) for a given input vector
-     */
-    /**
-     * Compute LSH hash vector for given input vector using provided hash functions
-     */
-    computeHashVector(vector: Int8Array, hashFunctions: LSHHashFunction[], expectedDimensions: number): number[] {
-        if (vector.length !== expectedDimensions) {
-            throw new Error(`Input vector has ${vector.length} dimensions, expected ${expectedDimensions}`);
-        }
-
-        if (hashFunctions.length === 0) {
-            throw new Error('No hash functions provided');
-        }
-
-        const hashBits: number[] = [];
-
-        // For each hash function, compute dot product and convert to bit
-        for (const hashFunction of hashFunctions) {
-            const dotProduct = this.dotProduct(vector, hashFunction.projectionMatrix);
-            // Convert to bit: positive = 1, negative/zero = 0
-            hashBits.push(dotProduct > 0 ? 1 : 0);
-        }
-
-        return hashBits;
-    }
-
-    /**
-     * Calculate Hamming distance between two hash vectors (number arrays)
-     */
-    static hammingDistance(hash1: number[], hash2: number[]): number {
-        if (hash1.length !== hash2.length) {
-            throw new Error('Hash vectors must have the same length');
-        }
-
-        let distance = 0;
-        for (let i = 0; i < hash1.length; i++) {
-            if (hash1[i] !== hash2[i]) {
-                distance++;
-            }
-        }
-        return distance;
-    }
-
-
-    /**
-     * Generate a random projection vector for LSH
-     */
-    private generateRandomProjectionVector(dimensions: number): Float32Array {
-        const vector = new Float32Array(dimensions);
-        
-        // Generate random values from standard normal distribution
-        for (let i = 0; i < dimensions; i++) {
-            // Box-Muller transform for normal distribution
-            const u1 = Math.random();
-            const u2 = Math.random();
-            const z0 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-            vector[i] = z0;
-        }
-
-        return vector;
-    }
-
-    /**
-     * Calculate dot product between Int8Array vector and Float32Array projection matrix
-     */
-    private dotProduct(vector: Int8Array, projectionMatrix: Float32Array): number {
-        if (vector.length !== projectionMatrix.length) {
-            this.logger.error('VectorUtils', `Dimension mismatch: vector.length=${vector.length}, projectionMatrix.length=${projectionMatrix.length}`);
-            throw new Error('Vectors must have the same length');
-        }
-
-        let sum = 0;
-        for (let i = 0; i < vector.length; i++) {
-            sum += vector[i] * projectionMatrix[i];
-        }
-        return sum;
-    }
-    /**
-     * L2 normalize a vector (make its magnitude = 1)
-     */
-    static l2Normalize(vector: number[]): number[] {
-        const magnitude = Math.sqrt(vector.reduce((sum, val) => sum + val * val, 0));
-        if (magnitude === 0) return vector; // Avoid division by zero
-        return vector.map(val => val / magnitude);
-    }
-
-    /**
-     * Quantize normalized float vector to int8 range [-128, 127]
-     */
-    static quantizeToInt8(normalizedVector: number[]): Int8Array {
-        return new Int8Array(normalizedVector.map(val => {
-            // Clamp to [-1, 1] range and scale to [-127, 127]
-            const clamped = Math.max(-1, Math.min(1, val));
-            return Math.round(clamped * 127);
-        }));
-    }
-
-    /**
-     * Complete processing: L2 normalize + quantize to int8
-     */
-    static processVector(vector: number[]): Int8Array {
-        const normalized = this.l2Normalize(vector);
-        return this.quantizeToInt8(normalized);
-    }
+export interface EmbeddingConfig {
+	/** Base URL of an OpenAI-compatible API, e.g. http://localhost:11434/v1 */
+	endpoint: string;
+	model: string;
+	apiKey: string | null;
+	prefixes: Prefixes;
 }
 
-export abstract class EmbeddingProvider {
-    abstract embed_one(text: string): Promise<Int8Array>;
-    abstract embed_many(texts: string[]): Promise<Int8Array[]>;
-    abstract validate(): Promise<void>;
+export type EmbeddingFailure = 'unreachable' | 'unauthorized' | 'model-not-found' | 'no-endpoint' | 'other';
+
+/**
+ * Identifies a vector space: vectors are only comparable when produced by the same model with
+ * the same document prefix. (Not the endpoint: the same model served elsewhere produces the
+ * same vectors.)
+ */
+export const vectorSpace = (model: string, documentPrefix: string) => `${modelKey(model)}|${documentPrefix}`;
+
+export class EmbeddingError extends Error {
+	constructor(readonly reason: EmbeddingFailure, message: string) {
+		super(message);
+	}
 }
 
+export type Request = (params: RequestUrlParam) => Promise<RequestUrlResponse>;
 
+const BATCH_SIZE = 32;
+/** Guard so one huge block can't exceed a model's context (roughly 4 characters per token). */
+const MAX_CHARS = 6000;
+const MAX_ATTEMPTS = 3;
 
-export class OllamaEmbeddingProvider extends EmbeddingProvider {
-    private baseUrl: string;
-    private modelName: string;
-    private logger: Logger;
-    private modelManager?: OllamaModelManager;
-
-    constructor(baseUrl: string = 'http://localhost:11434', modelName: string = 'nomic-embed-text', logger: Logger, modelManager?: OllamaModelManager) {
-        super();
-        this.baseUrl = baseUrl;
-        this.modelName = modelName;
-        this.logger = logger;
-        this.modelManager = modelManager;
-    }
-
-    /**
-     * Set the model manager for enhanced validation with auto-download
-     */
-    setModelManager(modelManager: OllamaModelManager): void {
-        this.modelManager = modelManager;
-    }
-
-    async embed_one(text: string): Promise<Int8Array> {
-        const requestBody = {
-            model: this.modelName,
-            input: text
-        };
-        
-        const response = await requestUrl({
-            url: `${this.baseUrl}/api/embed`,
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(requestBody)
-        });
-        
-        if (response.status !== 200) {
-            this.logger.error('OllamaProvider', `Error response: ${response.text}`);
-            throw new Error(`Ollama API error: ${response.status} - ${response.text}`);
-        }
-
-        const data = response.json;
-        
-        // Handle both single and batch response formats
-        const embedding = data.embeddings?.[0] || data.embedding;
-        
-        if (!embedding || embedding.length === 0) {
-            throw new Error(`Ollama returned empty embedding for text: ${text.substring(0, 100)}...`);
-        }
-        
-        return VectorUtils.processVector(embedding);
-    }
-
-    async embed_many(texts: string[]): Promise<Int8Array[]> {
-        // Validate input data - should only be strings
-        for (let j = 0; j < texts.length; j++) {
-            const item = texts[j];
-            if (typeof item !== 'string') {
-                this.logger.error('OllamaProvider', `Invalid input at index ${j}: ${typeof item}`, item);
-                throw new Error(`Expected string at index ${j}, got ${typeof item}`);
-            }
-        }
-        
-        const embeddings: Int8Array[] = [];
-        const batchSize = 8; // Conservative batch size to avoid quality degradation
-        
-        for (let i = 0; i < texts.length; i += batchSize) {
-            const batch = texts.slice(i, i + batchSize);
-            
-            const requestBody = {
-                model: this.modelName,
-                input: batch
-            };
-            
-            const response = await requestUrl({
-                url: `${this.baseUrl}/api/embed`,
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(requestBody)
-            });
-            
-            if (response.status !== 200) {
-                this.logger.error('OllamaProvider', `Batch error response: ${response.text}`);
-                throw new Error(`Ollama API error: ${response.status} - ${response.text}`);
-            }
-
-            const data = response.json;
-            
-            if (!data.embeddings || !Array.isArray(data.embeddings)) {
-                throw new Error(`Ollama batch request failed - expected embeddings array, got: ${Object.keys(data)}`);
-            }
-            
-            // Process each embedding in the batch
-            for (const embedding of data.embeddings) {
-                if (!embedding || embedding.length === 0) {
-                    throw new Error('Ollama returned empty embedding in batch');
-                }
-                embeddings.push(VectorUtils.processVector(embedding));
-            }
-        }
-        
-        this.logger.info('OllamaProvider', `Completed batch processing of ${embeddings.length} embeddings`);
-        return embeddings;
-    }
-
-    async validate(): Promise<void> {
-        try {
-            // If model manager is available, use it for enhanced validation with auto-download
-            if (this.modelManager) {
-                await this.modelManager.ensureModelAvailable(this.modelName, true);
-                this.logger.info('OllamaProvider', `Validated connection and ensured model availability: ${this.modelName}`);
-                return;
-            }
-
-            // Fallback to basic validation if no model manager
-            const response = await requestUrl({
-                url: `${this.baseUrl}/api/tags`,
-                method: 'GET'
-            });
-            if (response.status !== 200) {
-                throw new Error(`Ollama server returned ${response.status}`);
-            }
-            
-            const data = response.json as OllamaModelsResponse;
-            if (!data.models || !Array.isArray(data.models)) {
-                throw new Error('Unexpected response format from Ollama server');
-            }
-            
-            // Check if selected model is available
-            const modelExists = data.models.some((model: OllamaModel) => model.name === this.modelName);
-            if (!modelExists) {
-                const availableModels = data.models.map((m: OllamaModel) => m.name).join(', ');
-                throw new Error(`Model "${this.modelName}" not found on Ollama server. Available models: ${availableModels}`);
-            }
-            
-            this.logger.info('OllamaProvider', `Validated connection and model: ${this.modelName}`);
-        } catch (error) {
-            if (error instanceof Error && error.message.includes('fetch')) {
-                throw new Error(`Cannot connect to Ollama server at ${this.baseUrl}. Please ensure Ollama is running and accessible.`);
-            }
-            throw error;
-        }
-    }
-}
-
-export class OpenAIEmbeddingProvider extends EmbeddingProvider {
-    private apiKey: string;
-    private modelName: string;
-    private baseUrl: string;
-    private logger: Logger;
-    private lastRequestTime: number = 0;
-    private minRequestInterval: number = 200; // Minimum 200ms between requests to avoid rate limits
-
-    constructor(apiKey: string, modelName: string = 'text-embedding-3-small', baseUrl: string = 'https://api.openai.com', logger: Logger) {
-        super();
-        this.apiKey = apiKey;
-        this.modelName = modelName;
-        this.baseUrl = baseUrl;
-        this.logger = logger;
-        
-        // Debug: Log API key info (without exposing the full key)
-        this.logger.debug('OpenAIProvider', `API key length: ${apiKey?.length || 0}, starts with: ${apiKey?.substring(0, 7) || 'undefined'}`);
-    }
-
-    async embed_one(text: string): Promise<Int8Array> {
-        // Check token count - rough estimate: 1 token ≈ 4 characters for English text
-        const estimatedTokens = Math.ceil(text.length / 4);
-        const maxTokens = 8000; // Leave some buffer below the 8192 limit
-        
-        if (estimatedTokens > maxTokens) {
-            this.logger.warn('OpenAIProvider', `Text too long for embedding (estimated ${estimatedTokens} tokens, limit ${maxTokens}), truncating...`);
-            // Truncate to approximately the token limit
-            const truncatedLength = maxTokens * 4;
-            text = text.substring(0, truncatedLength);
-        }
-        
-        return await this.makeRequestWithRetry(async () => {
-            const response = await requestUrl({
-                url: `${this.baseUrl}/v1/embeddings`,
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${this.apiKey}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    input: text,
-                    model: this.modelName
-                })
-            });
-
-            if (response.status !== 200) {
-                throw new Error(`OpenAI API error: ${response.status} - ${response.text}`);
-            }
-
-            const data = response.json;
-            
-            if (!data.data || !data.data[0] || !data.data[0].embedding) {
-                throw new Error('OpenAI returned invalid response format');
-            }
-            
-            return VectorUtils.processVector(data.data[0].embedding);
-        });
-    }
-
-    async embed_many(texts: string[]): Promise<Int8Array[]> {
-        // Validate input data - should only be strings
-        for (let j = 0; j < texts.length; j++) {
-            const item = texts[j];
-            if (typeof item !== 'string') {
-                this.logger.error('OpenAIProvider', `Invalid input at index ${j}: ${typeof item}`, item);
-                throw new Error(`Expected string at index ${j}, got ${typeof item}`);
-            }
-        }
-        
-        const embeddings: Int8Array[] = [];
-        const maxTokensPerRequest = 7500; // Leave buffer below 8192 limit
-        
-        // Process texts in dynamic batches based on token count
-        for (let i = 0; i < texts.length; ) {
-            const batch: string[] = [];
-            let currentTokens = 0;
-            
-            // Build batch until we approach token limit
-            while (i < texts.length && currentTokens < maxTokensPerRequest) {
-                const text = texts[i];
-                const estimatedTokens = Math.ceil(text.length / 4); // 1 token ≈ 4 characters
-                
-                // If adding this text would exceed limit, break (unless batch is empty)
-                if (currentTokens + estimatedTokens > maxTokensPerRequest && batch.length > 0) {
-                    break;
-                }
-                
-                batch.push(text);
-                currentTokens += estimatedTokens;
-                i++;
-            }
-            
-            if (batch.length === 0) {
-                // Single text is too large, skip it
-                this.logger.warn('OpenAIProvider', `Skipping text that's too large (estimated ${Math.ceil(texts[i].length / 4)} tokens)`);
-                i++;
-                continue;
-            }
-            
-            this.logger.debug('OpenAIProvider', `Processing batch of ${batch.length} items (~${currentTokens} tokens)`);
-            
-            const batchEmbeddings = await this.makeRequestWithRetry(async () => {
-                const response = await requestUrl({
-                    url: `${this.baseUrl}/v1/embeddings`,
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${this.apiKey}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        input: batch,
-                        model: this.modelName
-                    })
-                });
-
-                if (response.status !== 200) {
-                    this.logger.error('OpenAIProvider', `Batch error response: ${response.text}`);
-                    throw new Error(`OpenAI API error: ${response.status} - ${response.text}`);
-                }
-
-                const data = response.json;
-                
-                if (!data.data || !Array.isArray(data.data)) {
-                    throw new Error(`OpenAI batch request failed - expected data array, got: ${Object.keys(data)}`);
-                }
-                
-                // Process each embedding in the batch
-                const batchResults: Int8Array[] = [];
-                for (const item of data.data) {
-                    if (!item.embedding || item.embedding.length === 0) {
-                        throw new Error('OpenAI returned empty embedding in batch');
-                    }
-                    batchResults.push(VectorUtils.processVector(item.embedding));
-                }
-                
-                return batchResults;
-            });
-            
-            embeddings.push(...batchEmbeddings);
-        }
-        
-        this.logger.info('OpenAIProvider', `Completed batch processing of ${embeddings.length} embeddings`);
-        return embeddings;
-    }
-
-    /**
-     * Make a request with rate limiting and retry logic
-     */
-    private async makeRequestWithRetry<T>(requestFn: () => Promise<T>, maxRetries: number = 3): Promise<T> {
-        // Rate limiting: ensure minimum time between requests
-        const now = Date.now();
-        const timeSinceLastRequest = now - this.lastRequestTime;
-        if (timeSinceLastRequest < this.minRequestInterval) {
-            const waitTime = this.minRequestInterval - timeSinceLastRequest;
-            await sleep(waitTime);
-        }
-        this.lastRequestTime = Date.now();
-
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                return await requestFn();
-            } catch (error) {
-                const isRateLimit = error.message.includes('429') || error.message.includes('rate_limit_exceeded');
-                const isLastAttempt = attempt === maxRetries;
-                
-                if (isRateLimit && !isLastAttempt) {
-                    // Extract retry delay from error message or use default
-                    let retryDelay = 6000; // Default 6 seconds
-                    
-                    if (error.message.includes('try again in')) {
-                        const match = error.message.match(/try again in ([\d.]+)s/);
-                        if (match) {
-                            retryDelay = Math.ceil(parseFloat(match[1]) * 1000) + 1000; // Add 1s buffer
-                        }
-                    }
-                    
-                    this.logger.warn('OpenAIProvider', `Rate limited (attempt ${attempt}/${maxRetries}), retrying in ${retryDelay}ms`);
-                    await sleep(retryDelay);
-                    continue;
-                }
-                
-                // If not rate limit error, or final attempt, throw the error
-                throw error;
-            }
-        }
-        
-        // This should never be reached, but TypeScript requires it
-        throw new Error('Max retries exceeded');
-    }
-
-    async validate(): Promise<void> {
-        // Check for empty or missing API key first
-        if (!this.apiKey || this.apiKey.trim() === '') {
-            throw new Error('OpenAI API key is required. Please configure your API key in Tezcat settings (Settings → Community Plugins → Tezcat → Options).');
-        }
-        
-        try {
-            const response = await requestUrl({
-                url: 'https://api.openai.com/v1/me',
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${this.apiKey}`,
-                    'Content-Type': 'application/json'
-                }
-            });
-            
-            if (response.status !== 200) {
-                if (response.status === 401 || response.status === 403) {
-                    throw new Error('Invalid OpenAI API key. Please check your API key in Tezcat settings (Settings → Community Plugins → Tezcat → Options).');
-                }
-                throw new Error(`OpenAI API returned ${response.status}`);
-            }
-            
-            this.logger.info('OpenAIProvider', 'Validated API key successfully');
-        } catch (error) {
-            if (error.message.includes('fetch')) {
-                throw new Error('Cannot reach OpenAI API. Please check your internet connection.');
-            }
-            throw error;
-        }
-    }
-}
-
+/**
+ * Embeddings from any server with an OpenAI-compatible API (POST {endpoint}/embeddings):
+ * Ollama, LM Studio, llama.cpp, LocalAI, vLLM, OpenAI and others.
+ */
 export class EmbeddingService {
-    private provider: EmbeddingProvider;
-    private logger: Logger;
+	private readonly url: string;
+	private readonly base: string;
 
-    constructor(provider: EmbeddingProvider, logger: Logger) {
-        this.provider = provider;
-        this.logger = logger;
-    }
+	constructor(
+		readonly config: EmbeddingConfig,
+		private log: Logger,
+		private request: Request = (params) => requestUrl(params),
+		private wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+	) {
+		this.base = config.endpoint.trim().replace(/\/+$/, '');
+		this.url = `${this.base}/embeddings`;
+	}
 
-    get embeddingProvider(): EmbeddingProvider {
-        return this.provider;
-    }
+	/** This configuration's vector space (see vectorSpace). */
+	get space(): string {
+		return vectorSpace(this.config.model, this.config.prefixes.document);
+	}
 
-    async embedText(text: string): Promise<Int8Array> {
-        return await this.provider.embed_one(text);
-    }
+	/**
+	 * Model ids the server offers. Servers with a dedicated embeddings list (OpenRouter's
+	 * {endpoint}/embeddings/models) are asked for that first: their {endpoint}/models lists only
+	 * chat models. Elsewhere (Ollama, LM Studio, OpenAI, ...) that route doesn't exist and the
+	 * general {endpoint}/models list is used. `embeddingOnly` says which list it was.
+	 */
+	async listModels(): Promise<{ ids: string[]; embeddingOnly: boolean }> {
+		const dedicated = await this.getModelIds(`${this.base}/embeddings/models`).catch((e) => {
+			if (e instanceof EmbeddingError && e.reason === 'unreachable') throw e;
+			return null; // no such route on this server
+		});
+		if (dedicated) return { ids: dedicated, embeddingOnly: true };
+		const ids = await this.getModelIds(`${this.base}/models`);
+		if (!ids) throw new EmbeddingError('other', `Unexpected response from ${this.base}/models`);
+		return { ids, embeddingOnly: false };
+	}
 
-    async embedTexts(texts: string[]): Promise<Int8Array[]> {
-        return await this.provider.embed_many(texts);
-    }
-}
+	/** GET an OpenAI-style model list ({ data: [{ id }] }); null if the response isn't one. */
+	private async getModelIds(url: string): Promise<string[] | null> {
+		let res: RequestUrlResponse;
+		try {
+			res = await this.request({ url, method: 'GET', headers: this.headers(), throw: false });
+		} catch (e) {
+			throw new EmbeddingError('unreachable', `Could not connect to ${this.base}. Is the server running? (${(e as Error).message})`);
+		}
+		if (res.status !== 200) throw this.failure(res);
+		let data: unknown;
+		try { data = (res.json as { data?: unknown } | undefined)?.data; } catch { return null; }
+		if (!Array.isArray(data)) return null;
+		return data.map((m: { id?: unknown }) => m.id).filter((id): id is string => typeof id === 'string');
+	}
 
-export interface ModelDownloadProgress {
-    status: string;
-    completed?: number;
-    total?: number;
-    percentage?: number;
-    digest?: string;
-}
+	/** Ollama's native API sits beside its OpenAI-compatible one: the endpoint without /v1. */
+	private get ollamaBase(): string {
+		return this.base.replace(/\/v1$/, '');
+	}
 
-export class OllamaModelManager {
-    private baseUrl: string;
-    private logger: Logger;
-    private currentDownloadNotice: Notice | null = null;
+	/** Whether the endpoint is an Ollama server (it answers Ollama's /api/version). */
+	async isOllama(): Promise<boolean> {
+		try {
+			const res = await this.request({ url: `${this.ollamaBase}/api/version`, method: 'GET', throw: false });
+			return res.status === 200 && typeof (res.json as { version?: unknown } | undefined)?.version === 'string';
+		} catch {
+			return false;
+		}
+	}
 
-    constructor(baseUrl: string, logger: Logger) {
-        this.baseUrl = baseUrl;
-        this.logger = logger;
-    }
+	/** Download a model onto an Ollama server. Resolves when the download has finished. */
+	async pullOllamaModel(model: string): Promise<void> {
+		let res: RequestUrlResponse;
+		try {
+			res = await this.request({
+				url: `${this.ollamaBase}/api/pull`, method: 'POST', headers: this.headers(),
+				body: JSON.stringify({ model, stream: false }), throw: false,
+			});
+		} catch (e) {
+			throw new EmbeddingError('unreachable', `Could not connect to ${this.ollamaBase}. Is Ollama running? (${(e as Error).message})`);
+		}
+		const status = (res.json as { status?: string } | undefined)?.status;
+		if (res.status !== 200 || status !== 'success') throw this.failure(res);
+	}
 
-    /**
-     * Check if Ollama server is accessible
-     */
-    async checkServerAvailability(): Promise<boolean> {
-        try {
-            const response = await requestUrl({
-                url: `${this.baseUrl}/api/tags`,
-                method: 'GET'
-            });
-            return response.status === 200;
-        } catch (error) {
-            this.logger.warn('OllamaModelManager', 'Server not accessible', error);
-            return false;
-        }
-    }
+	private headers(): Record<string, string> {
+		const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+		if (this.config.apiKey) headers.Authorization = `Bearer ${this.config.apiKey}`;
+		return headers;
+	}
 
-    /**
-     * Get list of available models on Ollama server
-     */
-    async getAvailableModels(): Promise<string[]> {
-        try {
-            const response = await requestUrl({
-                url: `${this.baseUrl}/api/tags`,
-                method: 'GET'
-            });
-            if (response.status !== 200) {
-                throw new Error(`Server returned ${response.status}`);
-            }
-            
-            const data = response.json as OllamaModelsResponse;
-            if (!data.models || !Array.isArray(data.models)) {
-                return [];
-            }
-            
-            return data.models.map((model: OllamaModel) => model.name);
-        } catch (error) {
-            this.logger.error('OllamaModelManager', 'Failed to get available models', error);
-            return [];
-        }
-    }
+	async embedQuery(text: string): Promise<number[]> {
+		return (await this.embed([text], 'query'))[0];
+	}
 
-    /**
-     * Check if a specific model is available
-     */
-    async isModelAvailable(modelName: string): Promise<boolean> {
-        const models = await this.getAvailableModels();
-        return models.includes(modelName);
-    }
+	embedDocuments(texts: string[]): Promise<number[][]> {
+		return this.embed(texts, 'document');
+	}
 
-    /**
-     * Download a model from Ollama registry with progress tracking
-     */
-    async downloadModel(modelName: string, showProgress: boolean = true): Promise<void> {
-        this.logger.info('OllamaModelManager', `Starting download of model: ${modelName}`);
-        
-        if (showProgress) {
-            this.currentDownloadNotice = new Notice(`Downloading ${modelName}...`, 0);
-        }
+	/** Embed a short text to confirm the endpoint, model and key work. */
+	async check(): Promise<{ dimensions: number; ms: number }> {
+		const started = Date.now();
+		const [vector] = await this.embed(['Tezcat connection check'], 'document');
+		return { dimensions: vector.length, ms: Date.now() - started };
+	}
 
-        try {
-            // Note: Using fetch here because requestUrl doesn't support streaming responses
-            // This is the only remaining fetch call for streaming download functionality
-            const response = await fetch(`${this.baseUrl}/api/pull`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                    model: modelName,
-                    stream: true 
-                })
-            });
+	private async embed(texts: string[], kind: EmbedKind): Promise<number[][]> {
+		const prefix = this.config.prefixes[kind];
+		const out: number[][] = [];
+		for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+			out.push(...await this.post(texts.slice(i, i + BATCH_SIZE).map((t) => prefix + t.slice(0, MAX_CHARS))));
+		}
+		return out;
+	}
 
-            if (!response.ok) {
-                throw new Error(`Download failed: ${response.status} ${response.statusText}`);
-            }
+	private async post(input: string[]): Promise<number[][]> {
+		const headers = this.headers();
+		const body = JSON.stringify({ model: this.config.model, input });
 
-            await this.processDownloadStream(response, modelName, showProgress);
-            
-            this.logger.info('OllamaModelManager', `Successfully downloaded model: ${modelName}`);
-            
-            if (showProgress && this.currentDownloadNotice) {
-                this.currentDownloadNotice.hide();
-                new Notice(`Model ${modelName} downloaded successfully!`, 3000);
-            }
-            
-        } catch (error) {
-            this.logger.error('OllamaModelManager', `Failed to download model ${modelName}`, error);
-            
-            if (showProgress && this.currentDownloadNotice) {
-                this.currentDownloadNotice.hide();
-                new Notice(`Failed to download ${modelName}: ${error.message}`, 5000);
-            }
-            
-            throw error;
-        }
-    }
+		for (let attempt = 1; ; attempt++) {
+			let res: RequestUrlResponse;
+			try {
+				res = await this.request({ url: this.url, method: 'POST', headers, body, throw: false });
+			} catch (e) {
+				// Network-level failure (server not running, wrong host): retrying won't help.
+				throw new EmbeddingError('unreachable', `Could not connect to ${this.url}. Is the server running? (${(e as Error).message})`);
+			}
+			const retryable = res.status === 429 || res.status >= 500;
+			if (retryable && attempt < MAX_ATTEMPTS) {
+				const retryAfter = Number(res.headers?.['retry-after']);
+				const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 1000 * 2 ** (attempt - 1);
+				this.log.debug('Embeddings', `HTTP ${res.status}; retrying in ${delay} ms`);
+				await this.wait(delay);
+				continue;
+			}
+			if (res.status !== 200) throw this.failure(res);
 
-    /**
-     * Process the streaming download response
-     */
-    private async processDownloadStream(response: Response, modelName: string, showProgress: boolean): Promise<void> {
-        const reader = response.body?.getReader();
-        if (!reader) {
-            throw new Error('No response body available');
-        }
+			const data = (res.json as { data?: { index?: number; embedding?: number[] }[] } | undefined)?.data;
+			if (!Array.isArray(data) || data.length !== input.length || data.some((d) => !Array.isArray(d.embedding))) {
+				throw new EmbeddingError('other', `Unexpected response from ${this.url}: expected ${input.length} embeddings`);
+			}
+			// Items carry their position; don't rely on the order they arrive in.
+			return [...data].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)).map((d) => d.embedding!);
+		}
+	}
 
-        const decoder = new TextDecoder();
-        let downloadedBytes = 0;
-        let totalBytes = 0;
-
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                const chunk = decoder.decode(value, { stream: true });
-                const lines = chunk.split('\n').filter(line => line.trim());
-
-                for (const line of lines) {
-                    try {
-                        const data: ModelDownloadProgress = JSON.parse(line);
-                        
-                        if (data.completed && data.total) {
-                            downloadedBytes = data.completed;
-                            totalBytes = data.total;
-                            
-                            const percentage = Math.round((downloadedBytes / totalBytes) * 100);
-                            const mbDownloaded = Math.round(downloadedBytes / 1024 / 1024);
-                            const mbTotal = Math.round(totalBytes / 1024 / 1024);
-                            
-                            this.logger.debug('OllamaModelManager', `Download progress: ${percentage}% (${mbDownloaded}MB/${mbTotal}MB)`);
-                            
-                            if (showProgress && this.currentDownloadNotice) {
-                                this.updateDownloadProgress(modelName, percentage, mbDownloaded, mbTotal);
-                            }
-                        }
-                        
-                        if (data.status) {
-                            this.logger.debug('OllamaModelManager', `Download status: ${data.status}`);
-                            
-                            if (showProgress && this.currentDownloadNotice && data.status.includes('verifying')) {
-                                this.currentDownloadNotice.setMessage(`Verifying ${modelName}...`);
-                            }
-                        }
-                        
-                    } catch (parseError) {
-                        // Skip invalid JSON lines
-                        continue;
-                    }
-                }
-            }
-        } finally {
-            reader.releaseLock();
-        }
-    }
-
-    /**
-     * Update the download progress notice
-     */
-    private updateDownloadProgress(modelName: string, percentage: number, mbDownloaded: number, mbTotal: number): void {
-        if (!this.currentDownloadNotice) return;
-        
-        const progressBar = '█'.repeat(Math.floor(percentage / 5)) + '░'.repeat(20 - Math.floor(percentage / 5));
-        const message = `Downloading ${modelName}\n${progressBar} ${percentage}%\n${mbDownloaded}MB / ${mbTotal}MB`;
-        
-        this.currentDownloadNotice.setMessage(message);
-    }
-
-    /**
-     * Ensure a model is available, downloading it if necessary
-     */
-    async ensureModelAvailable(modelName: string, autoDownload: boolean = true): Promise<boolean> {
-        try {
-            // Check if server is available
-            if (!await this.checkServerAvailability()) {
-                throw new Error(`Ollama server not accessible at ${this.baseUrl}`);
-            }
-
-            // Check if model is already available
-            if (await this.isModelAvailable(modelName)) {
-                this.logger.info('OllamaModelManager', `Model ${modelName} is already available`);
-                return true;
-            }
-
-            // Model not available - download if auto-download is enabled
-            if (!autoDownload) {
-                return false;
-            }
-
-            this.logger.info('OllamaModelManager', `Model ${modelName} not found, downloading...`);
-            await this.downloadModel(modelName);
-            return true;
-
-        } catch (error) {
-            this.logger.error('OllamaModelManager', `Failed to ensure model ${modelName} is available`, error);
-            throw error;
-        }
-    }
-
-    /**
-     * Ensure multiple models are available
-     */
-    async ensureModelsAvailable(modelNames: string[], autoDownload: boolean = true): Promise<void> {
-        const results = await Promise.allSettled(
-            modelNames.map(modelName => this.ensureModelAvailable(modelName, autoDownload))
-        );
-
-        const failures = results
-            .map((result, index) => ({ result, modelName: modelNames[index] }))
-            .filter(({ result }) => result.status === 'rejected')
-            .map(({ result, modelName }) => ({ 
-                modelName, 
-                error: result.status === 'rejected' ? result.reason : 'Unknown error' 
-            }));
-
-        if (failures.length > 0) {
-            const errorMessage = failures
-                .map(({ modelName, error }) => `${modelName}: ${error.message || error}`)
-                .join(', ');
-            throw new Error(`Failed to ensure models available: ${errorMessage}`);
-        }
-
-        this.logger.info('OllamaModelManager', `All models are available: ${modelNames.join(', ')}`);
-    }
+	private failure(res: RequestUrlResponse): EmbeddingError {
+		let detail = '';
+		try {
+			const json = res.json as { error?: { message?: string } | string } | undefined;
+			detail = typeof json?.error === 'string' ? json.error : json?.error?.message ?? '';
+		} catch { /* not JSON */ }
+		detail ||= String(res.text ?? '').slice(0, 200);
+		const { model } = this.config;
+		if (res.status === 401 || res.status === 403) {
+			return new EmbeddingError('unauthorized', `The server rejected the API key (HTTP ${res.status}). ${detail}`.trim());
+		}
+		// Ollama: 404 "model ... not found, try pulling it first"; OpenAI: 404 "The model ... does
+		// not exist"; OpenRouter names the model without saying "model"; some servers use 400.
+		const aboutModel = /model/i.test(detail) || (model !== '' && (detail.includes(model) || detail.includes(model.replace(/:latest$/, ''))));
+		if ((res.status === 404 || res.status === 400) && aboutModel && /not found|does not exist|unknown|no such|no endpoints|not available|not a valid|invalid/i.test(detail)) {
+			return new EmbeddingError('model-not-found', `Model "${model}" isn't available on this server (with Ollama: ollama pull ${model}). ${detail}`.trim());
+		}
+		if (res.status === 404) {
+			return new EmbeddingError('no-endpoint', `No embeddings API at ${this.url} (HTTP 404). Check the endpoint URL; it usually ends in /v1.`);
+		}
+		return new EmbeddingError('other', `${this.url} returned HTTP ${res.status}. ${detail}`.trim());
+	}
 }

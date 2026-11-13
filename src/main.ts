@@ -1,1334 +1,647 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, WorkspaceLeaf} from 'obsidian';
-import { TezcatView, VIEW_TYPE } from './search_view';
-import { DatabaseService, SqlJsDatabaseAdapter } from './database_service';
-import { EmbeddingService, OllamaEmbeddingProvider, OpenAIEmbeddingProvider, EmbeddingProvider, VectorUtils, OllamaModelManager } from './embedding_service';
-import { ChunkingService } from './chunking_service';
-import { SearchService, SearchResult } from './search_service';
+import { App, CachedMetadata, Component, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, SecretComponent, Setting, TAbstractFile, TFile, WorkspaceLeaf, normalizePath, setIcon } from 'obsidian';
+import { EditorView } from '@codemirror/view';
+import { TezcatView, VIEW_TYPE, renderResultText } from './search_view';
+import { EmbeddingError, EmbeddingService, RECOMMENDED_OLLAMA_MODELS, embeddingModels, sameModel, suggestPrefixes } from './embedding_service';
+import { DEFAULT_SETTINGS, migrateSettings, vectorSpaceOf, type EmbeddingSettings, type SearchCadence, type TezcatSettings } from './settings';
+import { EmbeddingSpaceChanged, IndexRepository, type SourceFile, type VaultSource } from './index_repository';
+import { SearchService, type SearchResult } from './search';
 import { logger, LogLevel } from './logger';
-import { ValidationService, SystemValidationResult, ValidationResult } from './validation_service';
-import { NoteProcessor } from './note_processor';
+import { cursorContext } from './context';
 
 
-type EmbeddingProviderType = 'openai' | 'ollama';
-type SearchCadence = 'always' | 'sometimes' | 'occasionally';
-type SearchMode = 'vector' | 'hybrid';
+/** Wait this long after a file's last change before re-indexing it (Obsidian saves while you type). */
+const INDEX_DELAY_MS = 2000;
 
-interface TezcatSettings {
-    embeddingProvider: EmbeddingProviderType;
-    embeddingModel: string;
-    vectorSize: number;
-    openaiApiKey: string;
-    ollamaBaseUrl: string;
-    chunkSize: number;
-    chunkOverlap: number;
-    contextWindowWords: number;
-    searchCadence: SearchCadence;
-    searchMode: SearchMode;
-    logLevel: LogLevel;
-    highlightBlockOnOpen: boolean;
-}
+/** Debounce before searching, per cadence setting. */
+const SEARCH_DELAY_MS: Record<SearchCadence, number> = { always: 500, sometimes: 2000, occasionally: 8000 };
 
-const DEFAULT_SETTINGS: TezcatSettings = {
-    embeddingProvider: 'ollama',
-    embeddingModel: 'nomic-embed-text:v1.5',
-    vectorSize: 768,
-    openaiApiKey: '',
-    ollamaBaseUrl: 'http://localhost:11434',
-    chunkSize: 128,
-    chunkOverlap: 16,
-    contextWindowWords: 64, // Smaller context window for more focused search
-    searchCadence: 'always',
-    searchMode: 'hybrid',
-    logLevel: LogLevel.INFO,
-    highlightBlockOnOpen: true
-}
+const RESULT_LIMIT = 10;
+
+/** While the embedding provider is unreachable, check it again at most this often (on search or edit). */
+const SEMANTIC_RETRY_MS = 30_000;
+
+const isMarkdown = (file: TAbstractFile): file is TFile => file instanceof TFile && file.extension === 'md';
+
+const toSourceFile = (file: TFile): SourceFile =>
+    ({ path: file.path, basename: file.basename, mtime: file.stat.mtime, size: file.stat.size });
+
+const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 export default class Tezcat extends Plugin {
     settings: TezcatSettings;
-    public databaseService: DatabaseService;
-    public databaseAdapter: SqlJsDatabaseAdapter;
-    public embeddingService: EmbeddingService;
-    public chunkingService: ChunkingService;
-    public searchService: SearchService;
-    private noteProcessor: NoteProcessor;
-    private vectorUtils: VectorUtils;
-    private validationService: ValidationService;
-    public modelManager: OllamaModelManager | null = null;
-    private systemValidationResult: SystemValidationResult | null = null;
-    public isSystemValid: boolean = false;
-    public isOperationInProgress: boolean = false;
+    private index: IndexRepository;
+    private search: SearchService;
+    private embeddingService: EmbeddingService;
+
+    private indexReady = false;
+    private indexProgress: { label: string; done: number; total: number } | null = null;
+    /** Why semantic search is unavailable, if it is enabled but can't run. */
+    private semanticError: string | null = null;
+    private semanticRetryAt = 0;
+    /** The service search and embedding actually use: the configured one, or a fallback. */
+    private activeEmbedding: EmbeddingService | null = null;
+    /** Set while the configured model is missing and the last working model is used instead. */
+    private fallback: { configured: string; using: string } | null = null;
+    private embedRun: AbortController | null = null;
+    private embedAgain = false;
+    private rebuilding = false;
+
     private searchDebounceTimer: number | null = null;
-    private lastSearchContext: string = '';
-    private get CONTEXT_WINDOW_WORDS() { 
-        return this.settings.contextWindowWords; // Words to extract around cursor for search context
-    }
+    private searchSeq = 0; // Increments per search; stale results are dropped
     private searchSuppressedUntil: number = 0; // Timestamp to suppress search until
-    private currentNoteId: string | null = null; // Track current note for navigation events
-    private statusBarItem: HTMLElement | null = null; // Status bar item for system status
+    private pendingIndex = new Map<string, { timer: number; content: string; cache: CachedMetadata }>();
+    private statusBarItem: HTMLElement | null = null;
+
+    /** The vault, as the index sees it. */
+    private readonly vault: VaultSource = {
+        listFiles: () => this.app.vault.getMarkdownFiles().map(toSourceFile),
+        read: async (path) => {
+            const file = this.app.vault.getFileByPath(path);
+            if (!file || file.extension !== 'md') return null;
+            return { file: toSourceFile(file), content: await this.app.vault.cachedRead(file), cache: this.app.metadataCache.getFileCache(file) };
+        },
+    };
 
     async onload() {
         await this.loadSettings();
-        
-        // Configure logger from settings
         logger.setLevel(this.settings.logLevel);
-        logger.info('Plugin', 'Loading Tezcat plugin');
-        
-        
-        // Initialize vector utils and validation service
-        this.vectorUtils = new VectorUtils(logger);
-        this.validationService = new ValidationService(logger);
-        
-        // Initialize database (only this needs async initialization due to file I/O)
-        this.databaseAdapter = new SqlJsDatabaseAdapter(this, this.vectorUtils, logger);
-        await this.databaseAdapter.initialize();
-        
-        // Initialize services but don't validate yet
-        this.databaseService = new DatabaseService(this.databaseAdapter, logger);
-        this.initializeEmbeddingServices();
-        this.chunkingService = new ChunkingService(this.settings.chunkSize, this.settings.chunkOverlap, this, logger);
-        this.searchService = new SearchService(this.databaseService, this.embeddingService, logger);
 
-        // Initialize note processor
-        this.noteProcessor = new NoteProcessor();
+        this.index = new IndexRepository(this.indexNamespace(), logger);
+        this.search = new SearchService(this.index, async (path) => {
+            const file = this.app.vault.getFileByPath(path);
+            return file ? this.app.vault.cachedRead(file) : null;
+        }, logger);
+        this.createEmbeddingService();
 
-        // Create status bar item
         this.statusBarItem = this.addStatusBarItem();
-        this.updateStatusBar('sync', 'Tezcat: Initializing...', 'tezcat-status-initializing');
-        
-        // Schedule validation and setup to run when workspace is ready
-        this.app.workspace.onLayoutReady(() => {
-            this.performValidationAndSetup();
-        });
-        
-        //net new set up view
-        this.registerView(
-          VIEW_TYPE,
-          (leaf) => new TezcatView(leaf)
-        );
-        
-        // Add command to process all vault files
-        this.addCommand({
-            id: 'process-all-files',
-            name: 'Process all files',
-            callback: async () => {
-                await this.processAllVaultFilesIntoDatabase();
-            }
-        });
+        this.statusBarItem.onclick = () => new StatusModal(this.app, this).open();
+        this.refreshStatus();
 
-        // Add vector database commands
-        this.registerCommand('rebuild-database', 'Rebuild database', () => this.rebuildDatabase());
-        this.registerCommand('show-vector-database-stats', 'Show vector database stats', () => this.showVectorDatabaseStats());
-        this.registerCommand('rebuild-vector-index', 'Rebuild vector index', () => this.rebuildVectorIndex());
-        this.registerCommand('vector-search', 'Vector search', () => this.performVectorSearch());
-
-
-        // This adds a settings tab so the user can configure various aspects of the plugin
+        this.registerView(VIEW_TYPE, (leaf) => new TezcatView(leaf, this));
+        this.addRibbonIcon('eye', 'Open Tezcat panel', () => this.activateView());
+        this.addCommand({ id: 'open-panel', name: 'Open panel', callback: () => this.activateView() });
+        // Command ids are kept from earlier versions so existing hotkeys keep working.
+        this.addCommand({ id: 'process-all-files', name: 'Update index', callback: () => this.updateIndex() });
+        this.addCommand({ id: 'rebuild-database', name: 'Rebuild index', callback: () => this.rebuildIndex() });
+        this.addCommand({ id: 'show-vector-database-stats', name: 'Show index status', callback: () => new StatusModal(this.app, this).open() });
+        this.addCommand({ id: 'vector-search', name: 'Search notes', callback: () => this.searchFromModal() });
         this.addSettingTab(new TezcatSettingTab(this.app, this));
 
-        // If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-        // Using this function will automatically remove the event listener when this plugin is disabled.
+        // Search as the user types or moves the cursor (keyboard or mouse)...
+        this.registerEditorExtension(EditorView.updateListener.of((update) => {
+            if (update.docChanged || update.selectionSet) this.scheduleSearch();
+        }));
+        // ...and when they switch to another note or pane.
+        this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.scheduleSearch()));
+        this.registerEvent(this.app.workspace.on('file-open', () => this.scheduleSearch()));
 
-        // When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-        this.registerInterval(window.setInterval(() => logger.debug('Plugin', 'Heartbeat interval'), 5 * 60 * 1000));
-        
-        // Listen for file modifications
-        this.registerEvent(this.app.vault.on('modify', (file) => {
-            logger.debug('Plugin', `File modified: ${file.path}`);
-            this.handleFileModify(file);
-        }));
-        
-        // Listen for file creation
-        this.registerEvent(this.app.vault.on('create', (file) => {
-            logger.debug('Plugin', `File created: ${file.path}`);
-            this.handleFileCreate(file);
-        }));
-        
-        // Listen for file deletion
-        this.registerEvent(this.app.vault.on('delete', (file) => {
-            logger.info('Plugin', `File deletion event triggered: ${file.path}`);
-            this.handleFileDelete(file);
-        }));
-        
-        // Listen for file rename
-        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
-            logger.debug('Plugin', `File renamed: ${oldPath} -> ${file.path}`);
-            this.handleFileRename(file, oldPath);
-        }));
-        
-        // Listen for editor changes for dynamic search
-        this.registerEvent(this.app.workspace.on('editor-change', (editor, view) => {
-            if (view instanceof MarkdownView) {
-                this.onEditorChange(editor, view);
-            }
-        }));
-
-        // Listen for active leaf changes to track navigation to different markdown files
-        this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf) => {
-            this.onActiveLeafChange(leaf);
-        }));
-
-        // Listen for file open events (covers both opening new files and switching between files)
-        this.registerEvent(this.app.workspace.on('file-open', (file) => {
-            this.onFileOpen(file);
-        }));
-
-        // Listen for clicks on the editor to detect cursor movements
-        this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-            this.onDocumentClick(evt);
+        // Once the vault has loaded: keep the index in sync with file changes, then load and
+        // update it. Registering earlier would also receive an event for every file during load.
+        this.app.workspace.onLayoutReady(() => {
+            this.registerIndexingEvents();
+            void this.startIndex();
+            // Open the panel if the saved layout doesn't have it, without revealing an existing
+            // one behind another tab. With the setting off, a closed panel stays closed.
+            if (this.settings.openPanelOnStartup) void this.activateView({ reveal: false });
         });
-    }
-
-    async processOneFileIntoDatabase(file: any) {
-        try {
-            // Get file content
-            const content = await this.app.vault.read(file);
-            const metadata = await this.app.metadataCache.getFileCache(file);
-
-            const blocks = await this.noteProcessor.getBlocksFromFile(content, metadata)
-            
-            // Use upsertNote to handle existence checking and changes
-            const note_result = await this.databaseService.upsertNote(
-                file.path, 
-                file.name, 
-                file.basename, 
-                content
-            );
-
-            if (note_result.changed) {
-                const block_result = await this.databaseService.insertBlocksForNote(
-                    note_result.noteId,
-                    blocks
-                );
-
-                await this.databaseService.deleteVectorsForNote(note_result.noteId);
-                await this.databaseService.processNoteVector(
-                    note_result.noteId, 
-                    this.embeddingService
-                );
-
-                await this.databaseService.processBlockVectors(
-                    note_result.noteId,
-                    block_result.blockIds,
-                    this.embeddingService
-                );
-
-                logger.info('Plugin', `Processed: ${file.path}`);
-            }
-
-            return note_result;
-        } catch (error) {
-            logger.error('Plugin', `Error processing file ${file.path}`, error);
-            return null;
-        }
-    }
-
-    async processAllVaultFilesIntoDatabase(showNotice: boolean = true) {
-        if (showNotice) {
-            new Notice('Processing all files into database...');
-        }
-        
-        try {
-            const files = this.app.vault.getMarkdownFiles();
-            logger.info('Plugin', `Found ${files.length} markdown files in vault`);
-            
-            let processed = 0;
-            let created = 0;
-            let updated = 0;
-            let skipped = 0;
-            
-            for (const file of files) {
-                const result = await this.processOneFileIntoDatabase(file);
-                processed++;
-                if (result?.changed) {
-                    created++;
-                } else if (result) {
-                    skipped++;
-                }
-                // If result is null (error), it's counted in processed but not created/skipped
-            }
-            
-            const message = `Completed processing ${processed} files: ${created} processed (new/changed), ${skipped} skipped (unchanged)`;
-            if (showNotice) {
-                new Notice(message);
-            }
-            logger.info('Plugin', message);
-            
-        } catch (error) {
-            logger.error('Plugin', 'Failed to process vault files', error);
-            if (showNotice) {
-                new Notice('Failed to process vault files. Check console for details.');
-            }
-        }
-    }
-    
-    async activateView() {
-        const { workspace } = this.app;
-
-        let leaf: WorkspaceLeaf | null = null;
-        const leaves = workspace.getLeavesOfType(VIEW_TYPE);
-
-        if (leaves.length > 0) {
-          // A leaf with our view already exists, use that
-          leaf = leaves[0];
-        } else {
-          // Our view could not be found in the workspace, create a new leaf
-          // in the right sidebar for it
-          leaf = workspace.getRightLeaf(false);
-          if (leaf) {
-            await leaf.setViewState({ type: VIEW_TYPE, active: true });
-          }
-        }
-
-        // "Reveal" the leaf in case it is in a collapsed sidebar
-        if (leaf) {
-          workspace.revealLeaf(leaf);
-        }
     }
 
     async onunload() {
-        // Clean up status bar item
-        if (this.statusBarItem) {
-            this.statusBarItem.remove();
-            this.statusBarItem = null;
+        this.embedRun?.abort();
+        await this.index?.flush();
+    }
+
+    // ---------- settings ----------
+
+    async loadSettings() {
+        const saved = await this.loadData();
+        const migrated = saved ? migrateSettings(saved, (name, key) => this.app.secretStorage.setSecret(name, key)) : false;
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+        if (migrated) await this.saveData(this.settings);
+    }
+
+    /** Persist settings. Search and display settings take effect immediately. */
+    async saveSettings() {
+        await this.saveData(this.settings);
+        logger.setLevel(this.settings.logLevel);
+    }
+
+    /**
+     * Whether applying these changes means embedding every block again: they switch to a
+     * different model (or document prefix) whose vectors aren't stored. Vectors from different
+     * models can't be compared; the previous model's are kept, so switching back is free.
+     */
+    needsReembedding(changes: Partial<EmbeddingSettings>): boolean {
+        const space = vectorSpaceOf({ ...this.settings, ...changes });
+        return this.semanticEnabled && space !== vectorSpaceOf(this.settings) && !this.index.storedSpaces.includes(space);
+    }
+
+    /** Apply new embedding settings and restart semantic search with them. */
+    async updateEmbeddingSettings(changes: Partial<EmbeddingSettings>): Promise<void> {
+        Object.assign(this.settings, changes);
+        await this.saveSettings();
+        this.createEmbeddingService();
+        await this.updateSemanticSearch();
+    }
+
+    /** Change the semantic weight; turning semantic search on or off starts or stops it. */
+    async setSemanticWeight(weight: number): Promise<void> {
+        const wasOn = this.settings.semanticWeight > 0;
+        this.settings.semanticWeight = weight;
+        await this.saveSettings();
+        if (wasOn !== weight > 0) await this.updateSemanticSearch();
+    }
+
+    get semanticEnabled() { return this.settings.semanticWeight > 0; }
+
+    private createEmbeddingService(): void {
+        const { embeddingEndpoint, embeddingModel, embeddingApiKeySecret, queryPrefix, documentPrefix } = this.settings;
+        this.embeddingService = new EmbeddingService({
+            endpoint: embeddingEndpoint,
+            model: embeddingModel,
+            apiKey: embeddingApiKeySecret ? this.app.secretStorage.getSecret(embeddingApiKeySecret) : null,
+            prefixes: { query: queryPrefix, document: documentPrefix },
+        }, logger);
+    }
+
+    // ---------- index ----------
+
+    /** Per-vault, per-device name for the index databases, kept in Obsidian's vault-scoped local storage. */
+    private indexNamespace(): string {
+        let id = this.app.loadLocalStorage('tezcat-index-id');
+        if (typeof id !== 'string') {
+            id = crypto.randomUUID();
+            this.app.saveLocalStorage('tezcat-index-id', id);
         }
-        
-        // Save and close database connection
-        if (this.databaseAdapter) {
-            await this.databaseAdapter.save();
-            await this.databaseAdapter.close();
+        return `tezcat-${id}`;
+    }
+
+    private async startIndex() {
+        try {
+            // Load first: file events may already be arriving, and the index takes them in order.
+            await this.index.load();
+            await this.removeLegacyDatabase();
+            await this.syncIndex();
+            this.indexReady = true;
+            this.refreshStatus();
+            await this.updateSemanticSearch();
+        } catch (error) {
+            logger.error('Plugin', 'Failed to load the search index', error);
+            new Notice(`Tezcat could not load its index: ${errorMessage(error)}`, 10000);
         }
     }
 
-    private registerCommand(id: string, name: string, callback: () => Promise<void>): void {
-        this.addCommand({
-            id,
-            name,
-            callback
+    /** Versions before 2.0 kept a sql.js database in the plugin folder; nothing reads it now. */
+    private async removeLegacyDatabase() {
+        const legacy = normalizePath(`${this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`}/tezcat.db`);
+        if (await this.app.vault.adapter.exists(legacy)) {
+            await this.app.vault.adapter.remove(legacy);
+            logger.info('Plugin', 'Removed the database from an earlier version');
+        }
+    }
+
+    private async syncIndex() {
+        const { indexed, removed } = await this.index.sync(this.vault, (done, total) => {
+            this.indexProgress = done < total ? { label: 'Indexing', done, total } : null;
+            this.refreshStatus();
+        });
+        logger.info('Plugin', `Index updated: ${indexed} files indexed, ${removed} removed`);
+    }
+
+    /** Index new and changed files and embed any blocks that need it. */
+    async updateIndex() {
+        if (!this.indexReady) return;
+        await this.syncIndex();
+        void this.embedMissing();
+    }
+
+    /** Discard the index (including vectors) and build it again from the vault. */
+    async rebuildIndex() {
+        if (!this.indexReady || this.rebuilding) return;
+        this.rebuilding = true;
+        new Notice('Rebuilding the Tezcat index...');
+        try {
+            this.embedRun?.abort();
+            await this.index.clear();
+            await this.syncIndex();
+            await this.updateSemanticSearch();
+            new Notice('Tezcat index rebuilt.');
+        } catch (error) {
+            logger.error('Plugin', 'Index rebuild failed', error);
+            new Notice(`Rebuilding the index failed: ${errorMessage(error)}`, 10000);
+        } finally {
+            this.rebuilding = false;
+            this.refreshStatus();
+        }
+    }
+
+    get indexStats() { return this.index.stats; }
+
+    /** Model names with stored vectors, the current one first. */
+    get storedModels(): string[] {
+        return this.index.storedSpaces.map((space) => space.slice(0, space.lastIndexOf('|')));
+    }
+
+    /** Each model with stored vectors (current first) and how many vectors it has. */
+    async storedVectors(): Promise<{ space: string; model: string; count: number; current: boolean }[]> {
+        const counts = await this.index.storedVectorCounts();
+        return counts.map(({ space, count }) => ({
+            space,
+            model: space.slice(0, space.lastIndexOf('|')),
+            count,
+            current: space === this.index.embeddingSpace,
+        }));
+    }
+
+    async deleteStoredVectors(space: string) {
+        await this.index.deleteStoredVectors(space);
+        // The model in use lost its vectors: embed again (keyword search works meanwhile).
+        if (space === this.index.embeddingSpace) void this.embedMissing();
+        this.refreshStatus();
+    }
+
+    /** Model ids the configured server offers (see EmbeddingService.listModels). */
+    listModels(): Promise<{ ids: string[]; embeddingOnly: boolean }> {
+        return this.embeddingService.listModels();
+    }
+
+    isOllama(): Promise<boolean> {
+        return this.embeddingService.isOllama();
+    }
+
+    /** Download models onto the Ollama server one at a time, with a progress notice. */
+    async downloadModels(models: string[]): Promise<void> {
+        const service = this.embeddingService;
+        const notice = new Notice('', 0);
+        try {
+            for (const [i, model] of models.entries()) {
+                notice.setMessage(`Tezcat: downloading ${model} (${i + 1} of ${models.length})…`);
+                await service.pullOllamaModel(model);
+            }
+            notice.setMessage(`Tezcat: downloaded ${models.join(', ')}.`);
+            window.setTimeout(() => notice.hide(), 4000);
+        } catch (error) {
+            notice.setMessage(`Tezcat: download failed: ${errorMessage(error)}`);
+            window.setTimeout(() => notice.hide(), 10000);
+        }
+        // The configured model may have been one of the missing ones.
+        if (this.fallback || this.semanticError) await this.updateSemanticSearch({ quiet: true });
+    }
+
+    /** Embed a short text with the current settings and report what happened. */
+    async testConnection(): Promise<void> {
+        const service = this.embeddingService;
+        try {
+            const { dimensions, ms } = await service.check();
+            new Notice(`Connected: ${service.config.model} returns ${dimensions}-dimensional vectors (${ms} ms).`);
+            // It works now: stop using the fallback model, or start semantic search if it was down.
+            if (this.fallback || this.semanticError) await this.updateSemanticSearch();
+        } catch (error) {
+            new Notice(`Connection failed: ${errorMessage(error)}`, 10000);
+        }
+    }
+
+    // ---------- semantic search ----------
+
+    /**
+     * Start or stop semantic search to match the settings: check the embedding provider, then
+     * embed any blocks that need vectors in the background. Keyword search works throughout.
+     * `quiet` skips the notice when the provider is unreachable (used for automatic retries).
+     */
+    async updateSemanticSearch({ quiet = false }: { quiet?: boolean } = {}) {
+        this.embedRun?.abort();
+        this.semanticError = null;
+        this.search.semanticError = null;
+        this.search.embedQuery = null;
+        this.activeEmbedding = null;
+        this.fallback = null;
+        if (!this.semanticEnabled || !this.indexReady) {
+            this.refreshStatus();
+            return;
+        }
+        const configured = this.embeddingService;
+        let service = configured;
+        this.semanticRetryAt = Date.now() + SEMANTIC_RETRY_MS;
+        try {
+            await configured.check();
+        } catch (error) {
+            const fallback = await this.workingFallback(error);
+            if (configured !== this.embeddingService) return; // settings changed meanwhile
+            if (!fallback) {
+                if (!quiet) logger.warn('Plugin', 'Embedding provider unavailable', error);
+                this.semanticError = errorMessage(error);
+                this.refreshStatus();
+                if (!quiet) new Notice(`Tezcat: semantic search unavailable, using keyword search.\n${this.semanticError}`, 10000);
+                return;
+            }
+            service = fallback;
+            this.fallback = { configured: configured.config.model, using: fallback.config.model };
+            if (!quiet) logger.warn('Plugin', `Model ${configured.config.model} not found; using ${fallback.config.model}`);
+        }
+        if (configured !== this.embeddingService) return; // settings changed while validating
+        if (service === configured) await this.rememberWorkingModel();
+        await this.index.setEmbeddingSpace(service.space);
+        this.activeEmbedding = service;
+        this.search.embedQuery = (text) => service.embedQuery(text);
+        this.refreshStatus();
+        void this.embedMissing();
+    }
+
+    /**
+     * When the configured model isn't on the server, the last model that worked (if different
+     * and still available) — its vectors are kept, so switching to it is instant.
+     */
+    private async workingFallback(error: unknown): Promise<EmbeddingService | null> {
+        const last = this.settings.lastWorkingModel;
+        if (!(error instanceof EmbeddingError) || error.reason !== 'model-not-found') return null;
+        if (!last || last.model === this.settings.embeddingModel) return null;
+        const fallback = new EmbeddingService({
+            ...this.embeddingService.config,
+            model: last.model,
+            prefixes: { query: last.queryPrefix, document: last.documentPrefix },
+        }, logger);
+        try {
+            await fallback.check();
+            return fallback;
+        } catch {
+            return null;
+        }
+    }
+
+    private async rememberWorkingModel() {
+        const { embeddingModel: model, queryPrefix, documentPrefix } = this.settings;
+        const last = this.settings.lastWorkingModel;
+        if (last?.model === model && last.queryPrefix === queryPrefix && last.documentPrefix === documentPrefix) return;
+        this.settings.lastWorkingModel = { model, queryPrefix, documentPrefix };
+        await this.saveSettings();
+    }
+
+    /** While a fallback is in use: the configured model's name and the one used instead. */
+    get modelFallback() { return this.fallback; }
+
+    /**
+     * If the embedding provider was unreachable when semantic search started, check it again
+     * (quietly, at most every SEMANTIC_RETRY_MS) so semantic search and embedding resume once
+     * it's back. Called on searches and edits rather than on a timer, so nothing runs while idle.
+     */
+    private retrySemanticSearchIfDue() {
+        if (!this.semanticEnabled || Date.now() < this.semanticRetryAt) return;
+        if (this.semanticError && !this.search.embedQuery) {
+            void this.updateSemanticSearch({ quiet: true });
+        } else if (this.fallback) {
+            // Only switch over once the configured model works, so embedding with the fallback
+            // isn't interrupted by every check.
+            this.semanticRetryAt = Date.now() + SEMANTIC_RETRY_MS;
+            void this.embeddingService.check().then(() => this.updateSemanticSearch({ quiet: true }), () => {});
+        }
+    }
+
+    /** Embed blocks that have no vector yet. One run at a time; later requests queue a re-run. */
+    private async embedMissing() {
+        const service = this.activeEmbedding;
+        if (!service) return;
+        if (this.embedRun) { this.embedAgain = true; return; }
+        const run = this.embedRun = new AbortController();
+        try {
+            do {
+                this.embedAgain = false;
+                await this.index.embedMissing(this.vault, (texts) => service.embedDocuments(texts), {
+                    signal: run.signal,
+                    onProgress: (done, total) => {
+                        this.indexProgress = done < total ? { label: 'Embedding', done, total } : null;
+                        this.refreshStatus();
+                    },
+                });
+            } while (this.embedAgain && !run.signal.aborted);
+        } catch (error) {
+            if (!(error instanceof EmbeddingSpaceChanged) && !run.signal.aborted) {
+                logger.error('Plugin', 'Embedding failed', error);
+                this.semanticError = `Embedding failed: ${errorMessage(error)}`;
+            }
+        } finally {
+            if (this.embedRun === run) this.embedRun = null;
+            this.indexProgress = null;
+            this.refreshStatus();
+        }
+    }
+
+    // ---------- file events ----------
+
+    private registerIndexingEvents() {
+        // Fires after Obsidian has re-parsed a file (including newly created files), with the
+        // content and sections from the same parse.
+        this.registerEvent(this.app.metadataCache.on('changed', (file, content, cache) => {
+            if (file.extension === 'md') this.scheduleIndexing(file, content, cache);
+        }));
+        this.registerEvent(this.app.vault.on('delete', (file) => {
+            if (!isMarkdown(file)) return;
+            // A pending re-index would otherwise run after the delete and re-add the note.
+            this.cancelPendingIndexing(file.path);
+            void this.index.removeFile(file.path);
+        }));
+        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+            if (!isMarkdown(file)) return;
+            void this.vault.read(file.path).then((content) => this.index.renameFile(oldPath, content));
+        }));
+        this.register(() => {
+            for (const path of [...this.pendingIndex.keys()]) this.cancelPendingIndexing(path);
         });
     }
 
-    async loadSettings() {
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    /** Index a changed file once it has stopped changing, using its latest parse. */
+    private scheduleIndexing(file: TFile, content: string, cache: CachedMetadata) {
+        // Keyed by the path at the time of the change: renaming mutates `file.path`.
+        const key = file.path;
+        this.cancelPendingIndexing(key);
+        const timer = window.setTimeout(() => {
+            const latest = this.pendingIndex.get(key);
+            this.pendingIndex.delete(key);
+            // Skip files deleted in the meantime; a renamed file is indexed under its new path.
+            if (!latest || this.app.vault.getFileByPath(file.path) !== file) return;
+            void this.index.indexFile({ file: toSourceFile(file), content: latest.content, cache: latest.cache })
+                .then(() => {
+                    // The edit needs embedding: a good moment to check whether the provider is back.
+                    this.retrySemanticSearchIfDue();
+                    return this.embedMissing();
+                });
+        }, INDEX_DELAY_MS);
+        this.pendingIndex.set(key, { timer, content, cache });
     }
 
-    async saveSettings() {
-        await this.saveData(this.settings);
-        // Update logger level when settings are saved
-        logger.setLevel(this.settings.logLevel);
-        // Reinitialize services to pick up new settings
-        this.reinitializeServicesAfterSettingsChange();
+    private cancelPendingIndexing(path: string) {
+        const pending = this.pendingIndex.get(path);
+        if (!pending) return;
+        window.clearTimeout(pending.timer);
+        this.pendingIndex.delete(path);
     }
 
-    private reinitializeServicesAfterSettingsChange(): void {
-        logger.info('Plugin', 'Reinitializing services after settings change');
-        
-        // Reinitialize embedding services with new settings
-        this.initializeEmbeddingServices();
-        
-        // Update chunking service with new settings
-        this.chunkingService = new ChunkingService(
-            this.settings.chunkSize, 
-            this.settings.chunkOverlap, 
-            this, 
-            logger
-        );
-        
-        // Recreate search service with updated embedding service
-        this.searchService = new SearchService(
-            this.databaseService, 
-            this.embeddingService, 
-            logger
-        );
-        
-        // Clear any cached validation results to force fresh validation
-        this.clearValidationCache();
-        
-        logger.info('Plugin', 'Services reinitialized after settings change');
-    }
+    // ---------- search ----------
 
-    /**
-     * Clear validation cache to force fresh validation
-     */
-    clearValidationCache(): void {
-        this.systemValidationResult = null;
-        this.isSystemValid = false;
-    }
-
-    // Vector database command implementations
-    async rebuildDatabase() {
-        if (this.isOperationInProgress) {
-            new Notice('Database operation already in progress. Please wait for it to complete.');
-            return;
+    /** Open the panel in the right sidebar if it isn't open anywhere, and (by default) reveal it. */
+    async activateView({ reveal = true } = {}) {
+        const { workspace } = this.app;
+        let leaf: WorkspaceLeaf | null = workspace.getLeavesOfType(VIEW_TYPE)[0] ?? null;
+        if (!leaf) {
+            leaf = workspace.getRightLeaf(false);
+            await leaf?.setViewState({ type: VIEW_TYPE, active: true });
         }
-
-        this.isOperationInProgress = true;
-        new Notice('Starting database rebuild...');
-        
-        try {
-            // Drop all existing tables for a clean rebuild
-            await this.databaseAdapter.dropAllTables();
-            
-            // Recreate core tables
-            new Notice('Recreating database tables...');
-            await this.databaseAdapter.createNotesTable();
-            await this.databaseAdapter.createChunksTable();
-            await this.databaseAdapter.createVectorsTable();
-            await this.databaseAdapter.createBlocksTable();
-            await this.databaseAdapter.createFTSTable();
-            
-            // Process all vault files with the clean database
-            new Notice('Processing all vault files...');
-            await this.processAllVaultFilesIntoDatabase(false);
-            
-            // Build vector index (this will create LSH tables internally if needed)
-            new Notice('Building vector index...');
-            await this.databaseAdapter.generateVectorIndex(this.settings.vectorSize);
-            
-            // Save the rebuilt database
-            await this.databaseAdapter.save();
-            
-            new Notice('Database rebuild completed successfully!');
-            
-            // Update system status to reflect successful rebuild
-            this.isSystemValid = true;
-            this.updateStatusBar('check', 'Tezcat: System ready', 'tezcat-status-ready');
-        } catch (error) {
-            logger.error('Plugin', 'Database rebuild failed', error);
-            new Notice('Database rebuild failed. Check console for details.');
-        } finally {
-            this.isOperationInProgress = false;
-        }
-    }
-
-
-    /**
-     * Initialize embedding services with model manager integration
-     */
-    private initializeEmbeddingServices(): void {
-        if (this.settings.embeddingProvider === 'ollama') {
-            // Create model manager for Ollama
-            this.modelManager = new OllamaModelManager(this.settings.ollamaBaseUrl, logger);
-            
-            // Create Ollama provider with model manager
-            const ollamaProvider = new OllamaEmbeddingProvider(
-                this.settings.ollamaBaseUrl, 
-                this.settings.embeddingModel, 
-                logger
-            );
-            ollamaProvider.setModelManager(this.modelManager);
-            
-            this.embeddingService = new EmbeddingService(ollamaProvider, logger);
-            this.validationService.setModelManager(this.modelManager);
-        } else {
-            // Create OpenAI provider
-            const openaiProvider = new OpenAIEmbeddingProvider(
-                this.settings.openaiApiKey,
-                this.settings.embeddingModel,
-                'https://api.openai.com',
-                logger
-            );
-            
-            this.embeddingService = new EmbeddingService(openaiProvider, logger);
-        }
+        // Bring it to the front, e.g. out of a collapsed sidebar or from behind another tab
+        if (leaf && reveal) await workspace.revealLeaf(leaf);
     }
 
     /**
-     * Perform system validation before any setup
+     * The search panel, if it is open and loaded. A deferred leaf (restored from the saved
+     * layout but never shown since startup) has no TezcatView yet and returns null.
      */
-    async performValidationAndSetup(): Promise<void> {
-        if (this.isOperationInProgress) {
-            new Notice('Database operation already in progress. Please wait for it to complete.');
-            return;
-        }
-
-        this.isOperationInProgress = true;
-        try {
-            logger.info('Plugin', 'Starting system validation...');
-            
-            // Validate the entire system
-            this.systemValidationResult = await this.validationService.validateSystem(
-                this.embeddingService.embeddingProvider,
-                this.databaseService,
-                [this.settings.embeddingModel]
-            );
-            
-            this.isSystemValid = this.systemValidationResult.overall.success;
-            
-            if (this.isSystemValid) {
-                logger.info('Plugin', 'System validation successful, proceeding with setup...');
-                await this.performAutomaticSetup();
-                // Only show "ready" status after setup completes successfully
-                this.updateStatusBar('check', 'Tezcat: System ready', 'tezcat-status-ready');
-                await this.activateView();
-            } else {
-                logger.warn('Plugin', 'System validation failed, skipping automatic setup');
-                this.updateStatusBar('alert-triangle', 'Tezcat: Setup required', 'tezcat-status-error');
-                this.showValidationFailureGuidance();
-                // Still activate view so user can see guidance
-                await this.activateView();
-            }
-            
-        } catch (error) {
-            logger.error('Plugin', 'System validation failed with error', error);
-            this.isSystemValid = false;
-            this.updateStatusBar('x', 'Tezcat: Setup failed', 'tezcat-status-error');
-            new Notice('Tezcat setup failed. Check console for details.', 10000);
-            await this.activateView(); // Show view with error state
-        } finally {
-            this.isOperationInProgress = false;
-        }
-    }
-
-    /**
-     * Show guidance to user when validation fails
-     */
-    private showValidationFailureGuidance(): void {
-        if (!this.systemValidationResult) return;
-        
-        const summary = this.validationService.getValidationSummary(this.systemValidationResult);
-        new Notice(`Tezcat Setup Issues:\n${summary}`, 15000);
-        
-        // More specific guidance based on the type of failure
-        if (!this.systemValidationResult.embeddingProvider.success) {
-            const message = this.systemValidationResult.embeddingProvider.message;
-            if (message.includes('Ollama server not accessible')) {
-                new Notice('To fix: Start Ollama by starting up the application (or downloading and running at https://ollama.com/download) or by running "ollama serve" in terminal', 8000);
-            } else if (message.includes('API key')) {
-                new Notice('To fix: Add your OpenAI API key in Tezcat settings', 8000);
-            }
-        }
-        
-        if (!this.systemValidationResult.models.success) {
-            new Notice('Model download may be in progress. Check the notifications for status.', 5000);
-        }
-    }
-
-    /**
-     * Check if system is valid before performing vector operations
-     */
-    private ensureSystemValid(): boolean {
-        if (!this.isSystemValid) {
-            new Notice('Cannot perform operation: System validation failed. Please fix the issues shown earlier.', 8000);
-            return false;
-        }
-        return true;
-    }
-
-    async performAutomaticSetup() {
-        // Only proceed if system validation passed
-        if (!this.ensureSystemValid()) {
-            logger.warn('Plugin', 'Skipping automatic setup due to system validation failure');
-            return;
-        }
-        try {
-            // Automatically process all vault files when workspace is ready
-            logger.info('Plugin', 'Workspace ready, processing vault files...');
-            await this.processAllVaultFilesIntoDatabase(false);
-            
-            // Build vector index after all files are processed
-            logger.info('Plugin', 'Building vector index...');
-            await this.ensureVectorIndexExists();
-            
-            // Ensure FTS content exists for all notes (for hybrid search)
-            logger.info('Plugin', 'Ensuring FTS content is populated...');
-            await this.databaseService.ensureFTSContentForAllNotes();
-            
-            // Automatically activate the Tezcat view
-            logger.info('Plugin', 'Activating Tezcat view...');
-            await this.activateView();
-            
-            logger.info('Plugin', 'Automatic setup completed successfully');
-        } catch (error) {
-            logger.error('Plugin', 'Failed during automatic setup', error);
-        }
-    }
-
-    async ensureVectorIndexExists() {
-        if (!this.ensureSystemValid()) {
-            return;
-        }
-        
-        try {
-            // Check if vector index already exists
-            const lshConfig = await this.databaseAdapter.getLSHConfig();
-            
-            if (lshConfig) {
-                logger.info('Plugin', 'Vector index already exists, skipping build');
-                return;
-            }
-            
-            // Index doesn't exist, build it
-            logger.info('Plugin', 'Vector index not found, building index...');
-            await this.databaseAdapter.generateVectorIndex(this.settings.vectorSize);
-            logger.info('Plugin', 'Vector index built successfully');
-            
-        } catch (error) {
-            logger.error('Plugin', 'Failed to ensure vector index exists', error);
-            // Don't throw error during startup - just log it
-        }
-    }
-
-    async rebuildVectorIndex() {
-        if (!this.ensureSystemValid()) {
-            return;
-        }
-        
-        new Notice('Starting vector index rebuild...');
-        
-        try {
-            await this.databaseAdapter.generateVectorIndex(this.settings.vectorSize);
-            new Notice('Vector index rebuilt successfully!');
-        } catch (error) {
-            logger.error('Plugin', 'Vector index rebuild failed', error);
-            new Notice('Vector index rebuild failed. Check console for details.');
-        }
-    }
-
-    async showVectorDatabaseStats() {
-        try {
-            const stats = await this.databaseService.getVectorDatabaseStats();
-
-            const message = `Vector database stats:
-• Total notes: ${stats.totalNotes}
-• Processed notes: ${stats.processedNotes}
-• Total vectors: ${stats.totalVectors}
-• Note vectors: ${stats.vectorsByType.note}
-• Block vectors: ${stats.vectorsByType.block}
-• Outdated notes: ${stats.outdatedNotes}
-• Orphaned vectors: ${stats.orphanedData.orphanedVectors}
-• Orphaned chunks: ${stats.orphanedData.orphanedChunks}`;
-
-            new Notice(message, 10000); // Show for 10 seconds
-            logger.info('Plugin', `Vector Database Stats: totalNotes=${stats.totalNotes}, processedNotes=${stats.processedNotes}, totalVectors=${stats.totalVectors}, noteVectors=${stats.vectorsByType.note}, blockVectors=${stats.vectorsByType.block}`);
-        } catch (error) {
-            logger.error('Plugin', 'Failed to get vector database stats', error);
-            new Notice('Failed to get vector database stats. Check console for details.');
-        }
-    }
-
-    async performVectorSearch() {
-        try {
-            // Create a simple input modal to get the search query
-            new VectorSearchModal(this.app, async (query: string) => {
-                if (!query.trim()) {
-                    new Notice('Please enter a search query');
-                    return;
-                }
-
-                new Notice('Performing vector search...');
-                
-                try {
-                    const currentNotePath = this.getCurrentNotePath();
-                    const excludeNotePaths = currentNotePath ? [currentNotePath] : [];
-                    
-                    const results = await this.searchService.vectorSearch(query, {
-                        topK: 10,
-                        minScore: 0.1,
-                        includeNoteVectors: true,
-                        includeChunkVectors: false,
-                        includeBlockVectors: true,
-                        excludeNotePaths
-                    });
-
-                    if (results.length === 0) {
-                        new Notice('No results found');
-                        return;
-                    }
-
-                    // Display results in a modal
-                    new VectorSearchResultsModal(this.app, query, results).open();
-                    
-                } catch (error) {
-                    logger.error('Plugin', 'Vector search failed', error);
-                    new Notice('Vector search failed. Check console for details.');
-                }
-            }).open();
-            
-        } catch (error) {
-            logger.error('Plugin', 'Failed to open vector search', error);
-            new Notice('Failed to open vector search. Check console for details.');
-        }
-    }
-
-
-    private onEditorChange(editor: Editor, view: MarkdownView) {
-        // Only search if we're on a markdown file and search panel is visible
-        if (!view || !this.isSearchPanelVisible()) {
-            return;
-        }
-
-        const context = this.extractCursorContext(editor);
-        this.debouncedSearch(context);
-    }
-
-    private onActiveLeafChange(leaf: WorkspaceLeaf | null) {
-        // Handle note navigation tracking
-        this.handleNoteNavigation(leaf);
-        
-        // Track the last active markdown view for the search panel
-        if (leaf?.view instanceof MarkdownView) {
-            const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-            if (leaves.length > 0 && leaves[0].view instanceof TezcatView) {
-                const searchView = leaves[0].view;
-                searchView.setLastActiveMarkdownView(leaf.view);
-            }
-        }
-
-        if (!this.isSearchPanelVisible()) {
-            return;
-        }
-
-        // Check if we're on a markdown file
-        if (leaf?.view instanceof MarkdownView) {
-            const editor = leaf.view.editor;
-            const context = this.extractCursorContext(editor);
-            this.debouncedSearch(context);
-        }
-        // Note: We don't clear results when switching away from markdown files
-        // This allows users to interact with search results even when not in an editor
-    }
-
-    private onDocumentClick(evt: MouseEvent) {
-        // Only proceed if the search panel is open and visible
-        if (!this.isSearchPanelVisible()) {
-            return;
-        }
-
-        // Check if the click was in an editor area (lightweight check)
-        const target = evt.target as Element;
-        if (target && (target.closest('.cm-editor') || target.closest('.markdown-source-view'))) {
-            // Defer the heavy work to avoid blocking the click event
-            window.setTimeout(() => {
-                try {
-                    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-                    if (activeView && activeView.editor) {
-                        const context = this.extractCursorContext(activeView.editor);
-                        this.debouncedSearch(context);
-                    }
-                } catch (error) {
-                    logger.warn('Plugin', 'Error handling click event', error);
-                }
-            }, 10);
-        }
-    }
-
-    private onFileOpen(file: any) {
-        // Handle note navigation tracking for file opens
-        window.setTimeout(() => {
-            const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (activeView) {
-                this.handleNoteNavigation(activeView.leaf);
-            }
-        }, 10);
-
-        if (!this.isSearchPanelVisible()) {
-            return;
-        }
-
-        // Small delay to ensure the editor is ready
-        window.setTimeout(() => {
-            const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (activeView && activeView.editor) {
-                const context = this.extractCursorContext(activeView.editor);
-                this.debouncedSearch(context);
-            } else {
-                // Not a markdown file - clear results since there's no cursor context
-                this.updateSearchPanel([]);
-            }
-        }, 50);
-    }
-
-    private extractCursorContext(editor: Editor): string {
-        try {
-            const doc = editor.getDoc();
-            
-            // Get cursor position first, fallback to beginning if no cursor
-            let cursor;
-            try {
-                cursor = editor.getCursor();
-            } catch (error) {
-                cursor = { line: 0, ch: 0 };
-            }
-            
-            // Get a reasonable range around the cursor instead of the full document
-            // This is much faster for large documents
-            const lineCount = doc.lineCount();
-            const contextLines = 10; // Look at 10 lines before and after cursor
-            const startLine = Math.max(0, cursor.line - contextLines);
-            const endLine = Math.min(lineCount, cursor.line + contextLines + 1);
-            
-            // Get text from the limited range
-            const lines = [];
-            for (let i = startLine; i < endLine; i++) {
-                lines.push(doc.getLine(i));
-            }
-            const contextText = lines.join('\n');
-            
-            // Split into words
-            const words = contextText.split(/\s+/).filter(word => word.length > 0);
-            
-            if (words.length === 0) {
-                return '';
-            }
-            
-            // Find approximate cursor position within this limited context
-            let wordIndex = 0;
-            for (let i = startLine; i < cursor.line && i < lineCount; i++) {
-                const line = doc.getLine(i);
-                const lineWords = line.split(/\s+/).filter(word => word.length > 0);
-                wordIndex += lineWords.length;
-            }
-            
-            // Add words from current line up to cursor position
-            if (cursor.line < lineCount) {
-                const currentLine = doc.getLine(cursor.line);
-                const lineUpToCursor = currentLine.substring(0, cursor.ch);
-                const wordsBeforeCursor = lineUpToCursor.split(/\s+/).filter(word => word.length > 0);
-                wordIndex += wordsBeforeCursor.length;
-            }
-            
-            // Extract context window, but limit to what we actually retrieved
-            const halfWindow = Math.floor(this.CONTEXT_WINDOW_WORDS / 2);
-            const startIndex = Math.max(0, wordIndex - halfWindow);
-            const endIndex = Math.min(words.length, wordIndex + halfWindow);
-            
-            return words.slice(startIndex, endIndex).join(' ');
-            
-        } catch (error) {
-            logger.warn('Plugin', 'Error extracting cursor context', error);
-            return '';
-        }
-    }
-
-    /**
-     * Get debounce delay based on search cadence setting
-     */
-    private getSearchDebounceDelay(): number {
-        switch (this.settings.searchCadence) {
-            case 'always':
-                return 500; // 0.5 seconds - current behavior
-            case 'sometimes':
-                return 2000; // 2 seconds - slower
-            case 'occasionally':
-                return 8000; // 8 seconds - very slow
-            default:
-                return 500;
-        }
-    }
-
-    private debouncedSearch(context: string) {
-        // Check if search is currently suppressed
-        if (Date.now() < this.searchSuppressedUntil) {
-            logger.debug('Plugin', 'Search suppressed due to recent button interaction');
-            return;
-        }
-
-        if (this.searchDebounceTimer) {
-            window.clearTimeout(this.searchDebounceTimer);
-        }
-        
-        const debounceDelay = this.getSearchDebounceDelay();
-        logger.debug('Plugin', `Using search cadence: ${this.settings.searchCadence} (${debounceDelay}ms delay)`);
-        
-        this.searchDebounceTimer = window.setTimeout(async () => {
-            // Double-check suppression at execution time
-            if (Date.now() < this.searchSuppressedUntil) {
-                logger.debug('Plugin', 'Search suppressed at execution time');
-                return;
-            }
-            
-            if (context.trim()) {
-                this.lastSearchContext = context;
-                await this.performDynamicSearch(context);
-            }
-        }, debounceDelay);
+    private get view(): TezcatView | null {
+        const leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
+        return leaf?.view instanceof TezcatView ? leaf.view : null;
     }
 
     private isSearchPanelVisible(): boolean {
-        const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-        return leaves.length > 0 && leaves[0].view instanceof TezcatView && leaves[0].view.containerEl.isShown();
+        return this.view?.containerEl.isShown() ?? false;
     }
 
-    private async performDynamicSearch(context: string) {
+    /** Debounced: searches once the user pauses, using the cursor context at that moment. */
+    private scheduleSearch() {
+        if (!this.isSearchPanelVisible() || Date.now() < this.searchSuppressedUntil) return;
+        if (this.searchDebounceTimer) window.clearTimeout(this.searchDebounceTimer);
+        this.searchDebounceTimer = window.setTimeout(() => {
+            this.searchDebounceTimer = null;
+            void this.runSearch();
+        }, SEARCH_DELAY_MS[this.settings.searchCadence] ?? SEARCH_DELAY_MS.always);
+    }
+
+    private async runSearch() {
+        if (Date.now() < this.searchSuppressedUntil) return;
+        // This search uses keywords if semantic search is down; it may bring it back for the next.
+        this.retrySemanticSearchIfDue();
+        // Results stay as they are when focus is somewhere other than a note (e.g. the panel).
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view) return;
+        const context = cursorContext(view.editor, view.editor.getCursor(), this.settings.contextWindowWords);
+        if (!context.trim()) return;
+
+        const seq = ++this.searchSeq;
         try {
-            const currentNotePath = this.getCurrentNotePath();
-            const excludeNotePaths = currentNotePath ? [currentNotePath] : [];
-            
-            // Perform search based on settings (vector or hybrid)
-            const searchPromise = this.settings.searchMode === 'hybrid' 
-                ? this.searchService.hybridSearch(context, {
-                    topK: 10,
-                    minScore: 0, // RRF scores are much smaller than cosine similarity scores
-                    includeNoteVectors: true,
-                    includeChunkVectors: false,
-                    includeBlockVectors: true,
-                    excludeNotePaths,
-                    hybridWeight: 0.5 // Equal weighting by default
-                })
-                : this.searchService.vectorSearch(context, {
-                    topK: 10,
-                    minScore: 0.1,
-                    includeNoteVectors: true,
-                    includeChunkVectors: false,
-                    includeBlockVectors: true,
-                    excludeNotePaths
-                });
-            
-            const results = await searchPromise;
-            
-            // Update panel asynchronously
-            await this.updateSearchPanel(results);
-            
+            const results = await this.search.search(context, { ...this.searchOptions, excludePath: view.file?.path });
+            // A newer search started while this one ran; its results win.
+            if (seq === this.searchSeq) this.view?.updateSearchResults(results);
+            this.refreshStatus(); // a semantic search may have just failed or recovered
         } catch (error) {
-            logger.error('Plugin', 'Dynamic search failed', error);
-            await this.updateSearchPanel([]);
+            logger.error('Plugin', 'Search failed', error);
         }
     }
 
-    private async updateSearchPanel(results: SearchResult[]) {
-        const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-        if (leaves.length > 0 && leaves[0].view instanceof TezcatView) {
-            const view = leaves[0].view;
-            // Update view asynchronously to avoid blocking the editor
-            window.setTimeout(async () => {
-                await view.updateSearchResults(results);
-            }, 0);
-        }
-    }
-
-    private getCurrentNotePath(): string | null {
-        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!activeView || !activeView.file) {
-            return null;
-        }
-
-        return activeView.file.path;
+    private get searchOptions() {
+        return {
+            semanticWeight: this.settings.semanticWeight,
+            limit: RESULT_LIMIT,
+            filterBoilerplate: this.settings.filterBoilerplate,
+            filterCommonPhrasing: this.settings.filterCommonPhrasing,
+        };
     }
 
     suppressSearchFor(milliseconds: number = 2000) {
         this.searchSuppressedUntil = Date.now() + milliseconds;
-        logger.debug('Plugin', `Search suppressed for ${milliseconds}ms`);
     }
 
-    // File event handlers for note reprocessing
-    private async handleFileModify(file: any) {
-        // Only process markdown files
-        if (file.extension !== 'md') return;
-        
-        try {
-            // Use the complete blocks workflow for modified files
-            await this.processOneFileIntoDatabase(file);
-        } catch (error) {
-            logger.error('Plugin', `Failed to handle file modify for ${file.path}`, error);
-        }
+    private searchFromModal() {
+        new SearchQueryModal(this.app, async (query) => {
+            const results = await this.search.search(query, { ...this.searchOptions, excludePath: this.app.workspace.getActiveFile()?.path });
+            if (results.length === 0) new Notice('No results found');
+            else new SearchResultsModal(this.app, query, results).open();
+        }).open();
     }
 
-    private async handleFileCreate(file: any) {
-        // Only process markdown files
-        if (file.extension !== 'md') return;
-        
-        try {
-            // Use the complete blocks workflow for new files
-            await this.processOneFileIntoDatabase(file);
-        } catch (error) {
-            logger.error('Plugin', `Failed to handle file create for ${file.path}`, error);
+    // ---------- status ----------
+
+    /** One-line summary of what the index is doing, for the status bar and status modal. */
+    get statusSummary(): { icon: string; text: string; problem: boolean } {
+        if (this.indexProgress) {
+            const { label, done, total } = this.indexProgress;
+            return { icon: '○', text: `${label} ${done}/${total}`, problem: false };
         }
+        if (!this.indexReady) return { icon: '○', text: 'Loading index', problem: false };
+        if (this.semanticError) return { icon: '!', text: `Semantic search unavailable: ${this.semanticError}`, problem: true };
+        if (this.semanticEnabled && this.search.semanticError) {
+            return { icon: '!', text: `Semantic search failing, showing keyword results: ${this.search.semanticError}`, problem: true };
+        }
+        if (this.fallback) {
+            return { icon: '!', text: `Model "${this.fallback.configured}" isn't available on the server; using ${this.fallback.using}`, problem: true };
+        }
+        if (this.semanticEnabled && !this.search.embedQuery) return { icon: '○', text: 'Starting semantic search', problem: false };
+        return { icon: '✓', text: this.semanticEnabled ? 'Keyword and semantic search ready' : 'Keyword search ready', problem: false };
     }
 
-    private async handleFileDelete(file: any) {
-        // Only process markdown files
-        if (file.extension !== 'md') return;
-        
-        try {
-            // Check if note exists in database
-            const existingNote = await this.databaseService.getNoteByPath(file.path);
-            if (existingNote) {
-                logger.info('Plugin', `Removing deleted note from database: ${file.path}`);
-                // Delete in order: vectors, chunks, then note
-                await this.databaseService.deleteVectorsForNote(existingNote.id);
-                await this.databaseService.deleteChunksForNote(existingNote.id);
-                await this.databaseService.deleteNote(existingNote.id);
-                logger.info('Plugin', `Successfully removed note ${existingNote.id} (${file.path}) from database`);
-            } else {
-                logger.debug('Plugin', `Note not found in database for deletion: ${file.path}`);
-            }
-        } catch (error) {
-            logger.error('Plugin', `Failed to handle file delete for ${file.path}`, error);
-        }
-    }
-
-    private async handleFileRename(file: any, oldPath: string) {
-        // Only process markdown files
-        if (file.extension !== 'md') return;
-        
-        try {
-            // Look for note by old path
-            const existingNote = await this.databaseService.getNoteByPath(oldPath);
-            if (existingNote) {
-                logger.debug('Plugin', `Updating renamed note path: ${oldPath} -> ${file.path}`);
-                await this.databaseService.updateNote(existingNote.id, {
-                    name: file.name,
-                    base_name: file.basename,
-                    path: file.path
-                });
-            } else {
-                // Note not found by old path - might be a new file, handle as create
-                logger.debug('Plugin', `Note not found for rename, treating as new file: ${file.path}`);
-                await this.handleFileCreate(file);
-            }
-        } catch (error) {
-            logger.error('Plugin', `Failed to handle file rename from ${oldPath} to ${file.path}`, error);
-        }
-    }
-
-
-    private async handleNoteNavigation(leaf: WorkspaceLeaf | null) {
-        // Only handle markdown files
-        if (!leaf?.view || !(leaf.view instanceof MarkdownView) || !leaf.view.file) {
-            return;
-        }
-        
-        const file = leaf.view.file;
-        if (file.extension !== 'md') return;
-        
-        try {
-            // Get the note ID for the current file
-            const note = await this.databaseService.getNoteByPath(file.path);
-            const newNoteId = note?.id || null;
-            
-            
-            // Update current note tracking
-            this.currentNoteId = newNoteId;
-            
-        } catch (error) {
-            logger.warn('Plugin', `Failed to handle note navigation for ${file.path}`, error);
-        }
-    }
-
-    /**
-     * Update the status bar with current system status
-     */
-    public updateStatusBar(status: string, tooltip: string, className?: string) {
+    private refreshStatus() {
         if (!this.statusBarItem) return;
-        
-        this.statusBarItem.empty();
-        
-        // Map status to simple text indicators
-        let displayText: string;
-        switch (status) {
-            case 'sync':
-                displayText = '○';
-                break;
-            case 'check':
-                displayText = '✓';
-                break;
-            case 'alert-triangle':
-                displayText = '!';
-                break;
-            case 'x':
-                displayText = '×';
-                break;
-            default:
-                displayText = status;
-        }
-        
-        this.statusBarItem.setText(displayText);
-        this.statusBarItem.title = tooltip;
-        
-        // Remove existing tezcat status classes
-        this.statusBarItem.removeClass('tezcat-status-initializing');
-        this.statusBarItem.removeClass('tezcat-status-ready');
-        this.statusBarItem.removeClass('tezcat-status-error');
-        
-        if (className) {
-            this.statusBarItem.addClass(className);
-        }
-        
-        // Add click handler to show validation details
-        this.statusBarItem.onclick = () => {
-            this.showSystemStatusModal();
-        };
+        const { icon, text, problem } = this.statusSummary;
+        this.statusBarItem.setText(icon);
+        this.statusBarItem.title = `Tezcat: ${text}`;
+        this.statusBarItem.toggleClass('tezcat-status-ready', icon === '✓');
+        this.statusBarItem.toggleClass('tezcat-status-initializing', icon === '○');
+        this.statusBarItem.toggleClass('tezcat-status-error', problem);
     }
-
-    /**
-     * Show detailed system status in a modal
-     */
-    private async showSystemStatusModal() {
-        // If operation is in progress, show modal immediately without validation
-        if (this.isOperationInProgress) {
-            // Skip validation and proceed directly to showing modal
-        } else if (!this.systemValidationResult) {
-            // Only run validation if not in progress and no validation result exists
-            new Notice('Running system validation...');
-            await this.performValidationAndSetup();
-            // Return early - performValidationAndSetup handles everything including user feedback
-            // Don't show the modal after validation/setup completes
-            return;
-        }
-        
-        // Get current database stats for real-time display
-        try {
-            const noteCount = (await this.databaseService.getAllNotes()).length;
-            const vectorCount = await this.databaseService.getVectorCount();
-            
-            // Create updated validation result with current database info
-            const updatedResult = {
-                ...this.systemValidationResult,
-                database: {
-                    success: true,
-                    message: `Database ready (${noteCount} notes, ${vectorCount} vectors)`
-                }
-            } as SystemValidationResult;
-            
-            new SystemStatusModal(this.app, updatedResult, this.isSystemValid, this).open();
-        } catch (error) {
-            // Fall back to cached result if database query fails, or create minimal result if none exists
-            const fallbackResult = this.systemValidationResult || {
-                embeddingProvider: { success: false, message: 'Not validated yet' },
-                database: { success: false, message: 'Not validated yet' },
-                models: { success: false, message: 'Not validated yet' },
-                overall: { success: false, message: 'System not validated yet' }
-            };
-            new SystemStatusModal(this.app, fallbackResult, this.isSystemValid, this).open();
-        }
-    }
-
 }
 
 
+/** The nearest element (itself or an ancestor) that scrolls vertically. */
+function scrollParent(el: HTMLElement | null): HTMLElement | null {
+    for (let e = el; e; e = e.parentElement) {
+        const { overflowY } = getComputedStyle(e);
+        if ((overflowY === 'auto' || overflowY === 'scroll') && e.scrollHeight > e.clientHeight) return e;
+    }
+    return null;
+}
+
+/** Dropdown value for "type a model name". */
+const OTHER_MODEL = '\u0000other';
+
 class TezcatSettingTab extends PluginSettingTab {
     plugin: Tezcat;
-    private pendingSettings: TezcatSettings;
-    private hasSensitiveChanges: boolean = false;
+    /** The server's models (and whether it's Ollama), fetched once per endpoint/key and on refresh. */
+    private models: { source: string; ids: string[] | null; embeddingOnly: boolean; error: string | null; ollama: boolean } | null = null;
+    /** The user picked "Other…" to type a model name. */
+    private typingModel = false;
+    /** Whether the "Advanced" section is expanded; kept across redraws. */
+    private advancedOpen = false;
+    private downloading = false;
 
     constructor(app: App, plugin: Tezcat) {
         super(app, plugin);
         this.plugin = plugin;
-        this.pendingSettings = { ...plugin.settings };
     }
 
+    /** Redraws empty and rebuild the page; keep the user's scroll position instead of jumping to the top. */
     display(): void {
+        const scroller = scrollParent(this.containerEl);
+        const top = scroller?.scrollTop ?? 0;
+        this.render();
+        if (scroller) scroller.scrollTop = top;
+    }
+
+    private render(): void {
         const {containerEl} = this;
 
         containerEl.empty();
 
-        // Embedding Settings Section
-        new Setting(containerEl).setHeading().setName('Embeddings');
-        containerEl.createEl('p', {
-            text: 'Changing these settings will require reindexing all vault content.',
-            cls: 'setting-item-description'
-        });
+        new Setting(containerEl).setHeading().setName('Search');
 
         new Setting(containerEl)
-            .setName('Embedding provider')
-            .setDesc('Choose the provider for generating embeddings')
-            .addDropdown(dropdown => dropdown
-                .addOption('ollama', 'Ollama')
-                .addOption('openai', 'OpenAI')
-                .setValue(this.pendingSettings.embeddingProvider)
-                .onChange((value: EmbeddingProviderType) => {
-                    this.pendingSettings.embeddingProvider = value;
-                    this.hasSensitiveChanges = true;
-                    this.display(); // Refresh settings to show/hide conditional settings
+            .setName('Semantic search')
+            .setDesc('0 uses keyword search only and needs nothing else. Higher values mix in semantic matches from an embedding provider (configured below); 1 uses semantic matches only.')
+            .addSlider(slider => slider
+                .setLimits(0, 1, 0.05)
+                .setValue(this.plugin.settings.semanticWeight)
+                // Deprecated in 1.13, where the value is always shown; needed to show it on older versions.
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    const wasOn = this.plugin.semanticEnabled;
+                    await this.plugin.setSemanticWeight(value);
+                    if (wasOn !== this.plugin.semanticEnabled) this.display(); // show/hide provider settings
                 }));
 
-        new Setting(containerEl)
-            .setName('Embedding model')
-            .setDesc('The model to use for generating embeddings')
-            .addDropdown(dropdown => {
-                if (this.pendingSettings.embeddingProvider === 'openai') {
-                    dropdown
-                        .addOption('text-embedding-3-small', 'Text Embedding 3 Small (1536d)')
-                        .addOption('text-embedding-3-large', 'Text Embedding 3 Large (3072d)');
-                } else if (this.pendingSettings.embeddingProvider === 'ollama') {
-                    dropdown
-                        .addOption('nomic-embed-text:v1.5', 'Nomic Embed Text v1.5 (768d)')
-                        .addOption('bge-m3', 'BGE M3 (1024d)');
-                }
-                
-                dropdown
-                    .setValue(this.pendingSettings.embeddingModel)
-                    .onChange((value) => {
-                        this.pendingSettings.embeddingModel = value;
-                        this.hasSensitiveChanges = true;
-                        
-                        // Auto-update vector size based on model
-                        if (value === 'bge-m3') {
-                            this.pendingSettings.vectorSize = 1024;
-                        } else if (value === 'text-embedding-3-small') {
-                            this.pendingSettings.vectorSize = 1536;
-                        } else if (value === 'text-embedding-3-large') {
-                            this.pendingSettings.vectorSize = 3072;
-                        } else {
-                            this.pendingSettings.vectorSize = 768;
-                        }
-                        this.display(); // Refresh to update vector size field
-                    });
-            });
-
-        new Setting(containerEl)
-            .setName('Vector size')
-            .setDesc('The size of the embedding vectors (default: 768)')
-            .addText(text => {
-                const isReadOnly = this.pendingSettings.embeddingModel === 'bge-m3' || 
-                                 this.pendingSettings.embeddingModel === 'text-embedding-3-small' ||
-                                 this.pendingSettings.embeddingModel === 'text-embedding-3-large';
-                
-                text
-                    .setPlaceholder('768')
-                    .setValue(this.pendingSettings.vectorSize.toString())
-                    .setDisabled(isReadOnly);
-                
-                if (!isReadOnly) {
-                    const originalValue = this.plugin.settings.vectorSize;
-                    text.onChange((value) => {
-                        const vectorSize = parseInt(value) || 768;
-                        this.pendingSettings.vectorSize = vectorSize;
-                    });
-                    text.inputEl.addEventListener('blur', () => {
-                        if (this.pendingSettings.vectorSize !== originalValue) {
-                            this.hasSensitiveChanges = true;
-                            this.display();
-                        }
-                    });
-                }
-            });
-
-        new Setting(containerEl)
-            .setName('Chunk size')
-            .setDesc('The number of tokens per text chunk. Also affects the search context window size around your cursor (default: 128)')
-            .addText(text => {
-                const originalValue = this.plugin.settings.chunkSize;
-                text
-                    .setPlaceholder('128')
-                    .setValue(this.pendingSettings.chunkSize.toString())
-                    .onChange((value) => {
-                        const chunkSize = parseInt(value) || 128;
-                        this.pendingSettings.chunkSize = chunkSize;
-                    });
-                text.inputEl.addEventListener('blur', () => {
-                    if (this.pendingSettings.chunkSize !== originalValue) {
-                        this.hasSensitiveChanges = true;
-                        this.display();
-                    }
-                });
-            });
-
-        new Setting(containerEl)
-            .setName('Chunk overlap')
-            .setDesc('The number of tokens to overlap between chunks for better context continuity (default: 16)')
-            .addText(text => {
-                const originalValue = this.plugin.settings.chunkOverlap;
-                text
-                    .setPlaceholder('16')
-                    .setValue(this.pendingSettings.chunkOverlap.toString())
-                    .onChange((value) => {
-                        const chunkOverlap = parseInt(value) || 16;
-                        this.pendingSettings.chunkOverlap = chunkOverlap;
-                    });
-                text.inputEl.addEventListener('blur', () => {
-                    if (this.pendingSettings.chunkOverlap !== originalValue) {
-                        this.hasSensitiveChanges = true;
-                        this.display();
-                    }
-                });
-            });
-
-        // Conditional settings based on provider
-        if (this.pendingSettings.embeddingProvider === 'openai') {
-            new Setting(containerEl)
-                .setName('OpenAI API key')
-                .setDesc('Your OpenAI API key for embedding generation')
-                .addText(text => {
-                    const originalValue = this.plugin.settings.openaiApiKey;
-                    text
-                        .setPlaceholder('sk-...')
-                        .setValue(this.pendingSettings.openaiApiKey)
-                        .onChange((value) => {
-                            this.pendingSettings.openaiApiKey = value;
-                        });
-                    text.inputEl.addEventListener('blur', () => {
-                        if (this.pendingSettings.openaiApiKey !== originalValue) {
-                            this.hasSensitiveChanges = true;
-                            this.display();
-                        }
-                    });
-                });
-        }
-
-        if (this.pendingSettings.embeddingProvider === 'ollama') {
-            new Setting(containerEl)
-                .setName('Ollama base URL')
-                .setDesc('The base URL for your Ollama server')
-                .addText(text => {
-                    const originalValue = this.plugin.settings.ollamaBaseUrl;
-                    text
-                        .setPlaceholder('http://localhost:11434')
-                        .setValue(this.pendingSettings.ollamaBaseUrl)
-                        .onChange((value) => {
-                            this.pendingSettings.ollamaBaseUrl = value;
-                        });
-                    text.inputEl.addEventListener('blur', () => {
-                        if (this.pendingSettings.ollamaBaseUrl !== originalValue) {
-                            this.hasSensitiveChanges = true;
-                            this.display();
-                        }
-                    });
-                });
-        }
-
-        // Save and Cancel buttons for sensitive settings
-        const buttonContainer = containerEl.createDiv('setting-item');
-        const buttonInfo = buttonContainer.createDiv('setting-item-info');
-        const buttonControl = buttonContainer.createDiv('setting-item-control');
-
-        if (this.hasSensitiveChanges) {
-            const saveButton = buttonControl.createEl('button', {
-                text: 'Save changes',
-                cls: 'mod-cta'
-            });
-            saveButton.onclick = () => this.confirmAndSave();
-
-            const cancelButton = buttonControl.createEl('button', {
-                text: 'Cancel'
-            });
-            cancelButton.onclick = () => this.cancelChanges();
-        }
-
-        // Rebuild Database Button
-        new Setting(containerEl)
-            .setName('Rebuild database & index')
-            .setDesc('Completely rebuild the database and reindex all vault content. This will take some time but can fix indexing issues.')
-            .addButton(button => button
-                .setButtonText('Rebuild database')
-                .setClass('mod-warning')
-                .onClick(async () => {
-                    // Show confirmation modal
-                    new ReindexConfirmModal(
-                        this.app,
-                        async () => {
-                            // User confirmed - proceed with rebuild
-                            await this.plugin.rebuildDatabase();
-                        },
-                        () => {
-                            // User cancelled - do nothing
-                        }
-                    ).open();
-                }));
-
-        // Horizontal divider
-        const divider = containerEl.createEl('hr', {
-            cls: 'tezcat-settings-divider'
-        });
-
-        // Application Settings Section
-        new Setting(containerEl).setHeading().setName('Application');
-        containerEl.createEl('p', {
-            text: 'These settings take effect immediately and don\'t require reindexing.',
-            cls: 'setting-item-description'
-        });
-
-        // Search Cadence Setting (applies immediately)
         new Setting(containerEl)
             .setName('Search cadence')
             .setDesc('How frequently to perform contextual searches as you move your cursor')
@@ -1340,23 +653,8 @@ class TezcatSettingTab extends PluginSettingTab {
                 .onChange(async (value: SearchCadence) => {
                     this.plugin.settings.searchCadence = value;
                     await this.plugin.saveSettings();
-                    logger.info('Settings', `Search cadence updated to: ${value}`);
                 }));
 
-        new Setting(containerEl)
-            .setName('Search mode')
-            .setDesc('Choose between vector-only search or hybrid search combining semantic similarity with keyword matching')
-            .addDropdown(dropdown => dropdown
-                .addOption('vector', 'Vector only (semantic similarity)')
-                .addOption('hybrid', 'Hybrid (semantic + keyword matching)')
-                .setValue(this.plugin.settings.searchMode)
-                .onChange(async (value: SearchMode) => {
-                    this.plugin.settings.searchMode = value;
-                    await this.plugin.saveSettings();
-                    logger.info('Settings', `Search mode updated to: ${value}`);
-                }));
-
-        // Context Window Setting (applies immediately)
         new Setting(containerEl)
             .setName('Search context window (words)')
             .setDesc('Number of words to extract around your cursor for contextual search (default: 64)')
@@ -1364,25 +662,62 @@ class TezcatSettingTab extends PluginSettingTab {
                 .setPlaceholder('64')
                 .setValue(this.plugin.settings.contextWindowWords.toString())
                 .onChange(async (value) => {
-                    const contextWords = parseInt(value) || 64;
-                    this.plugin.settings.contextWindowWords = contextWords;
+                    this.plugin.settings.contextWindowWords = parseInt(value) || 64;
                     await this.plugin.saveSettings();
-                    logger.info('Settings', `Context window words updated to: ${contextWords}`);
                 }));
 
-        // Highlight Block Setting (applies immediately)
         new Setting(containerEl)
-            .setName('Highlight block on open')
-            .setDesc('When opening a note from a block search result, highlight the entire block content')
+            .setName('Filter detected boilerplate')
+            .setDesc('Hide passages repeated across 5 or more notes, such as templated headers and bylines, and show any other repeated passage only once.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.filterBoilerplate)
+                .onChange(async (value) => {
+                    this.plugin.settings.filterBoilerplate = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Filter common phrasing')
+            .setDesc('Hide passages made only of words that are common across your vault, such as "he said, at last." Applies once the vault has 20 or more notes.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.filterCommonPhrasing)
+                .onChange(async (value) => {
+                    this.plugin.settings.filterCommonPhrasing = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Highlight text on open')
+            .setDesc('When opening a result, select the matching text in the note')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.highlightBlockOnOpen)
                 .onChange(async (value) => {
                     this.plugin.settings.highlightBlockOnOpen = value;
                     await this.plugin.saveSettings();
-                    logger.info('Settings', `Highlight block on open: ${value}`);
                 }));
 
-        // Log Level Setting (applies immediately)
+        new Setting(containerEl)
+            .setName('Open panel on startup')
+            .setDesc('Open the Tezcat panel when Obsidian starts, if it isn\'t already open. Turn off to keep it closed once you close it.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.openPanelOnStartup)
+                .onChange(async (value) => {
+                    this.plugin.settings.openPanelOnStartup = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        if (this.plugin.semanticEnabled) this.displayEmbeddingSettings(containerEl);
+
+        new Setting(containerEl).setHeading().setName('Maintenance');
+
+        new Setting(containerEl)
+            .setName('Rebuild index')
+            .setDesc('Discard the index and rebuild it from your vault. Not normally needed; it can fix a damaged index.')
+            .addButton(button => button
+                .setButtonText('Rebuild index')
+                .setWarning()
+                .onClick(() => this.plugin.rebuildIndex()));
+
         new Setting(containerEl)
             .setName('Log level')
             .setDesc('Set the logging verbosity level for debugging')
@@ -1393,257 +728,309 @@ class TezcatSettingTab extends PluginSettingTab {
                 .addOption(LogLevel.DEBUG.toString(), 'DEBUG')
                 .setValue(this.plugin.settings.logLevel.toString())
                 .onChange(async (value) => {
-                    const newLogLevel = parseInt(value) as LogLevel;
-                    this.plugin.settings.logLevel = newLogLevel;
+                    this.plugin.settings.logLevel = parseInt(value) as LogLevel;
                     await this.plugin.saveSettings();
-                    logger.setLevel(newLogLevel);
                 }));
     }
 
-    private createEmbeddingProvider(): EmbeddingProvider {
-        switch (this.plugin.settings.embeddingProvider) {
-            case 'ollama':
-                // Create model manager if needed
-                if (!this.plugin.modelManager) {
-                    this.plugin.modelManager = new OllamaModelManager(this.plugin.settings.ollamaBaseUrl, logger);
-                }
-                
-                // Create Ollama provider with model manager
-                const ollamaProvider = new OllamaEmbeddingProvider(
-                    this.plugin.settings.ollamaBaseUrl, 
-                    this.plugin.settings.embeddingModel, 
-                    logger
-                );
-                ollamaProvider.setModelManager(this.plugin.modelManager);
-                return ollamaProvider;
-            case 'openai':
-                return new OpenAIEmbeddingProvider(
-                    this.plugin.settings.openaiApiKey,
-                    this.plugin.settings.embeddingModel,
-                    'https://api.openai.com',
-                    logger
-                );
-            default:
-                throw new Error(`Unknown embedding provider: ${this.plugin.settings.embeddingProvider}`);
-        }
-    }
-
-    private async reinitializeServices(): Promise<void> {
-        logger.info('Plugin', 'Reinitializing services with new settings...');
-        
-        // Always recreate all services for safety
-        const provider = this.createEmbeddingProvider();
-        this.plugin.embeddingService = new EmbeddingService(provider, logger);
-        
-        this.plugin.chunkingService = new ChunkingService(
-            this.plugin.settings.chunkSize, 
-            this.plugin.settings.chunkOverlap, 
-            this.plugin, 
-            logger
-        );
-        
-        // Recreate search service to use the new embedding service
-        this.plugin.searchService = new SearchService(
-            this.plugin.databaseService, 
-            this.plugin.embeddingService, 
-            logger
-        );
-        
-        // Clear any cached validation results to force fresh validation
-        this.plugin.clearValidationCache();
-        
-        logger.info('Plugin', 'Services reinitialized successfully');
-    }
-
-    private async validateCurrentProvider(): Promise<void> {
-        const provider = this.plugin.embeddingService.embeddingProvider;
-        await provider.validate();
-    }
-
-    private async confirmAndSave() {
-        const requiresReindex = this.requiresReindex();
-        
-        if (requiresReindex) {
-            new ReindexConfirmModal(
-                this.app, 
-                async () => {
-                    // User confirmed - proceed with save and reindex
-                    await this.saveAndReindex();
-                },
-                () => {
-                    // User cancelled - reset pending settings and clear save/cancel state
-                    this.pendingSettings = { ...this.plugin.settings };
-                    this.hasSensitiveChanges = false;
-                    this.display();
-                }
-            ).open();
-        } else {
-            await this.saveSettings();
-        }
-    }
-
-    private requiresReindex(): boolean {
-        return (
-            this.plugin.settings.embeddingProvider !== this.pendingSettings.embeddingProvider ||
-            this.plugin.settings.embeddingModel !== this.pendingSettings.embeddingModel ||
-            this.plugin.settings.vectorSize !== this.pendingSettings.vectorSize ||
-            this.plugin.settings.chunkSize !== this.pendingSettings.chunkSize ||
-            this.plugin.settings.chunkOverlap !== this.pendingSettings.chunkOverlap
-        );
-    }
-
-    private async saveAndReindex() {
-        if (this.plugin.isOperationInProgress) {
-            new Notice('Database operation already in progress. Please wait for it to complete.');
-            return;
-        }
-
-        this.plugin.isOperationInProgress = true;
-        try {
-            // Save settings first
-            this.plugin.settings = { ...this.pendingSettings };
-            await this.plugin.saveSettings();
-            this.hasSensitiveChanges = false;
-            this.display(); // Immediately refresh UI to clear save/cancel buttons
-            
-            new Notice('Settings saved. Validating configuration...');
-            logger.info('Plugin', 'Starting reindexing process with new settings');
-            
-            // Reinitialize services with new settings
-            await this.reinitializeServices();
-            
-            // Validate provider before destructive operations
-            new Notice('Validating embedding provider...');
-            await this.validateCurrentProvider();
-            
-            new Notice('Configuration validated. Rebuilding vector database...');
-            logger.info('Plugin', 'Beginning vector database rebuild');
-            
-            // Use the existing rebuildDatabase method which handles everything properly
-            await this.plugin.rebuildDatabase();
-            
-            new Notice('Reindexing completed successfully!');
-            logger.info('Plugin', 'Reindexing completed successfully');
-            
-            // Update system status to reflect successful reindex
-            this.plugin.isSystemValid = true;
-            this.plugin.updateStatusBar('check', 'Tezcat: System ready', 'tezcat-status-ready');
-            
-            // Reset pending settings to match saved settings and refresh UI
-            this.pendingSettings = { ...this.plugin.settings };
-            this.hasSensitiveChanges = false;
-            this.display();
-            
-        } catch (error) {
-            logger.error('Plugin', 'Reindexing failed', error);
-            
-            // Keep new settings but show clear error and reset UI state
-            let errorMessage = 'Reindexing failed: ';
-            if (error.message.includes('Ollama')) {
-                errorMessage += error.message;
-            } else if (error.message.includes('OpenAI')) {
-                errorMessage += error.message;
-            } else {
-                errorMessage += 'Unknown error occurred. Check console for details.';
-            }
-            
-            new Notice(errorMessage, 10000);
-            new Notice('Try using Command Palette - "Tezcat: Rebuild Vector Database" to retry with the new settings.', 8000);
-            
-            // Reset pending settings to match saved settings (even though save failed, we want UI to reflect current state)
-            this.pendingSettings = { ...this.plugin.settings };
-            this.hasSensitiveChanges = false;
-            this.display();
-        } finally {
-            this.plugin.isOperationInProgress = false;
-        }
-    }
-
-    private async saveSettings() {
-        this.plugin.settings = { ...this.pendingSettings };
-        await this.plugin.saveSettings();
-        this.hasSensitiveChanges = false;
-        
-        new Notice('Settings saved.');
-        this.display();
-    }
-
-    private cancelChanges() {
-        this.pendingSettings = { ...this.plugin.settings };
-        this.hasSensitiveChanges = false;
-        this.display();
-    }
-}
-
-class ReindexConfirmModal extends Modal {
-    private onConfirm: () => void;
-    private onCancel: () => void;
-
-    constructor(app: App, onConfirm: () => void, onCancel: () => void) {
-        super(app);
-        this.onConfirm = onConfirm;
-        this.onCancel = onCancel;
-    }
-
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.empty();
-
-        new Setting(contentEl).setHeading().setName('Confirm reindex');
-
-        contentEl.createEl('p', {
-            text: 'The changes you made will require reindexing all vault content. This may take several minutes depending on your vault size.'
-        });
-
-        contentEl.createEl('p', {
-            text: 'During reindexing:',
+    private displayEmbeddingSettings(containerEl: HTMLElement) {
+        const settings = this.plugin.settings;
+        new Setting(containerEl).setHeading().setName('Embedding provider');
+        containerEl.createEl('p', {
+            text: 'Any server with an OpenAI-compatible embeddings API: Ollama (http://localhost:11434/v1), LM Studio (http://localhost:1234/v1), llama.cpp, or a hosted service such as OpenAI (https://api.openai.com/v1) or OpenRouter (https://openrouter.ai/api/v1). Hosted services charge for embedding.',
             cls: 'setting-item-description'
         });
 
-        const list = contentEl.createEl('ul');
-        list.createEl('li', { text: 'All existing embeddings will be cleared' });
-        list.createEl('li', { text: 'New embeddings will be generated for all files' });
-        list.createEl('li', { text: 'Search functionality may be limited until complete' });
+        // Text settings apply when the field is committed (Enter or leaving it), not per keystroke.
+        const textSetting = (name: string, desc: string, placeholder: string, value: string, apply: (value: string) => void) =>
+            new Setting(containerEl).setName(name).setDesc(desc).addText(text => {
+                text.setPlaceholder(placeholder).setValue(value);
+                text.inputEl.addEventListener('change', () => {
+                    const next = text.getValue().trim();
+                    if (next !== value) apply(next);
+                });
+            });
 
-        const buttonContainer = contentEl.createDiv('tezcat-button-container');
-        
-        const confirmButton = buttonContainer.createEl('button', {
-            text: 'Confirm and Reindex',
-            cls: 'mod-cta'
-        });
-        confirmButton.onclick = () => {
-            this.close();
-            this.onConfirm();
-        };
+        textSetting('Endpoint URL', 'Base URL of the embeddings API, usually ending in /v1.', DEFAULT_SETTINGS.embeddingEndpoint,
+            settings.embeddingEndpoint, (embeddingEndpoint) => this.apply({ embeddingEndpoint }));
 
-        const cancelButton = buttonContainer.createEl('button', {
-            text: 'Cancel'
-        });
-        cancelButton.onclick = () => {
-            this.close();
-            this.onCancel();
+        const modelSetting = this.displayModelSetting(containerEl, textSetting);
+        const fallback = this.plugin.modelFallback;
+        if (fallback) {
+            const warning = modelSetting.descEl.createDiv({ cls: 'tezcat-setting-warning' });
+            setIcon(warning.createSpan({ cls: 'tezcat-setting-warning-icon' }), 'alert-triangle');
+            warning.createSpan({
+                text: `"${fallback.configured}" isn't available on this server, so Tezcat is using ${fallback.using}, the last model that worked. With Ollama, run: ollama pull ${fallback.configured}`,
+            });
+        }
+
+        new Setting(containerEl)
+            .setName('API key')
+            .setDesc('Only needed for hosted services. Kept in Obsidian\'s secret storage, not in the plugin\'s settings file.')
+            .addComponent(el => new SecretComponent(this.app, el)
+                .setValue(settings.embeddingApiKeySecret)
+                .onChange((secret) => this.apply({ embeddingApiKeySecret: secret ?? '' })));
+
+        new Setting(containerEl)
+            .setName('Test connection')
+            .setDesc('Embed a short text with these settings and report the result.')
+            .addButton(button => button
+                .setButtonText('Test')
+                .onClick(async () => {
+                    button.setDisabled(true);
+                    await this.plugin.testConnection();
+                    button.setDisabled(false);
+                }));
+
+
+        // Rarely needed: prefixes are filled in automatically for known models.
+        const advanced = containerEl.createEl('details', { cls: 'tezcat-settings-advanced' });
+        advanced.open = this.advancedOpen;
+        advanced.addEventListener('toggle', () => { this.advancedOpen = advanced.open; });
+        advanced.createEl('summary', { text: 'Advanced' });
+        // Prefixes are kept exactly as typed: trailing spaces and newlines are part of them.
+        // Short description; the full explanation is a hover tooltip on an info icon by the name.
+        // Obsidian shows its own tooltip for an element's aria-label (which screen readers read too).
+        const prefixSetting = (name: string, desc: string, help: string, value: string, apply: (value: string) => void) => {
+            const setting = new Setting(advanced).setName(name).setDesc(desc).addTextArea(text => {
+                text.setValue(value);
+                text.inputEl.rows = 2;
+                text.inputEl.addEventListener('change', () => {
+                    if (text.getValue() !== value) apply(text.getValue());
+                });
+            });
+            const info = setting.nameEl.createSpan({ cls: 'tezcat-setting-info', attr: { tabindex: '0', role: 'img', 'aria-label': help } });
+            setIcon(info, 'info');
+            return setting;
         };
+        prefixSetting('Query prefix', 'Added before your search text.',
+            'Instruction some embedding models expect before a search query (here, your text around the cursor). Filled in automatically for known models; change it only if your model needs a different one.',
+            settings.queryPrefix, (queryPrefix) => this.apply({ queryPrefix }));
+        prefixSetting('Document prefix', 'Added before each passage. Changing it re-embeds.',
+            'Instruction some embedding models expect before each passage being indexed. Filled in automatically for known models. Changing it changes every stored vector, so all blocks are embedded again.',
+            settings.documentPrefix, (documentPrefix) => this.apply({ documentPrefix }));
+        this.displayStoredVectors(advanced);
     }
 
-    onClose() {
-        const { contentEl } = this;
-        contentEl.empty();
+    /**
+     * Models with stored vectors, each with a delete button. Vectors are kept for the current
+     * and previous model, so switching back is instant.
+     */
+    private displayStoredVectors(containerEl: HTMLElement) {
+        new Setting(containerEl)
+            .setHeading()
+            .setName('Stored vectors')
+            .setDesc(this.plugin.storedModels.length
+                ? 'Kept for the current and previous model, so switching back is instant.'
+                : 'None yet.');
+        const list = containerEl.createDiv();
+        void this.plugin.storedVectors().then((stored) => {
+            for (const { space, model, count, current } of stored) {
+                new Setting(list)
+                    .setName(current ? `${model} (in use)` : model)
+                    .setDesc(`${count.toLocaleString()} vectors`)
+                    .addExtraButton(button => button
+                        .setIcon('trash-2')
+                        .setTooltip('Delete these vectors')
+                        .onClick(() => new ConfirmModal(this.app, {
+                            title: `Delete vectors for ${model}?`,
+                            body: current
+                                ? `${model} is the model in use, so every block will be embedded again, starting now. Keyword search keeps working meanwhile.`
+                                : `Switching back to ${model} later will embed every block again.`,
+                            confirm: 'Delete',
+                            onConfirm: async () => {
+                                await this.plugin.deleteStoredVectors(space);
+                                this.display();
+                            },
+                        }).open()));
+            }
+        });
+    }
+
+    /**
+     * Model picker: a dropdown of the server's embedding models, plus "Other…" to type any
+     * name (also shown when the current model isn't in the server's list).
+     */
+    private displayModelSetting(containerEl: HTMLElement, textSetting: (name: string, desc: string, placeholder: string, value: string, apply: (value: string) => void) => Setting): Setting {
+        const current = this.plugin.settings.embeddingModel;
+        this.loadModels();
+        const ids = this.models?.ids ?? null;
+        // A dedicated embeddings list needs no filtering by name (some embedding models' names
+        // don't say "embed"); a general list does.
+        const candidates = ids && !this.models?.embeddingOnly ? embeddingModels(ids) : ids ?? [];
+        const listed = candidates.filter((id) => !sameModel(id, current));
+        const currentListed = ids?.some((id) => sameModel(id, current)) ?? false;
+        const typing = this.typingModel || (ids !== null && !currentListed);
+
+        // The list only has models already on the server; say how to get another one.
+        const howToAdd = /:11434(\/|$)/.test(this.plugin.settings.embeddingEndpoint)
+            ? 'To use another model, download it first (e.g. ollama pull mxbai-embed-large), then refresh this list.'
+            : 'To use another model, download or enable it on your server first, then refresh this list.';
+        const desc = this.models?.error
+            ? `Couldn't get the server's model list: ${this.models.error} Choose "Other…" to type a model name.`
+            : ids === null
+                ? 'Loading the server\'s models…'
+                : ids.length === 0
+                    ? `The server lists no models. ${howToAdd}`
+                    : `Embedding models installed on the server. ${howToAdd}`;
+
+        const setting = new Setting(containerEl)
+            .setName('Model')
+            .setDesc(desc)
+            .addDropdown(dropdown => {
+                dropdown.addOption(current, current);
+                for (const id of listed) dropdown.addOption(id, id);
+                dropdown.addOption(OTHER_MODEL, 'Other…');
+                dropdown.setValue(this.typingModel ? OTHER_MODEL : current);
+                dropdown.onChange((value) => {
+                    this.typingModel = value === OTHER_MODEL;
+                    if (this.typingModel) this.display();
+                    else this.chooseModel(value);
+                });
+            })
+            .addExtraButton(button => button
+                .setIcon('refresh-cw')
+                .setTooltip('Refresh the list from the server')
+                .onClick(() => this.loadModels(true)));
+
+        if (typing) {
+            textSetting('Model name', 'Any model name the server accepts, e.g. nomic-embed-text:v1.5, bge-m3, text-embedding-3-small.',
+                DEFAULT_SETTINGS.embeddingModel, current, (model) => this.chooseModel(model));
+        }
+
+        // On Ollama, offer to download the recommended models that aren't installed yet.
+        const missing = this.models?.ollama && ids
+            ? RECOMMENDED_OLLAMA_MODELS.filter((m) => !ids.some((id) => sameModel(id, m.name)))
+            : [];
+        if (missing.length) {
+            new Setting(containerEl)
+                .setName('Recommended models')
+                .setDesc(`Not installed: ${missing.map((m) => `${m.name} (${m.size})`).join(', ')}. Download ${missing.length === 1 ? 'it' : 'them'} to choose from the recommended embedding models.`)
+                .addButton(button => button
+                    .setButtonText(this.downloading ? 'Downloading…' : 'Download')
+                    .setDisabled(this.downloading)
+                    .setCta()
+                    .onClick(async () => {
+                        this.downloading = true;
+                        this.display();
+                        await this.plugin.downloadModels(missing.map((m) => m.name));
+                        this.downloading = false;
+                        this.loadModels(true);
+                    }));
+        }
+        return setting;
+    }
+
+    /** Fetch the server's model list, once per endpoint and key unless forced. */
+    private loadModels(force = false) {
+        const { embeddingEndpoint, embeddingApiKeySecret } = this.plugin.settings;
+        const source = `${embeddingEndpoint}|${embeddingApiKeySecret}`;
+        if (!force && this.models?.source === source) return;
+        const entry = this.models = { source, ids: null as string[] | null, embeddingOnly: false as boolean, error: null as string | null, ollama: false as boolean };
+        Promise.all([
+            this.plugin.listModels().then(
+                ({ ids, embeddingOnly }) => { entry.ids = ids; entry.embeddingOnly = embeddingOnly; },
+                (error) => { entry.ids = []; entry.error = errorMessage(error); },
+            ),
+            this.plugin.isOllama().then((ollama) => { entry.ollama = ollama; }),
+        ]).finally(() => {
+            if (this.models === entry) this.display();
+        });
+        if (force) this.display();
+    }
+
+    private chooseModel(embeddingModel: string) {
+        const settings = this.plugin.settings;
+        // The name field stays visible on its own if the chosen model isn't in the server's list.
+        this.typingModel = false;
+        if (!embeddingModel || embeddingModel === settings.embeddingModel) return this.display();
+        // Follow the new model's recommended prefixes, unless the user customised them.
+        const previous = suggestPrefixes(settings.embeddingModel);
+        const customised = settings.queryPrefix !== previous.query || settings.documentPrefix !== previous.document;
+        const next = suggestPrefixes(embeddingModel);
+        this.apply({ embeddingModel, ...(customised ? {} : { queryPrefix: next.query, documentPrefix: next.document }) });
+    }
+
+    /** Apply embedding settings now, asking first if every block would need embedding again. */
+    private apply(changes: Partial<EmbeddingSettings>) {
+        const run = async () => {
+            // updateEmbeddingSettings applies the values before its first await, so the redraw
+            // shows them while the provider is checked and blocks are embedded.
+            const done = this.plugin.updateEmbeddingSettings(changes);
+            this.display();
+            await done;
+            this.display(); // show the outcome of checking the new settings (e.g. a model fallback)
+        };
+        if (this.plugin.needsReembedding(changes)) {
+            new ReembedConfirmModal(this.app, run, () => this.display()).open();
+        } else {
+            void run();
+        }
     }
 }
 
-class VectorSearchModal extends Modal {
-    private onSubmit: (query: string) => void;
-
-    constructor(app: App, onSubmit: (query: string) => void) {
+/** A yes/no confirmation for a destructive action. */
+class ConfirmModal extends Modal {
+    constructor(app: App, private opts: { title: string; body: string; confirm: string; onConfirm: () => void }) {
         super(app);
-        this.onSubmit = onSubmit;
+    }
+
+    onOpen() {
+        const { contentEl, opts } = this;
+        new Setting(contentEl).setHeading().setName(opts.title);
+        contentEl.createEl('p', { text: opts.body });
+        new Setting(contentEl)
+            .addButton(button => button
+                .setButtonText(opts.confirm)
+                .setWarning()
+                .onClick(() => { this.close(); opts.onConfirm(); }))
+            .addButton(button => button
+                .setButtonText('Cancel')
+                .onClick(() => this.close()));
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+class ReembedConfirmModal extends Modal {
+    private confirmed = false;
+
+    constructor(app: App, private onConfirm: () => void, private onCancel: () => void) {
+        super(app);
     }
 
     onOpen() {
         const { contentEl } = this;
-        contentEl.empty();
+        new Setting(contentEl).setHeading().setName('Re-embed all notes?');
+        contentEl.createEl('p', {
+            text: 'Vectors from different models can\'t be compared, so every block will be embedded with the new model. This may take a while for a large vault; keyword search keeps working meanwhile. Vectors for the previous model are kept, so switching back is instant.'
+        });
+        new Setting(contentEl)
+            .addButton(button => button
+                .setButtonText('Switch and re-embed')
+                .setCta()
+                .onClick(() => { this.confirmed = true; this.close(); this.onConfirm(); }))
+            .addButton(button => button
+                .setButtonText('Cancel')
+                .onClick(() => this.close()));
+    }
 
-        new Setting(contentEl).setHeading().setName('Vector search');
+    onClose() {
+        this.contentEl.empty();
+        if (!this.confirmed) this.onCancel(); // also on Escape: put the field back
+    }
+}
+
+class SearchQueryModal extends Modal {
+    constructor(app: App, private onSubmit: (query: string) => void) {
+        super(app);
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        new Setting(contentEl).setHeading().setName('Search notes');
 
         const inputContainer = contentEl.createDiv('tezcat-modal-input-container');
         const input = inputContainer.createEl('input', {
@@ -1651,264 +1038,98 @@ class VectorSearchModal extends Modal {
             placeholder: 'Enter your search query...',
             cls: 'tezcat-input'
         });
-
-        const buttonContainer = contentEl.createDiv('tezcat-button-container');
-        
-        const searchButton = buttonContainer.createEl('button', {
-            text: 'Search',
-            cls: 'mod-cta'
-        });
-        searchButton.onclick = () => {
+        const submit = () => {
             const query = input.value.trim();
-            if (query) {
-                this.close();
-                this.onSubmit(query);
-            }
+            if (!query) return;
+            this.close();
+            this.onSubmit(query);
         };
+        new Setting(contentEl)
+            .addButton(button => button.setButtonText('Search').setCta().onClick(submit))
+            .addButton(button => button.setButtonText('Cancel').onClick(() => this.close()));
 
-        const cancelButton = buttonContainer.createEl('button', {
-            text: 'Cancel'
-        });
-        cancelButton.onclick = () => this.close();
-
-        // Focus the input and handle Enter key
         input.focus();
         input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                searchButton.click();
-            }
+            if (e.key === 'Enter') submit();
         });
     }
 
     onClose() {
-        const { contentEl } = this;
-        contentEl.empty();
+        this.contentEl.empty();
     }
 }
 
-class SystemStatusModal extends Modal {
-    private validationResult: SystemValidationResult;
-    private isSystemValid: boolean;
-    private plugin: Tezcat;
-
-    constructor(app: App, validationResult: SystemValidationResult, isSystemValid: boolean, plugin: Tezcat) {
+class StatusModal extends Modal {
+    constructor(app: App, private plugin: Tezcat) {
         super(app);
-        this.validationResult = validationResult;
-        this.isSystemValid = isSystemValid;
-        this.plugin = plugin;
     }
 
     onOpen() {
-        const { contentEl } = this;
-        contentEl.empty();
+        const { contentEl, plugin } = this;
+        new Setting(contentEl).setHeading().setName('Tezcat status');
 
-        new Setting(contentEl).setHeading().setName('Tezcat system status');
+        const { text, problem } = plugin.statusSummary;
+        const summary = contentEl.createDiv('tezcat-overall-status');
+        summary.addClass(problem ? 'setup-required' : 'system-ready');
+        summary.createEl('strong', { text });
 
-        // Show operation in progress status
-        if (this.plugin.isOperationInProgress) {
-            const progressEl = contentEl.createDiv('tezcat-operation-progress');
-            progressEl.addClass('operation-in-progress');
-            progressEl.createEl('strong', { text: 'Operation in Progress' });
-            progressEl.createEl('br');
-            progressEl.appendText('Database rebuild or validation is currently running. Please wait for it to complete.');
-            progressEl.createEl('br');
-        }
-        
-        // Overall status
-        const overallEl = contentEl.createDiv('tezcat-overall-status');
-        
-        if (this.isSystemValid) {
-            overallEl.addClass('system-ready');
-            const strongEl = overallEl.createEl('strong', { text: 'System ready' });
-            overallEl.createEl('br');
-            overallEl.appendText('All components are working correctly.');
-        } else {
-            overallEl.addClass('setup-required');
-            const strongEl = overallEl.createEl('strong', { text: 'Setup required' });
-            overallEl.createEl('br');
-            overallEl.appendText('Some components need attention.');
-        }
-        
-        // Detailed status
-        const detailsEl = contentEl.createDiv('system-status-details');
-        
-        // Provider status
-        this.createStatusItem(
-            detailsEl,
-            'Embedding provider',
-            this.validationResult.embeddingProvider
-        );
-        
-        // Models status
-        this.createStatusItem(
-            detailsEl,
-            'Models',
-            this.validationResult.models
-        );
-        
-        // Database status
-        this.createStatusItem(
-            detailsEl,
-            'Database',
-            this.validationResult.database
-        );
-        
-        // Action buttons
-        const buttonContainer = contentEl.createDiv('tezcat-button-container');
-        
-        if (!this.isSystemValid) {
-            const retryButton = buttonContainer.createEl('button', {
-                text: this.plugin.isOperationInProgress ? 'Operation in progress...' : 'Retry setup',
-                cls: this.plugin.isOperationInProgress ? 'mod-muted' : 'mod-cta'
-            });
-            
-            if (this.plugin.isOperationInProgress) {
-                retryButton.disabled = true;
-                retryButton.addClass('tezcat-button-disabled');
-            } else {
-                retryButton.onclick = async () => {
-                    this.close();
-                    new Notice('Retrying system setup...');
-                    await this.plugin.performValidationAndSetup();
-                };
-            }
-            
-            const settingsButton = buttonContainer.createEl('button', {
-                text: 'Open settings'
-            });
-            settingsButton.onclick = () => {
-                this.close();
-                (this.app as any).setting.open();
-                (this.app as any).setting.openTabById('tezcat');
-            };
-        }
-        
-        const closeButton = buttonContainer.createEl('button', {
-            text: 'Close'
-        });
-        closeButton.onclick = () => this.close();
-    }
-    
-    private createStatusItem(container: HTMLElement, title: string, result: ValidationResult) {
-        const itemEl = container.createDiv('tezcat-validation-item');
-        
-        const headerEl = itemEl.createDiv('tezcat-validation-header');
-        
-        const titleEl = headerEl.createEl('strong');
-        titleEl.textContent = title;
-        
-        const statusEl = headerEl.createSpan({ cls: 'tezcat-validation-status' });
-        if (result.success) {
-            statusEl.textContent = 'Ready';
-            statusEl.addClass('ready');
-        } else {
-            statusEl.textContent = 'Issue';
-            statusEl.addClass('issue');
-        }
-        
-        const messageEl = itemEl.createDiv('tezcat-validation-message');
-        messageEl.textContent = result.message;
+        const { files, blocks, vectors } = plugin.indexStats;
+        const details = contentEl.createDiv('system-status-details');
+        const item = (title: string, value: string) => {
+            const el = details.createDiv('tezcat-validation-item');
+            el.createEl('strong', { text: title });
+            el.createDiv({ cls: 'tezcat-validation-message', text: value });
+        };
+        item('Index', `${files} notes, ${blocks} blocks`);
+        const [model, ...others] = plugin.storedModels;
+        item('Semantic search', plugin.semanticEnabled
+            ? `${vectors} block vectors from ${model ?? plugin.settings.embeddingModel} (weight ${plugin.settings.semanticWeight})`
+            : 'Off: keyword search only');
+        if (others.length) item('Also stored', `Vectors for ${others.join(', ')}`);
+
+        new Setting(contentEl)
+            .addButton(button => button.setButtonText('Update index').onClick(() => { this.close(); void plugin.updateIndex(); }))
+            .addButton(button => button.setButtonText('Close').setCta().onClick(() => this.close()));
     }
 
     onClose() {
-        const { contentEl } = this;
-        contentEl.empty();
+        this.contentEl.empty();
     }
 }
 
-class VectorSearchResultsModal extends Modal {
-    private query: string;
-    private results: SearchResult[];
+class SearchResultsModal extends Modal {
+    /** Owns what the rendered passages create; unloaded when the modal closes. */
+    private renderScope = new Component();
 
-    constructor(app: App, query: string, results: SearchResult[]) {
+    constructor(app: App, private query: string, private results: SearchResult[]) {
         super(app);
-        this.query = query;
-        this.results = results;
     }
 
     onOpen() {
         const { contentEl } = this;
-        contentEl.empty();
-
+        this.renderScope.load();
         new Setting(contentEl).setHeading().setName(`Search results for: "${this.query}"`);
         contentEl.createEl('p', { text: `Found ${this.results.length} matches` });
 
         const resultsContainer = contentEl.createDiv('tezcat-search-results');
-
-        this.results.forEach((result, index) => {
+        for (const result of this.results) {
             const resultEl = resultsContainer.createDiv('tezcat-search-result');
-
-            if (result.type === 'chunk') {
-                // For chunks: show chunk text first, then note info below
-                const textEl = resultEl.createDiv('tezcat-search-result-text');
-                textEl.textContent = result.text.length > 200 ? result.text.substring(0, 200) + '...' : result.text;
-
-                // Note info with score and type
-                const headerEl = resultEl.createDiv('tezcat-search-result-header');
-
-                const titleEl = headerEl.createEl('strong', { cls: 'tezcat-search-result-title' });
-                titleEl.textContent = result.noteName;
-
-                const metaEl = headerEl.createDiv();
-                const typeSpan = metaEl.createEl('span', {
-                    text: result.type,
-                    cls: 'tezcat-search-result-type'
-                });
-
-                const scoreSpan = metaEl.createEl('span', {
-                    text: `Score: ${result.score.toFixed(3)}`,
-                    cls: 'tezcat-search-result-score'
-                });
-
-                // Path
-                const pathEl = resultEl.createDiv('tezcat-search-result-path');
-                pathEl.textContent = result.notePath;
-            } else {
-                // For notes: show note info first, then path
-                const headerEl = resultEl.createDiv('tezcat-search-result-header');
-
-                const titleEl = headerEl.createEl('strong');
-                titleEl.textContent = result.noteName;
-
-                const metaEl = headerEl.createDiv();
-                const typeSpan = metaEl.createEl('span', {
-                    text: result.type,
-                    cls: 'tezcat-search-result-type'
-                });
-
-                const scoreSpan = metaEl.createEl('span', {
-                    text: `Score: ${result.score.toFixed(3)}`,
-                    cls: 'tezcat-search-result-score'
-                });
-
-                // Path
-                const pathEl = resultEl.createDiv('tezcat-search-result-path note-path');
-                pathEl.textContent = result.notePath;
-
-                // Text content (note path and name)
-                const textEl = resultEl.createDiv('tezcat-search-result-text');
-                textEl.textContent = result.text.length > 200 ? result.text.substring(0, 200) + '...' : result.text;
-            }
-
-            // Click to open note
+            const headerEl = resultEl.createDiv('tezcat-search-result-header');
+            headerEl.createEl('strong', { text: result.noteName });
+            resultEl.createDiv({ cls: 'tezcat-search-result-path', text: result.path });
+            renderResultText(this.app, resultEl, result, this.renderScope);
             resultEl.onclick = () => {
                 this.close();
-                this.app.workspace.openLinkText(result.notePath, '', false);
+                const file = this.app.vault.getFileByPath(result.path);
+                if (file) void this.app.workspace.getLeaf(false).openFile(file, { eState: { line: result.line } });
             };
+        }
 
-            // Hover effects are handled by CSS
-        });
-
-        const buttonContainer = contentEl.createDiv('tezcat-button-container');
-        const closeButton = buttonContainer.createEl('button', {
-            text: 'Close'
-        });
-        closeButton.onclick = () => this.close();
+        new Setting(contentEl).addButton(button => button.setButtonText('Close').onClick(() => this.close()));
     }
 
     onClose() {
-        const { contentEl } = this;
-        contentEl.empty();
+        this.renderScope.unload();
+        this.contentEl.empty();
     }
 }
-

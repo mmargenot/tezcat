@@ -1,0 +1,216 @@
+import { describe, it, expect, vi } from 'vitest';
+import type { RequestUrlParam, RequestUrlResponse } from 'obsidian';
+import { EmbeddingError, EmbeddingService, embeddingModels, sameModel, suggestPrefixes, type EmbeddingConfig } from '../src/embedding_service';
+
+const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any;
+
+const response = (status: number, json: unknown, headers: Record<string, string> = {}): RequestUrlResponse =>
+    ({ status, json, text: JSON.stringify(json), headers, arrayBuffer: new ArrayBuffer(0) }) as RequestUrlResponse;
+
+/** A fake server that embeds each input as [length, index-in-request]. */
+const echoServer = () => vi.fn(async (req: RequestUrlParam) => {
+    const { input } = JSON.parse(req.body as string) as { input: string[] };
+    return response(200, { data: input.map((t, index) => ({ index, embedding: [t.length, index] })) });
+});
+
+const config = (over: Partial<EmbeddingConfig> = {}): EmbeddingConfig => ({
+    endpoint: 'http://localhost:11434/v1/',
+    model: 'nomic-embed-text',
+    apiKey: null,
+    prefixes: { query: 'search_query: ', document: 'search_document: ' },
+    ...over,
+});
+
+const noWait = async () => {};
+
+describe('suggestPrefixes', () => {
+    it('knows models that need instruction prefixes', () => {
+        expect(suggestPrefixes('nomic-embed-text:v1.5')).toEqual({ query: 'search_query: ', document: 'search_document: ' });
+        expect(suggestPrefixes('intfloat/multilingual-e5-large').query).toBe('query: ');
+        expect(suggestPrefixes('BAAI/bge-small-en-v1.5').document).toBe('');
+    });
+
+    it('gives Qwen3-Embedding its query instruction under each server\'s naming', () => {
+        for (const name of ['qwen3-embedding:0.6b', 'Qwen/Qwen3-Embedding-0.6B', 'text-embedding-qwen3-embedding-4b']) {
+            expect(suggestPrefixes(name)).toEqual({
+                query: 'Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:',
+                document: '',
+            });
+        }
+    });
+
+    it('suggests none for models that do not use them', () => {
+        expect(suggestPrefixes('bge-m3')).toEqual({ query: '', document: '' });
+        expect(suggestPrefixes('text-embedding-3-small')).toEqual({ query: '', document: '' });
+    });
+});
+
+describe('EmbeddingService', () => {
+    it('posts to {endpoint}/embeddings with the model, prefixes and key', async () => {
+        const request = echoServer();
+        const service = new EmbeddingService(config({ apiKey: 'sk-test' }), log, request, noWait);
+        await service.embedQuery('raven');
+        const [req] = request.mock.calls[0];
+        expect(req.url).toBe('http://localhost:11434/v1/embeddings');
+        expect(req.headers?.Authorization).toBe('Bearer sk-test');
+        expect(JSON.parse(req.body as string)).toEqual({ model: 'nomic-embed-text', input: ['search_query: raven'] });
+        await service.embedDocuments(['lenore']);
+        expect(JSON.parse(request.mock.calls[1][0].body as string).input).toEqual(['search_document: lenore']);
+    });
+
+    it('sends no Authorization header without a key', async () => {
+        const request = echoServer();
+        await new EmbeddingService(config(), log, request, noWait).embedQuery('x');
+        expect(request.mock.calls[0][0].headers).not.toHaveProperty('Authorization');
+    });
+
+    it('batches large inputs and keeps results in input order', async () => {
+        const request = vi.fn(async (req: RequestUrlParam) => {
+            const { input } = JSON.parse(req.body as string) as { input: string[] };
+            const data = input.map((t, index) => ({ index, embedding: [Number(t.split(' ')[1])] }));
+            return response(200, { data: data.reverse() }); // server returns them out of order
+        });
+        const service = new EmbeddingService(config({ prefixes: { query: '', document: '' } }), log, request, noWait);
+        const texts = Array.from({ length: 70 }, (_, i) => `text ${i}`);
+        const vectors = await service.embedDocuments(texts);
+        expect(request).toHaveBeenCalledTimes(3); // 32 + 32 + 6
+        expect(vectors.map((v) => v[0])).toEqual(texts.map((_, i) => i));
+    });
+
+    it('retries on rate limits and server errors, then gives up', async () => {
+        const wait = vi.fn(async (_ms: number) => {});
+        const flaky = vi.fn()
+            .mockResolvedValueOnce(response(429, { error: 'slow down' }, { 'retry-after': '2' }))
+            .mockResolvedValueOnce(response(503, { error: 'busy' }))
+            .mockImplementation(echoServer());
+        expect(await new EmbeddingService(config(), log, flaky, wait).embedQuery('x')).toHaveLength(2);
+        expect(wait.mock.calls.map((c) => c[0])).toEqual([2000, 2000]);
+
+        const down = vi.fn(async () => response(500, { error: 'boom' }));
+        await expect(new EmbeddingService(config(), log, down, noWait).embedQuery('x')).rejects.toThrow(/HTTP 500/);
+        expect(down).toHaveBeenCalledTimes(3);
+    });
+
+    it('explains common failures', async () => {
+        const fail = (res: RequestUrlResponse | Error) => new EmbeddingService(config(), log,
+            vi.fn(async () => { if (res instanceof Error) throw res; return res; }), noWait).check();
+
+        await expect(fail(new Error('net::ERR_CONNECTION_REFUSED'))).rejects.toThrow(/Is the server running\?/);
+        await expect(fail(response(401, { error: { message: 'bad key' } }))).rejects.toThrow(/rejected the API key.*bad key/);
+        await expect(fail(response(404, { error: 'model "nomic-embed-text" not found, try pulling it first' })))
+            .rejects.toThrow(/ollama pull nomic-embed-text/);
+        await expect(fail(response(404, 'page not found'))).rejects.toThrow(/usually ends in \/v1/);
+        await expect(fail(response(200, { data: [] }))).rejects.toBeInstanceOf(EmbeddingError);
+    });
+
+    it('classifies failures, so callers can tell a missing model from a down server', async () => {
+        const reason = async (res: RequestUrlResponse | Error) => {
+            const service = new EmbeddingService(config(), log, vi.fn(async () => { if (res instanceof Error) throw res; return res; }), noWait);
+            return service.check().catch((e: EmbeddingError) => e.reason);
+        };
+        expect(await reason(new Error('ECONNREFUSED'))).toBe('unreachable');
+        expect(await reason(response(401, {}))).toBe('unauthorized');
+        expect(await reason(response(404, { error: 'model "foo" not found, try pulling it first' }))).toBe('model-not-found'); // Ollama
+        expect(await reason(response(404, { error: { message: 'The model `foo` does not exist' } }))).toBe('model-not-found'); // OpenAI
+        expect(await reason(response(400, { error: 'unknown model: foo' }))).toBe('model-not-found');
+        // OpenRouter-style: names the model without the word "model"
+        expect(await reason(response(404, { error: { message: 'No endpoints found for nomic-embed-text.', code: 404 } }))).toBe('model-not-found');
+        expect(await reason(response(400, { error: { message: 'nomic-embed-text is not a valid model ID' } }))).toBe('model-not-found');
+        expect(await reason(response(404, 'Not Found'))).toBe('no-endpoint');
+        expect(await reason(response(400, { error: 'input too long' }))).toBe('other');
+    });
+
+    it('does not retry when the server cannot be reached', async () => {
+        const request = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
+        await expect(new EmbeddingService(config(), log, request, noWait).check()).rejects.toThrow(EmbeddingError);
+        expect(request).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports dimensions from a connection check', async () => {
+        const result = await new EmbeddingService(config(), log, echoServer(), noWait).check();
+        expect(result.dimensions).toBe(2);
+    });
+
+    it('identifies the vector space by model and document prefix, not endpoint', () => {
+        const a = new EmbeddingService(config(), log);
+        expect(new EmbeddingService(config({ endpoint: 'http://127.0.0.1:11434/v1' }), log).space).toBe(a.space);
+        expect(new EmbeddingService(config({ model: 'bge-m3' }), log).space).not.toBe(a.space);
+        expect(new EmbeddingService(config({ prefixes: { query: '', document: '' } }), log).space).not.toBe(a.space);
+    });
+});
+
+describe('model lists', () => {
+    /** A fake server answering only the given model-list routes. */
+    const lists = (routes: Record<string, unknown>) => vi.fn(async (req: RequestUrlParam) => {
+        const path = new URL(req.url).pathname;
+        return path in routes ? response(200, routes[path]) : response(404, '404 page not found');
+    });
+
+    it('lists the server\'s models from {endpoint}/models when there is no embeddings list', async () => {
+        const request = lists({ '/v1/models': { data: [{ id: 'bge-m3:latest' }, { id: 'llama3:8b' }] } });
+        const result = await new EmbeddingService(config({ apiKey: 'k' }), log, request, noWait).listModels();
+        expect(result).toEqual({ ids: ['bge-m3:latest', 'llama3:8b'], embeddingOnly: false });
+        expect(request.mock.calls.map((c) => c[0].url)).toEqual(['http://localhost:11434/v1/embeddings/models', 'http://localhost:11434/v1/models']);
+        expect(request.mock.calls[1][0].headers?.Authorization).toBe('Bearer k');
+    });
+
+    it('prefers a dedicated embeddings list (OpenRouter)', async () => {
+        const request = lists({
+            '/api/v1/embeddings/models': { data: [{ id: 'openai/text-embedding-3-small' }, { id: 'voyage/voyage-3' }] },
+            '/api/v1/models': { data: [{ id: 'anthropic/claude-sonnet' }] },
+        });
+        const service = new EmbeddingService(config({ endpoint: 'https://openrouter.ai/api/v1' }), log, request, noWait);
+        expect(await service.listModels()).toEqual({ ids: ['openai/text-embedding-3-small', 'voyage/voyage-3'], embeddingOnly: true });
+        expect(request).toHaveBeenCalledTimes(1);
+    });
+
+    it('explains why the list could not be fetched', async () => {
+        const down = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
+        await expect(new EmbeddingService(config(), log, down, noWait).listModels()).rejects.toThrow(/Is the server running/);
+    });
+
+    it('picks out OpenAI\'s embedding models from its full model list', () => {
+        const openai = ['gpt-4o', 'gpt-4o-mini', 'o3', 'dall-e-3', 'whisper-1', 'tts-1', 'omni-moderation-latest',
+            'text-embedding-3-small', 'text-embedding-3-large', 'text-embedding-ada-002'];
+        expect(embeddingModels(openai)).toEqual(['text-embedding-3-large', 'text-embedding-3-small', 'text-embedding-ada-002']);
+    });
+
+    it('picks out embedding models by name, or keeps everything if none match', () => {
+        expect(embeddingModels(['llama3:8b', 'nomic-embed-text:v1.5', 'bge-m3:latest', 'qwen2.5:7b', 'text-embedding-3-small', 'gpt-4o']))
+            .toEqual(['bge-m3:latest', 'nomic-embed-text:v1.5', 'text-embedding-3-small']);
+        expect(embeddingModels(['zeta', 'alpha'])).toEqual(['alpha', 'zeta']);
+    });
+
+    it('treats an Ollama ":latest" tag as the same model, including for the vector space', () => {
+        expect(sameModel('bge-m3', 'bge-m3:latest')).toBe(true);
+        expect(sameModel('bge-m3', 'bge-m3:567m')).toBe(false);
+        const a = new EmbeddingService(config({ model: 'bge-m3' }), log);
+        expect(new EmbeddingService(config({ model: 'bge-m3:latest' }), log).space).toBe(a.space);
+    });
+});
+
+describe('Ollama model downloads', () => {
+    it('detects an Ollama server from its native API beside /v1', async () => {
+        const ollama = vi.fn(async (_req: RequestUrlParam) => response(200, { version: '0.34.1' }));
+        expect(await new EmbeddingService(config(), log, ollama, noWait).isOllama()).toBe(true);
+        expect(ollama.mock.calls[0][0].url).toBe('http://localhost:11434/api/version');
+
+        const other = vi.fn(async () => response(404, 'Not Found'));
+        expect(await new EmbeddingService(config({ endpoint: 'http://localhost:1234/v1' }), log, other, noWait).isOllama()).toBe(false);
+        const down = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
+        expect(await new EmbeddingService(config(), log, down, noWait).isOllama()).toBe(false);
+    });
+
+    it('pulls a model and waits for it to finish', async () => {
+        const request = vi.fn(async (_req: RequestUrlParam) => response(200, { status: 'success' }));
+        await new EmbeddingService(config(), log, request, noWait).pullOllamaModel('qwen3-embedding:0.6b');
+        const [req] = request.mock.calls[0];
+        expect(req.url).toBe('http://localhost:11434/api/pull');
+        expect(JSON.parse(req.body as string)).toEqual({ model: 'qwen3-embedding:0.6b', stream: false });
+    });
+
+    it('reports a failed pull', async () => {
+        const request = vi.fn(async () => response(500, { error: 'pull model manifest: file does not exist' }));
+        await expect(new EmbeddingService(config(), log, request, noWait).pullOllamaModel('nope')).rejects.toThrow(/file does not exist/);
+    });
+});

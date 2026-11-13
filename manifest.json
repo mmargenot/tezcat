@@ -1,9 +1,9 @@
 {
 	"id": "tezcat",
 	"name": "Tezcat",
-	"version": "1.1.0",
-	"minAppVersion": "0.15.0",
-	"description": "Implements AI indexing and search to surface related thoughts to your current work. Look into the mirror.",
+	"version": "2.0.0",
+	"minAppVersion": "1.11.4",
+	"description": "Implements a remembrance agent using keyword and semantic search. Surface thoughts related to your current work from around your vault. Look into the mirror.",
 	"author": "Max Margenot",
 	"authorUrl": "https://github.com/mmargenot",
 	"fundingUrl": "https://coff.ee/mmargenot",

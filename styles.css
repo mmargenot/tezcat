@@ -43,24 +43,6 @@
     font-size: 0.8em;
 }
 
-.tezcat-search-result-meta {
-    display: flex;
-    align-items: center;
-}
-
-.tezcat-search-result-type {
-    background: var(--background-modifier-border);
-    padding: 2px 6px;
-    border-radius: 3px;
-    font-size: 0.8em;
-}
-
-.tezcat-search-result-score {
-    color: var(--text-muted);
-    font-size: 0.8em;
-    margin-left: 6px;
-}
-
 .tezcat-search-result-actions {
     margin-top: 8px;
     display: flex;
@@ -95,40 +77,11 @@
     border: 1px solid rgba(255, 255, 0, 0.3);
 }
 
-.tezcat-button-container {
-    margin-top: 20px;
-}
-
-.tezcat-button-disabled {
-    opacity: 0.5;
-}
-
-.tezcat-settings-divider {
-    margin: 2em 0;
-    border: none;
-    border-top: 1px solid var(--background-modifier-border);
-}
-
 .tezcat-validation-item {
     padding: 8px 12px;
     margin-bottom: 8px;
     border-radius: 4px;
     border: 1px solid var(--background-modifier-border);
-}
-
-.tezcat-validation-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 4px;
-}
-
-.tezcat-validation-status.ready {
-    color: var(--text-success);
-}
-
-.tezcat-validation-status.issue {
-    color: var(--text-error);
 }
 
 .tezcat-validation-message {
@@ -158,6 +111,30 @@
     font-size: 0.9em;
     line-height: 1.4;
     margin-bottom: 8px;
+    /* Long passages are clamped rather than cut, so Markdown never breaks mid-syntax. */
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 6;
+    overflow: hidden;
+}
+
+/* Rendered passages: compact spacing, headings no larger than body text. */
+.tezcat-search-result-text > :first-child { margin-top: 0; }
+.tezcat-search-result-text > :last-child { margin-bottom: 0; }
+.tezcat-search-result-text p,
+.tezcat-search-result-text ul,
+.tezcat-search-result-text ol,
+.tezcat-search-result-text blockquote {
+    margin: 0 0 0.4em;
+}
+.tezcat-search-result-text h1,
+.tezcat-search-result-text h2,
+.tezcat-search-result-text h3,
+.tezcat-search-result-text h4,
+.tezcat-search-result-text h5,
+.tezcat-search-result-text h6 {
+    font-size: 1em;
+    margin: 0 0 0.3em;
 }
 
 .tezcat-search-result-header {
@@ -167,32 +144,7 @@
     margin-bottom: 4px;
 }
 
-.tezcat-search-result-title {
-    font-size: 0.9em;
-}
-
-.tezcat-search-result-path {
-    color: var(--text-muted);
-    font-size: 0.8em;
-}
-
-.tezcat-search-result-path.note-path {
-    font-size: 0.9em;
-    margin-bottom: 8px;
-}
-
-.tezcat-search-result-chunk-text {
-    font-size: 0.9em;
-    line-height: 1.4;
-}
-
-/* Status Bar Styles */
-.tezcat-status-bar {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-}
-
+/* Status bar */
 .tezcat-status-initializing {
     color: var(--text-muted);
 }
@@ -203,4 +155,53 @@
 
 .tezcat-status-error {
     color: var(--text-error);
+}
+
+/* Inline warning under a setting (e.g. the configured model isn't on the server) */
+.tezcat-setting-warning {
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+    margin-top: 6px;
+    color: var(--text-warning);
+}
+
+.tezcat-setting-warning-icon {
+    flex-shrink: 0;
+    display: inline-flex;
+}
+
+.tezcat-setting-warning-icon svg {
+    width: 14px;
+    height: 14px;
+}
+
+/* Collapsible "Advanced" group in settings */
+.tezcat-settings-advanced {
+    margin-top: 8px;
+}
+
+.tezcat-settings-advanced > summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    padding: 6px 0;
+}
+
+.tezcat-settings-advanced textarea {
+    width: 100%;
+    font-family: var(--font-monospace);
+}
+
+/* Info icon with a tooltip, next to a setting's name */
+.tezcat-setting-info {
+    display: inline-flex;
+    vertical-align: middle;
+    margin-left: 4px;
+    color: var(--text-muted);
+    cursor: help;
+}
+
+.tezcat-setting-info svg {
+    width: 14px;
+    height: 14px;
 }
