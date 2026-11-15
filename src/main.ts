@@ -402,19 +402,32 @@ export default class Tezcat extends Plugin {
         if (!service) return;
         if (this.embedRun) { this.embedAgain = true; return; }
         const run = this.embedRun = new AbortController();
+        const { model } = service.config;
         try {
             do {
                 this.embedAgain = false;
-                await this.index.embedMissing(this.vault, (texts) => service.embedDocuments(texts), {
+                const started = Date.now();
+                let total = 0;
+                const done = await this.index.embedMissing(this.vault, (texts) => service.embedDocuments(texts), {
                     signal: run.signal,
-                    onProgress: (done, total) => {
-                        this.indexProgress = done < total ? { label: 'Embedding', done, total } : null;
+                    onProgress: (done, count) => {
+                        if (done === 0 && count > 0) {
+                            total = count;
+                            logger.info('Embedding', `Embedding ${count} passages with ${model}`);
+                        }
+                        this.indexProgress = done < count ? { label: 'Embedding', done, total: count } : null;
                         this.refreshStatus();
                     },
                 });
+                if (total) {
+                    logger.info('Embedding', run.signal.aborted
+                        ? `Stopped after ${done} of ${total} passages`
+                        : `Embedded ${done} passages with ${model} in ${((Date.now() - started) / 1000).toFixed(1)} s`);
+                }
             } while (this.embedAgain && !run.signal.aborted);
         } catch (error) {
-            if (!(error instanceof EmbeddingSpaceChanged) && !run.signal.aborted) {
+            if (error instanceof EmbeddingSpaceChanged) logger.info('Embedding', `Stopped: the model changed from ${model}`);
+            else if (!run.signal.aborted) {
                 logger.error('Plugin', 'Embedding failed', error);
                 this.semanticError = `Embedding failed: ${errorMessage(error)}`;
             }
