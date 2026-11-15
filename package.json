@@ -8,7 +8,8 @@
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
 		"test": "vitest run",
 		"test:watch": "vitest",
-		"version": "node version-bump.mjs && git add manifest.json versions.json"
+		"version": "node version-bump.mjs && git add manifest.json versions.json",
+		"lint": "eslint ."
 	},
 	"keywords": [],
 	"author": "",
@@ -18,10 +19,13 @@
 		"@codemirror/view": "6.43.13",
 		"@types/node": "^20.19.9",
 		"esbuild": "0.28.2",
+		"eslint": "9.39.5",
+		"eslint-plugin-obsidianmd": "0.5.1",
 		"fake-indexeddb": "6.2.8",
 		"obsidian": "1.14.4",
 		"tslib": "2.9.1",
 		"typescript": "5.9.3",
+		"typescript-eslint": "8.72.2",
 		"vitest": "3.2.7"
 	},
 	"dependencies": {

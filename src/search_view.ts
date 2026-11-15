@@ -53,10 +53,10 @@ class TezcatView extends ItemView {
     const container = this.containerEl.children[1];
     container.empty();
 
-    const header = container.createEl('div', { cls: 'tezcat-search-view-header' });
+    const header = container.createDiv({ cls: 'tezcat-search-view-header' });
     new Setting(header).setHeading().setName('Tezcat search');
 
-    this.resultsContainer = container.createEl('div', { cls: 'tezcat-search-results-container' });
+    this.resultsContainer = container.createDiv({ cls: 'tezcat-search-results-container' });
     this.showEmptyState();
   }
 
@@ -68,24 +68,24 @@ class TezcatView extends ItemView {
       this.showEmptyState();
       return;
     }
-    this.resultsContainer.createEl('div', { cls: 'tezcat-search-count', text: `${results.length} results` });
+    this.resultsContainer.createDiv({ cls: 'tezcat-search-count', text: `${results.length} results` });
     for (const result of results) this.createResultItem(result);
   }
 
   private showEmptyState() {
-    const emptyEl = this.resultsContainer.createEl('div', { cls: 'tezcat-search-empty-state' });
+    const emptyEl = this.resultsContainer.createDiv({ cls: 'tezcat-search-empty-state' });
     emptyEl.createEl('p', { text: 'Move your cursor around in a markdown file to see related content.' });
   }
 
   private createResultItem(result: SearchResult) {
-    const itemEl = this.resultsContainer.createEl('div', { cls: 'tezcat-search-result-item' });
+    const itemEl = this.resultsContainer.createDiv({ cls: 'tezcat-search-result-item' });
 
     renderResultText(this.app, itemEl, result, this.renderScope!);
 
-    const pathContainerEl = itemEl.createEl('div', { cls: 'tezcat-search-result-path-container' });
-    pathContainerEl.createEl('div', { cls: 'tezcat-search-result-path', text: result.path });
+    const pathContainerEl = itemEl.createDiv({ cls: 'tezcat-search-result-path-container' });
+    pathContainerEl.createDiv({ cls: 'tezcat-search-result-path', text: result.path });
 
-    const actionsEl = itemEl.createEl('div', { cls: 'tezcat-search-result-actions' });
+    const actionsEl = itemEl.createDiv({ cls: 'tezcat-search-result-actions' });
     const button = (text: string, onClick: () => void, cls?: string) => {
       actionsEl.createEl('button', { text, cls }).onclick = (e) => {
         e.stopPropagation();

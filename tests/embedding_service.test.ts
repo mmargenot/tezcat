@@ -5,7 +5,7 @@ import { EmbeddingError, EmbeddingService, embeddingModels, sameModel, suggestPr
 const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any;
 
 const response = (status: number, json: unknown, headers: Record<string, string> = {}): RequestUrlResponse =>
-    ({ status, json, text: JSON.stringify(json), headers, arrayBuffer: new ArrayBuffer(0) }) as RequestUrlResponse;
+    ({ status, json, text: JSON.stringify(json), headers, arrayBuffer: new ArrayBuffer(0) });
 
 /** A fake server that embeds each input as [length, index-in-request]. */
 const echoServer = () => vi.fn(async (req: RequestUrlParam) => {

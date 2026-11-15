@@ -36,7 +36,8 @@ class Logger {
                     console.debug(prefix, message, ...args);
                     break;
                 case LogLevel.INFO:
-                    console.log(prefix, message, ...args);
+                    // Obsidian's guidelines allow only debug, warn and error in the console.
+                    console.debug(prefix, message, ...args);
                     break;
                 case LogLevel.WARN:
                     console.warn(prefix, message, ...args);

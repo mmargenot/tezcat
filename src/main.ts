@@ -106,15 +106,16 @@ export default class Tezcat extends Plugin {
         });
     }
 
-    async onunload() {
+    onunload() {
         this.embedRun?.abort();
-        await this.index?.flush();
+        // Obsidian doesn't wait for onunload, so the final save runs on its own.
+        void this.index?.flush();
     }
 
     // ---------- settings ----------
 
     async loadSettings() {
-        const saved = await this.loadData();
+        const saved = (await this.loadData()) as Record<string, unknown> | null;
         const migrated = saved ? migrateSettings(saved, (name, key) => this.app.secretStorage.setSecret(name, key)) : false;
         this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
         if (migrated) await this.saveData(this.settings);
@@ -168,11 +169,10 @@ export default class Tezcat extends Plugin {
 
     /** Per-vault, per-device name for the index databases, kept in Obsidian's vault-scoped local storage. */
     private indexNamespace(): string {
-        let id = this.app.loadLocalStorage('tezcat-index-id');
-        if (typeof id !== 'string') {
-            id = crypto.randomUUID();
-            this.app.saveLocalStorage('tezcat-index-id', id);
-        }
+        const saved: unknown = this.app.loadLocalStorage('tezcat-index-id');
+        if (typeof saved === 'string') return `tezcat-${saved}`;
+        const id = crypto.randomUUID();
+        this.app.saveLocalStorage('tezcat-index-id', id);
         return `tezcat-${id}`;
     }
 
@@ -402,19 +402,32 @@ export default class Tezcat extends Plugin {
         if (!service) return;
         if (this.embedRun) { this.embedAgain = true; return; }
         const run = this.embedRun = new AbortController();
+        const { model } = service.config;
         try {
             do {
                 this.embedAgain = false;
-                await this.index.embedMissing(this.vault, (texts) => service.embedDocuments(texts), {
+                const started = Date.now();
+                let total = 0;
+                const done = await this.index.embedMissing(this.vault, (texts) => service.embedDocuments(texts), {
                     signal: run.signal,
-                    onProgress: (done, total) => {
-                        this.indexProgress = done < total ? { label: 'Embedding', done, total } : null;
+                    onProgress: (done, count) => {
+                        if (done === 0 && count > 0) {
+                            total = count;
+                            logger.info('Embedding', `Embedding ${count} passages with ${model}`);
+                        }
+                        this.indexProgress = done < count ? { label: 'Embedding', done, total: count } : null;
                         this.refreshStatus();
                     },
                 });
+                if (total) {
+                    logger.info('Embedding', run.signal.aborted
+                        ? `Stopped after ${done} of ${total} passages`
+                        : `Embedded ${done} passages with ${model} in ${((Date.now() - started) / 1000).toFixed(1)} s`);
+                }
             } while (this.embedAgain && !run.signal.aborted);
         } catch (error) {
-            if (!(error instanceof EmbeddingSpaceChanged) && !run.signal.aborted) {
+            if (error instanceof EmbeddingSpaceChanged) logger.info('Embedding', `Stopped: the model changed from ${model}`);
+            else if (!run.signal.aborted) {
                 logger.error('Plugin', 'Embedding failed', error);
                 this.semanticError = `Embedding failed: ${errorMessage(error)}`;
             }
@@ -547,10 +560,13 @@ export default class Tezcat extends Plugin {
     }
 
     private searchFromModal() {
-        new SearchQueryModal(this.app, async (query) => {
+        const run = async (query: string) => {
             const results = await this.search.search(query, { ...this.searchOptions, excludePath: this.app.workspace.getActiveFile()?.path });
             if (results.length === 0) new Notice('No results found');
             else new SearchResultsModal(this.app, query, results).open();
+        };
+        new SearchQueryModal(this.app, (query) => {
+            run(query).catch((error) => new Notice(`Search failed: ${errorMessage(error)}`));
         }).open();
     }
 
@@ -728,7 +744,7 @@ class TezcatSettingTab extends PluginSettingTab {
                 .addOption(LogLevel.DEBUG.toString(), 'DEBUG')
                 .setValue(this.plugin.settings.logLevel.toString())
                 .onChange(async (value) => {
-                    this.plugin.settings.logLevel = parseInt(value) as LogLevel;
+                    this.plugin.settings.logLevel = parseInt(value);
                     await this.plugin.saveSettings();
                 }));
     }
@@ -838,9 +854,11 @@ class TezcatSettingTab extends PluginSettingTab {
                                 ? `${model} is the model in use, so every block will be embedded again, starting now. Keyword search keeps working meanwhile.`
                                 : `Switching back to ${model} later will embed every block again.`,
                             confirm: 'Delete',
-                            onConfirm: async () => {
-                                await this.plugin.deleteStoredVectors(space);
-                                this.display();
+                            onConfirm: () => {
+                                this.plugin.deleteStoredVectors(space).then(
+                                    () => this.display(),
+                                    (error) => new Notice(`Deleting the vectors failed: ${errorMessage(error)}`),
+                                );
                             },
                         }).open()));
             }
@@ -927,7 +945,7 @@ class TezcatSettingTab extends PluginSettingTab {
         const source = `${embeddingEndpoint}|${embeddingApiKeySecret}`;
         if (!force && this.models?.source === source) return;
         const entry = this.models = { source, ids: null as string[] | null, embeddingOnly: false as boolean, error: null as string | null, ollama: false as boolean };
-        Promise.all([
+        void Promise.all([
             this.plugin.listModels().then(
                 ({ ids, embeddingOnly }) => { entry.ids = ids; entry.embeddingOnly = embeddingOnly; },
                 (error) => { entry.ids = []; entry.error = errorMessage(error); },
@@ -962,7 +980,7 @@ class TezcatSettingTab extends PluginSettingTab {
             this.display(); // show the outcome of checking the new settings (e.g. a model fallback)
         };
         if (this.plugin.needsReembedding(changes)) {
-            new ReembedConfirmModal(this.app, run, () => this.display()).open();
+            new ReembedConfirmModal(this.app, () => void run(), () => this.display()).open();
         } else {
             void run();
         }

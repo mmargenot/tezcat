@@ -4,6 +4,10 @@
 
 import { vi } from 'vitest';
 
+// Tests run in Node, which has no `window`; the plugin uses window timers (as Obsidian
+// recommends for popout windows), and Node's global timers behave the same.
+(globalThis as { window?: unknown }).window ??= globalThis;
+
 // Mock the obsidian module globally
 vi.mock('obsidian', () => ({
   Notice: vi.fn().mockImplementation((message: string, duration?: number) => ({
